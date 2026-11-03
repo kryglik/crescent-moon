@@ -1,0 +1,281 @@
+//! Operating-system specific parts: drives, free space, hidden files, opening files and shells.
+
+use std::fs::Metadata;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::util;
+
+/// What the delete confirmation calls the place deleted files go to.
+pub const TRASH_NAME: &str = if cfg!(windows) { "the Recycle Bin" } else { "the trash" };
+
+pub struct DriveInfo {
+    pub root: PathBuf,
+    pub label: String,
+    pub kind: &'static str,
+    /// Free and total bytes, for local drives only.
+    pub space: Option<(u64, u64)>,
+}
+
+#[cfg(windows)]
+pub use win::{disk_space, drives, init, open_default};
+
+#[cfg(windows)]
+pub fn is_hidden(_name: &str, meta: Option<&Metadata>) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+    meta.is_some_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+}
+
+#[cfg(windows)]
+pub fn is_executable(name: &str, _meta: Option<&Metadata>) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1")
+}
+
+#[cfg(windows)]
+mod win {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+    };
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    use super::DriveInfo;
+
+    fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+        s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Stops Windows from popping up "There is no disk in the drive" boxes.
+    pub fn init() {
+        unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+    }
+
+    pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+        let path = wide(path);
+        let (mut free, mut total) = (0u64, 0u64);
+        let ok = unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut free, &mut total, null_mut()) };
+        (ok != 0).then_some((free, total))
+    }
+
+    fn volume_label(root: &[u16]) -> String {
+        let mut buf = [0u16; 261];
+        let ok = unsafe {
+            GetVolumeInformationW(
+                root.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                0,
+            )
+        };
+        if ok == 0 {
+            return String::new();
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+    }
+
+    pub fn drives() -> Vec<DriveInfo> {
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u8)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| {
+                let root = format!("{}:\\", (b'A' + i) as char);
+                let root_w = wide(&root);
+                let code = unsafe { GetDriveTypeW(root_w.as_ptr()) };
+                let kind = match code {
+                    DRIVE_FIXED => "fixed",
+                    DRIVE_REMOVABLE => "removable",
+                    DRIVE_REMOTE => "network",
+                    DRIVE_CDROM => "cd/dvd",
+                    DRIVE_RAMDISK => "ram disk",
+                    _ => "unknown",
+                };
+                // Network and optical drives can block for seconds when offline or empty.
+                let local = matches!(code, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_RAMDISK);
+                DriveInfo {
+                    label: if local { volume_label(&root_w) } else { String::new() },
+                    space: if local { disk_space(Path::new(&root)) } else { None },
+                    root: PathBuf::from(root),
+                    kind,
+                }
+            })
+            .collect()
+    }
+
+    /// Opens a file in its associated Windows application.
+    pub fn open_default(path: &Path) -> Result<(), String> {
+        let file = wide(path);
+        let verb = wide("open");
+        let dir = path.parent().map(wide);
+        let result = unsafe {
+            ShellExecuteW(
+                null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                null(),
+                dir.as_ref().map_or(null(), |d| d.as_ptr()),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        match result {
+            r if r > 32 => Ok(()),
+            31 => Err(format!("No app is associated with \"{}\".", path.display())),
+            r => Err(format!("Windows could not open \"{}\" (error {r}).", path.display())),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn init() {}
+
+#[cfg(not(windows))]
+pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn drives() -> Vec<DriveInfo> {
+    vec![DriveInfo { root: PathBuf::from("/"), label: String::new(), kind: "root", space: None }]
+}
+
+#[cfg(not(windows))]
+pub fn open_default(path: &Path) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    Command::new(opener)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Cannot run {opener}: {e}"))
+}
+
+#[cfg(not(windows))]
+pub fn is_hidden(name: &str, _meta: Option<&Metadata>) -> bool {
+    name.starts_with('.')
+}
+
+#[cfg(not(windows))]
+pub fn is_executable(_name: &str, meta: Option<&Metadata>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// The shell that runs command-line input and Ctrl+O sessions.
+#[derive(Clone, Debug)]
+pub enum Shell {
+    PowerShell(PathBuf),
+    Cmd,
+    Posix(PathBuf),
+}
+
+impl Shell {
+    /// `RMC_SHELL` if set, else pwsh, Windows PowerShell or cmd (or `$SHELL` elsewhere).
+    pub fn detect() -> Self {
+        if let Ok(custom) = std::env::var("RMC_SHELL")
+            && !custom.trim().is_empty()
+        {
+            return Self::from_program(custom.trim());
+        }
+        Self::default_shell()
+    }
+
+    fn from_program(program: &str) -> Self {
+        let stem = Path::new(program)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        match stem.as_str() {
+            "cmd" => Shell::Cmd,
+            "pwsh" | "powershell" => Shell::PowerShell(program.into()),
+            _ => Shell::Posix(program.into()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn default_shell() -> Self {
+        util::find_in_path("pwsh.exe")
+            .or_else(|| util::find_in_path("powershell.exe"))
+            .map_or(Shell::Cmd, Shell::PowerShell)
+    }
+
+    #[cfg(not(windows))]
+    fn default_shell() -> Self {
+        Shell::Posix(std::env::var_os("SHELL").map_or_else(|| "/bin/sh".into(), PathBuf::from))
+    }
+
+    /// A command that runs one line of user input.
+    pub fn command(&self, line: &str) -> Command {
+        match self {
+            Shell::PowerShell(program) => {
+                // -EncodedCommand sidesteps all quoting problems: it takes base64 UTF-16LE.
+                let utf16: Vec<u8> = line.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                let mut command = Command::new(program);
+                command.args(["-NoLogo", "-EncodedCommand", &util::base64(&utf16)]);
+                command
+            }
+            Shell::Cmd => {
+                let mut command = Command::new("cmd.exe");
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    command.raw_arg(format!("/S /C \"{line}\""));
+                }
+                #[cfg(not(windows))]
+                command.args(["/C", line]);
+                command
+            }
+            Shell::Posix(program) => {
+                let mut command = Command::new(program);
+                command.arg("-c").arg(line);
+                command
+            }
+        }
+    }
+
+    /// An interactive shell session (Ctrl+O).
+    pub fn interactive(&self) -> Command {
+        match self {
+            Shell::PowerShell(program) => {
+                let mut command = Command::new(program);
+                command.arg("-NoLogo");
+                command
+            }
+            Shell::Cmd => Command::new("cmd.exe"),
+            Shell::Posix(program) => Command::new(program),
+        }
+    }
+
+    pub fn quote(&self, s: &str) -> String {
+        match self {
+            Shell::PowerShell(_) => format!("'{}'", s.replace('\'', "''")),
+            Shell::Cmd => format!("\"{s}\""),
+            Shell::Posix(_) => format!("'{}'", s.replace('\'', "'\\''")),
+        }
+    }
+
+    /// A command line that runs the program or script at `path`.
+    pub fn run_file_line(&self, path: &Path) -> String {
+        let quoted = self.quote(&path.display().to_string());
+        match self {
+            Shell::PowerShell(_) => format!("& {quoted}"),
+            _ => quoted,
+        }
+    }
+}
