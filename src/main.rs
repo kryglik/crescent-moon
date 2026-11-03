@@ -3,6 +3,7 @@
 mod app;
 mod dialog;
 mod hotlist;
+mod mouse;
 mod ops;
 mod panel;
 mod platform;
@@ -18,7 +19,7 @@ use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use ratatui::crossterm::{cursor, execute, terminal};
 
 use app::{App, Config, External};
@@ -26,10 +27,11 @@ use app::{App, Config, External};
 const USAGE: &str = "\
 rmc - two-panel file manager
 
-Usage: rmc [LEFT_DIR [RIGHT_DIR]] [--cwd-file FILE]
+Usage: rmc [LEFT_DIR [RIGHT_DIR]] [--cwd-file FILE] [--no-mouse]
 
   --cwd-file FILE   on exit, write the active panel's directory to FILE
                     (lets a shell function cd there)
+  --no-mouse        leave the mouse to the terminal (normal text selection)
   -h, --help        show this help
   -V, --version     show the version
 
@@ -39,11 +41,12 @@ Environment: RMC_EDITOR (default nvim), RMC_VIEWER (default nvim -R),
 struct Args {
     dirs: Vec<PathBuf>,
     cwd_file: Option<PathBuf>,
+    mouse: bool,
 }
 
 /// Ok(None) means the program should just exit (help or version printed).
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut args = Args { dirs: Vec::new(), cwd_file: None };
+    let mut args = Args { dirs: Vec::new(), cwd_file: None, mouse: true };
     let mut iter = std::env::args_os().skip(1);
     while let Some(arg) = iter.next() {
         match arg.to_str() {
@@ -58,6 +61,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             Some("--cwd-file") => {
                 args.cwd_file = Some(iter.next().ok_or("--cwd-file needs a file name")?.into());
             }
+            Some("--no-mouse") => args.mouse = false,
             Some(s) if s.starts_with('-') => return Err(format!("unknown option {s} (try --help)")),
             _ if args.dirs.len() < 2 => args.dirs.push(arg.into()),
             _ => return Err("at most two directories can be given".into()),
@@ -83,7 +87,9 @@ fn main() -> ExitCode {
     let mut app = App::new(left, right, Config::from_env());
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
+    let mouse = Mouse(args.mouse);
+    let result = mouse.capture().and_then(|()| run(&mut terminal, &mut app, mouse));
+    mouse.release();
     ratatui::restore();
 
     if let Some(file) = args.cwd_file {
@@ -98,18 +104,45 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+/// Mouse capture, unless `--no-mouse` was given. While it is on, the terminal's own
+/// text selection needs Shift held down.
+#[derive(Clone, Copy)]
+struct Mouse(bool);
+
+impl Mouse {
+    fn capture(self) -> io::Result<()> {
+        if self.0 {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        }
+        Ok(())
+    }
+
+    fn release(self) {
+        if self.0 {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+    }
+}
+
+fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Result<()> {
+    // A panic must not leave the terminal reporting mouse movements as text.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        mouse.release();
+        previous_hook(info);
+    }));
+
     while !app.quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
         let timeout = Duration::from_millis(if app.is_busy() { 50 } else { 500 });
         if event::poll(timeout)? {
-            // Handle everything already queued (fast typing, pastes) before drawing again.
+            // Handle everything already queued (fast typing, pastes, mouse moves) before drawing again.
             loop {
-                // Windows reports key releases too; only presses (and repeats) count.
-                if let Event::Key(key) = event::read()?
-                    && key.kind != KeyEventKind::Release
-                {
-                    app.on_key(key);
+                match event::read()? {
+                    // Windows reports key releases too; only presses (and repeats) count.
+                    Event::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+                    Event::Mouse(event) => app.on_mouse(event),
+                    _ => {}
                 }
                 if app.quit || app.external.is_some() || !event::poll(Duration::ZERO)? {
                     break;
@@ -118,7 +151,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         }
         app.tick();
         if let Some(external) = app.external.take() {
-            let result = run_external(terminal, app, external)?;
+            let result = run_external(terminal, app, external, mouse)?;
             app.after_external(result);
         }
     }
@@ -126,7 +159,12 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 }
 
 /// Hands the terminal to an editor, viewer, shell or command, then takes it back.
-fn run_external(terminal: &mut DefaultTerminal, app: &App, external: External) -> io::Result<Result<(), String>> {
+fn run_external(
+    terminal: &mut DefaultTerminal,
+    app: &App,
+    external: External,
+    mouse: Mouse,
+) -> io::Result<Result<(), String>> {
     let cwd = app.active_panel().cwd.clone();
     let config = &app.config;
     let (mut command, name) = match &external {
@@ -138,6 +176,7 @@ fn run_external(terminal: &mut DefaultTerminal, app: &App, external: External) -
     let wait = matches!(external, External::Command(_));
     command.current_dir(&cwd);
 
+    mouse.release();
     terminal::disable_raw_mode()?;
     execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
     match &external {
@@ -157,6 +196,7 @@ fn run_external(terminal: &mut DefaultTerminal, app: &App, external: External) -
     }
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), terminal::EnterAlternateScreen)?;
+    mouse.capture()?;
     terminal.clear()?;
     Ok(result)
 }

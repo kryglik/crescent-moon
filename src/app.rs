@@ -3,13 +3,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
 use crate::hotlist::Hotlist;
+use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::panel::{DirSize, Panel};
 use crate::platform::{self, Shell};
@@ -80,7 +81,12 @@ pub struct App {
     pub external: Option<External>,
     pub quit: bool,
     pub hotlist: Hotlist,
+    /// Screen areas from the last frame, for the mouse.
+    pub hit: HitAreas,
+    pub(crate) last_click: Option<LastClick>,
     sizer: Option<Sizer>,
+    /// Free space of network/optical drives, arriving while the drive picker is open.
+    drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
     history: Vec<String>,
     history_pos: Option<usize>,
 }
@@ -98,7 +104,10 @@ impl App {
             config,
             external: None,
             quit: false,
+            hit: HitAreas::default(),
+            last_click: None,
             sizer: None,
+            drive_space: None,
             history: Vec::new(),
             history_pos: None,
         }
@@ -106,7 +115,8 @@ impl App {
 
     /// Whether background work is running (the main loop then redraws more often).
     pub fn is_busy(&self) -> bool {
-        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy)
+        let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
+        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -305,7 +315,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(drive) = drives.get(cursor) {
-                        self.change_dir(side, drive.root.clone());
+                        self.switch_drive(side, &drive.root);
                     }
                     None
                 }
@@ -313,7 +323,7 @@ impl App {
                     let wanted = format!("{}:", c.to_ascii_uppercase());
                     match drives.iter().find(|d| d.root.to_string_lossy().starts_with(&wanted)) {
                         Some(drive) => {
-                            self.change_dir(side, drive.root.clone());
+                            self.switch_drive(side, &drive.root);
                             None
                         }
                         None => Some(Dialog::Drives { side, drives, cursor }),
@@ -482,6 +492,16 @@ impl App {
 
     /// Picks up directory sizes and the progress, questions and end of a running job.
     pub fn tick(&mut self) {
+        if let Some(answers) = &self.drive_space {
+            while let Ok((root, space)) = answers.try_recv() {
+                if let Some(Dialog::Drives { drives, .. }) = &mut self.dialog
+                    && let Some(drive) = drives.iter_mut().find(|d| d.root == root)
+                {
+                    drive.space = space;
+                    drive.pending = false;
+                }
+            }
+        }
         if let Some(sizer) = &self.sizer {
             while let Ok(update) = sizer.updates.try_recv() {
                 for panel in &mut self.panels {
@@ -554,10 +574,20 @@ impl App {
             .iter()
             .position(|d| cwd.starts_with(&d.root.to_string_lossy().to_lowercase()))
             .unwrap_or(0);
+        let slow: Vec<PathBuf> = drives.iter().filter(|d| d.pending).map(|d| d.root.clone()).collect();
+        self.drive_space = (!slow.is_empty()).then(|| platform::query_space_later(slow));
         self.dialog = Some(Dialog::Drives { side, drives, cursor });
     }
 
-    fn open_current(&mut self) {
+    /// Goes to the folder the panel last had open on that drive. Choosing the drive the panel
+    /// is already on goes to its root, as in Total Commander.
+    fn switch_drive(&mut self, side: usize, root: &Path) {
+        let panel = &self.panels[side];
+        let target = if util::same_volume(root, &panel.cwd) { root.to_path_buf() } else { panel.dir_on_drive(root) };
+        self.change_dir(side, target);
+    }
+
+    pub(crate) fn open_current(&mut self) {
         let Some(entry) = self.active_panel().current().cloned() else { return };
         if entry.is_parent {
             self.go_up();
@@ -719,8 +749,15 @@ impl App {
         }
         match cd_argument(&line) {
             Some(arg) => {
-                let cwd = self.active_panel().cwd.clone();
-                let target = if arg.is_empty() { util::home_dir().unwrap_or(cwd.clone()) } else { util::resolve(&cwd, arg) };
+                let panel = self.active_panel();
+                let cwd = panel.cwd.clone();
+                let target = match util::bare_drive(arg) {
+                    // "cd e:" returns to where this panel was on E: (and stays put when already there).
+                    Some(root) if util::same_volume(&root, &cwd) => return,
+                    Some(root) => panel.dir_on_drive(&root),
+                    None if arg.is_empty() => util::home_dir().unwrap_or(cwd),
+                    None => util::resolve(&cwd, arg),
+                };
                 self.change_dir(self.active, target);
             }
             None => self.external = Some(External::Command(line)),

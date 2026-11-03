@@ -158,15 +158,24 @@ pub fn child_name(dir: &Path, path: &Path) -> Option<String> {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
 }
 
+/// The drive part of a path (`e:` or `\\server\share`, lower-cased); None without one.
+pub fn volume_key(path: &Path) -> Option<String> {
+    match normalize(path).components().next() {
+        Some(Component::Prefix(p)) => Some(p.as_os_str().to_string_lossy().to_lowercase()),
+        _ => None,
+    }
+}
+
 /// Whether two paths are on the same drive, so a move can be a plain rename.
 pub fn same_volume(a: &Path, b: &Path) -> bool {
-    fn prefix(path: &Path) -> Option<String> {
-        match normalize(path).components().next() {
-            Some(Component::Prefix(p)) => Some(p.as_os_str().to_string_lossy().to_lowercase()),
-            _ => None,
-        }
-    }
-    prefix(a) == prefix(b)
+    volume_key(a) == volume_key(b)
+}
+
+/// `e:` alone (a whole drive rather than a place on it) as that drive's root.
+pub fn bare_drive(input: &str) -> Option<PathBuf> {
+    let bytes = input.trim().as_bytes();
+    (cfg!(windows) && bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| PathBuf::from(format!("{}:\\", (bytes[0] as char).to_ascii_uppercase())))
 }
 
 pub fn with_trailing_separator(path: &Path) -> String {

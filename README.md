@@ -44,7 +44,21 @@ Press **F1** inside rmc for the full list. The essentials:
 | F10 | quit |
 
 Typing anywhere goes to the command line; Enter runs it in the active panel's directory.
-`cd DIR` (and `cd e:`) changes the panel's directory.
+`cd DIR` changes the panel's directory.
+
+Each panel remembers where it was on every drive: picking E: in the drive picker (or `cd e:`)
+returns to that folder, and picking the drive the panel is already on goes to its root.
+Network drives show the share they are mapped to and their free space, which is fetched in
+the background so an unreachable share can't freeze the screen.
+
+### Mouse
+
+Click selects, double-click opens, right-click marks, the wheel scrolls the panel under the
+pointer. Click a column heading (Name, Size, Modify time) to sort by it, and the F-key bar
+labels to run them; dialog buttons and the drive and hotlist rows are clickable too.
+
+While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
+`rmc --no-mouse` to leave the mouse to the terminal.
 
 ## Settings
 
@@ -84,6 +98,7 @@ function rmc {
 | `src/panel.rs` | a panel: listing, sorting, cursor, marks |
 | `src/ops.rs` | copy/move/delete jobs on a worker thread (progress, questions, cancel) |
 | `src/sizes.rs` | directory size measuring on a worker thread |
+| `src/mouse.rs` | mouse handling, using the screen areas `ui.rs` records each frame |
 | `src/hotlist.rs` | favourite folders and their file |
 | `src/dialog.rs` | dialogs, buttons, line editor, help text |
 | `src/ui.rs` | drawing with ratatui |
@@ -92,4 +107,4 @@ function rmc {
 
 ## Not there yet
 
-Mouse, archives and SFTP, a persistent shell like mc's subshell, a user menu, themes.
+Archives and SFTP, a persistent shell like mc's subshell, a user menu, themes.

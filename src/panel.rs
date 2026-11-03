@@ -94,6 +94,8 @@ pub struct Panel {
     /// Visible list rows, updated on every draw (used for PgUp/PgDn).
     pub page: usize,
     pub space: Option<(u64, u64)>,
+    /// Where this panel last was on each drive (keyed by `util::volume_key`).
+    drive_dirs: HashMap<String, PathBuf>,
 }
 
 impl Panel {
@@ -110,6 +112,7 @@ impl Panel {
             show_hidden,
             page: 20,
             space: None,
+            drive_dirs: HashMap::new(),
         };
         let cwd = util::normalize(&cwd);
         let candidates: Vec<PathBuf> = cwd
@@ -124,7 +127,24 @@ impl Panel {
                 break;
             }
         }
+        panel.remember_drive();
         panel
+    }
+
+    fn remember_drive(&mut self) {
+        if let Some(key) = util::volume_key(&self.cwd) {
+            self.drive_dirs.insert(key, self.cwd.clone());
+        }
+    }
+
+    /// Where this panel last was on the drive of `root`, if that folder still exists;
+    /// otherwise the root itself.
+    pub fn dir_on_drive(&self, root: &Path) -> PathBuf {
+        util::volume_key(root)
+            .and_then(|key| self.drive_dirs.get(&key))
+            .filter(|dir| dir.is_dir())
+            .cloned()
+            .unwrap_or_else(|| root.to_path_buf())
     }
 
     /// Re-reads the directory. Marks of entries that still exist are kept.
@@ -152,8 +172,12 @@ impl Panel {
             let cwd = self.cwd.clone();
             let show_hidden = self.show_hidden;
             let sort = self.sort;
+            let drive_dirs = std::mem::take(&mut self.drive_dirs);
             *self = Panel::new(cwd, show_hidden);
             self.sort = sort;
+            for (drive, dir) in drive_dirs {
+                self.drive_dirs.entry(drive).or_insert(dir);
+            }
             let _ = self.load();
             return;
         }
@@ -171,6 +195,7 @@ impl Panel {
             Ok(()) => {
                 self.cursor = 0;
                 self.offset = 0;
+                self.remember_drive();
                 // Coming back up: put the cursor on the directory we just left.
                 if let Some(name) = util::child_name(&self.cwd, &previous) {
                     self.select_name(&name);
@@ -476,6 +501,23 @@ mod tests {
         let parent = panel.cwd.parent().unwrap().to_path_buf();
         panel.change_dir(parent).unwrap();
         assert_eq!(panel.current().unwrap().name, "two");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remembers_the_last_folder_on_each_drive() {
+        let tmp = TempDir::new("panel-drives");
+        let deep = tmp.dir("deep/er");
+        let mut panel = Panel::new(deep.clone(), true);
+        let root = PathBuf::from(format!("{}\\", util::volume_key(&deep).unwrap().to_uppercase()));
+        // Somewhere on another (non-existent here) drive and back: the folder is remembered.
+        assert!(util::same_path(&panel.dir_on_drive(&root), &deep));
+        assert_eq!(panel.dir_on_drive(Path::new(r"Q:\")), PathBuf::from(r"Q:\"), "unknown drive: root");
+        panel.change_dir(tmp.path().to_path_buf()).unwrap();
+        assert!(util::same_path(&panel.dir_on_drive(&root), tmp.path()), "the latest visit wins");
+        // A remembered folder that was deleted falls back to the root.
+        drop(tmp);
+        assert_eq!(panel.dir_on_drive(&root), root);
     }
 
     #[test]

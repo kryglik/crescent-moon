@@ -3,6 +3,8 @@
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use crate::util;
 
@@ -11,10 +13,27 @@ pub const TRASH_NAME: &str = if cfg!(windows) { "the Recycle Bin" } else { "the 
 
 pub struct DriveInfo {
     pub root: PathBuf,
+    /// Volume label, or for a network drive the share it is mapped to.
     pub label: String,
     pub kind: &'static str,
-    /// Free and total bytes, for local drives only.
+    /// Free and total bytes.
     pub space: Option<(u64, u64)>,
+    /// The space is still being asked for (network and optical drives).
+    pub pending: bool,
+}
+
+/// Asks for the free space of slow drives on background threads, so an offline share
+/// cannot freeze the screen. Each answer arrives as `(root, space)`.
+pub fn query_space_later(roots: Vec<PathBuf>) -> Receiver<(PathBuf, Option<(u64, u64)>)> {
+    let (tx, rx) = mpsc::channel();
+    for root in roots {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let space = disk_space(&root);
+            let _ = tx.send((root, space));
+        });
+    }
+    rx
 }
 
 #[cfg(windows)]
@@ -43,6 +62,7 @@ mod win {
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
 
+    use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
     };
@@ -92,12 +112,28 @@ mod win {
         String::from_utf16_lossy(&buf[..len])
     }
 
+    /// The share a mapped network drive points to, such as `\\nas\photos`.
+    fn remote_name(letter: char) -> String {
+        let local = wide(format!("{letter}:"));
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        if unsafe { WNetGetConnectionW(local.as_ptr(), buf.as_mut_ptr(), &mut len) } != 0 {
+            return String::new();
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+
+    /// All drives. Local ones come with their label and free space; for network and optical
+    /// drives, which can block for seconds when offline or empty, the space is left `pending`
+    /// (see `query_space_later`).
     pub fn drives() -> Vec<DriveInfo> {
         let mask = unsafe { GetLogicalDrives() };
         (0..26u8)
             .filter(|i| mask & (1 << i) != 0)
             .map(|i| {
-                let root = format!("{}:\\", (b'A' + i) as char);
+                let letter = (b'A' + i) as char;
+                let root = format!("{letter}:\\");
                 let root_w = wide(&root);
                 let code = unsafe { GetDriveTypeW(root_w.as_ptr()) };
                 let kind = match code {
@@ -108,11 +144,16 @@ mod win {
                     DRIVE_RAMDISK => "ram disk",
                     _ => "unknown",
                 };
-                // Network and optical drives can block for seconds when offline or empty.
                 let local = matches!(code, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_RAMDISK);
+                let label = match code {
+                    _ if local => volume_label(&root_w),
+                    DRIVE_REMOTE => remote_name(letter),
+                    _ => String::new(),
+                };
                 DriveInfo {
-                    label: if local { volume_label(&root_w) } else { String::new() },
+                    label,
                     space: if local { disk_space(Path::new(&root)) } else { None },
+                    pending: !local,
                     root: PathBuf::from(root),
                     kind,
                 }
@@ -153,7 +194,7 @@ pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
 
 #[cfg(not(windows))]
 pub fn drives() -> Vec<DriveInfo> {
-    vec![DriveInfo { root: PathBuf::from("/"), label: String::new(), kind: "root", space: None }]
+    vec![DriveInfo { root: PathBuf::from("/"), label: String::new(), kind: "root", space: None, pending: false }]
 }
 
 #[cfg(not(windows))]

@@ -1,4 +1,5 @@
 //! Drawing: two panels, the command line, the function-key bar, dialogs and job progress.
+//! Every frame also records where things are (`HitAreas`) so mouse clicks can find them.
 
 use std::time::SystemTime;
 
@@ -12,11 +13,13 @@ use ratatui::widgets::{Block, Clear, Gauge, Padding, Paragraph, Widget};
 use crate::app::App;
 use crate::dialog::{self, Button, Dialog};
 use crate::hotlist::Hotlist;
+use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
 use crate::panel::{Entry, Panel};
+use crate::platform::DriveInfo;
 use crate::util;
 
-const KEYS: [&str; 10] = ["Help", "Rename", "View", "Edit", "Copy", "Move", "Mkdir", "Delete", "Sort", "Quit"];
+pub const KEYS: [&str; 10] =["Help", "Rename", "View", "Edit", "Copy", "Move", "Mkdir", "Delete", "Sort", "Quit"];
 
 fn panel_style() -> Style {
     Style::new().fg(Color::Gray).bg(Color::Blue)
@@ -36,12 +39,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(4), Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panels_area);
 
+    let mut hit = HitAreas { keybar: keys_area, ..HitAreas::default() };
     let active = app.active;
     let search = app.quicksearch.clone();
     let mut search_cursor = None;
     for (side, rect) in [left, right].into_iter().enumerate() {
         let query = if side == active { search.as_deref() } else { None };
-        let cursor = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query);
+        let (cursor, panel_hit) = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query);
+        hit.panels[side] = panel_hit;
         search_cursor = search_cursor.or(cursor);
     }
     let cmd_cursor = draw_cmdline(frame, cmd_area, app);
@@ -51,16 +56,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_progress(frame, area, job);
     }
     if let Some(dialog) = &app.dialog {
-        if let Some(position) = draw_dialog(frame, area, dialog, &app.hotlist) {
+        let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist);
+        if let Some(position) = cursor {
             frame.set_cursor_position(position);
         }
+        hit.dialog = Some(dialog_hit);
     } else if app.job.is_none() {
         frame.set_cursor_position(search_cursor.unwrap_or(cmd_cursor));
     }
+    app.hit = hit;
 }
 
-/// Draws one panel; returns the cursor position while quick search is typing into it.
-fn draw_panel(buf: &mut Buffer, area: Rect, panel: &mut Panel, active: bool, search: Option<&str>) -> Option<Position> {
+/// Draws one panel. Returns the cursor position while quick search is typing into it,
+/// and where the panel's parts are for the mouse.
+fn draw_panel(
+    buf: &mut Buffer,
+    area: Rect,
+    panel: &mut Panel,
+    active: bool,
+    search: Option<&str>,
+) -> (Option<Position>, PanelHit) {
     let base = panel_style();
     let inner_w = area.width.saturating_sub(2) as usize;
     let path = util::fit_left(&panel.cwd.display().to_string(), inner_w.saturating_sub(4));
@@ -79,7 +94,7 @@ fn draw_panel(buf: &mut Buffer, area: Rect, panel: &mut Panel, active: bool, sea
     let inner = block.inner(area);
     block.render(area, buf);
     if inner.height < 4 || inner.width < 8 {
-        return None;
+        return (None, PanelHit { area, ..PanelHit::default() });
     }
 
     let list_h = (inner.height - 3) as usize;
@@ -89,6 +104,14 @@ fn draw_panel(buf: &mut Buffer, area: Rect, panel: &mut Panel, active: bool, sea
     let name_w = if details { inner_w - size_w - time_w - 2 } else { inner_w };
     let size_x = inner.x + name_w as u16 + 1;
     let time_x = size_x + size_w as u16 + 1;
+    let hit = PanelHit {
+        area,
+        list: Rect::new(inner.x, inner.y + 1, inner.width, list_h as u16),
+        header_y: inner.y,
+        size_x,
+        time_x,
+        details,
+    };
 
     // Column headings, with the sort indicator in the corner like mc.
     let heading = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -152,7 +175,7 @@ fn draw_panel(buf: &mut Buffer, area: Rect, panel: &mut Panel, active: bool, sea
         let text = format!("Search: {query}");
         buf.set_string(inner.x, status_y, util::fit(&text, inner_w), cursor_style());
         let x = util::width(&text).min(inner_w.saturating_sub(1)) as u16;
-        return Some(Position::new(inner.x + x, status_y));
+        return (Some(Position::new(inner.x + x, status_y)), hit);
     }
     let status = match panel.current() {
         Some(e) if e.is_parent => "UP--DIR".to_string(),
@@ -160,7 +183,7 @@ fn draw_panel(buf: &mut Buffer, area: Rect, panel: &mut Panel, active: bool, sea
         None => String::new(),
     };
     buf.set_string(inner.x, status_y, util::fit(&status, inner_w), base);
-    None
+    (None, hit)
 }
 
 /// mc's type markers: `/` directory, `~` link to a directory, `@` link, `*` executable.
@@ -235,8 +258,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
 }
 
-/// Clears a centred box and draws a dialog frame; returns the area inside it.
-fn dialog_frame(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str, error: bool) -> Rect {
+/// Clears a centred box and draws a dialog frame; returns the box and the area inside it.
+fn dialog_frame(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str, error: bool) -> (Rect, Rect) {
     let rect = centered(area, width, height);
     let style = dialog_style(error);
     let title_style = if error { style.add_modifier(Modifier::BOLD) } else { style.fg(Color::Blue) };
@@ -247,15 +270,24 @@ fn dialog_frame(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
-    inner
+    (rect, inner)
 }
 
-fn buttons_line(buttons: &[Button], focus: usize, base: Style) -> Line<'static> {
-    let mut spans = Vec::new();
+/// The buttons centred in `width` columns (by hand, so their positions are known exactly),
+/// and each button's offset and width for the mouse.
+fn buttons_line(buttons: &[Button], focus: usize, base: Style, width: u16) -> (Line<'static>, Vec<(u16, u16)>) {
+    let widths: Vec<u16> = buttons.iter().map(|b| util::width(b.label) as u16 + 4).collect();
+    let total = widths.iter().sum::<u16>() + widths.len().saturating_sub(1) as u16;
+    let mut x = width.saturating_sub(total) / 2;
+    let mut spans = vec![Span::styled(" ".repeat(x as usize), base)];
+    let mut places = Vec::new();
     for (i, button) in buttons.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" ", base));
+            x += 1;
         }
+        places.push((x, widths[i]));
+        x += widths[i];
         let style = if i == focus { cursor_style() } else { base };
         let hot = button.label.char_indices().find(|(_, c)| c.eq_ignore_ascii_case(&button.hotkey));
         spans.push(Span::styled("[ ", style));
@@ -270,35 +302,52 @@ fn buttons_line(buttons: &[Button], focus: usize, base: Style) -> Line<'static> 
         }
         spans.push(Span::styled(" ]", style));
     }
-    Line::from(spans).centered()
+    (Line::from(spans), places)
 }
 
 /// A message with buttons under it (messages, confirmations and job questions).
-fn draw_message(frame: &mut Frame, area: Rect, title: &str, lines: &[String], buttons: &[Button], focus: usize, error: bool) {
+fn draw_message(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    buttons: &[Button],
+    focus: usize,
+    error: bool,
+) -> DialogHit {
     let widest = lines.iter().map(|l| util::width(l)).max().unwrap_or(0).max(util::width(title) + 4);
     let width = (widest as u16 + 4).clamp(34, area.width.saturating_sub(4).max(10));
     let height = lines.len() as u16 + 4;
-    let inner = dialog_frame(frame, area, width, height, title, error);
+    let (outer, inner) = dialog_frame(frame, area, width, height, title, error);
     let style = dialog_style(error);
     let mut text: Vec<Line> = lines.iter().map(|l| Line::from(util::fit_left(l, inner.width as usize))).collect();
     text.push(Line::default());
-    text.push(buttons_line(buttons, focus, style));
+    let button_y = inner.y + text.len() as u16;
+    let (line, places) = buttons_line(buttons, focus, style, inner.width);
+    text.push(line);
     frame.render_widget(Paragraph::new(text).style(style), inner);
+    let buttons = if button_y < inner.bottom() {
+        places.into_iter().enumerate().map(|(i, (x, w))| (Rect::new(inner.x + x, button_y, w, 1), i)).collect()
+    } else {
+        Vec::new()
+    };
+    DialogHit { area: outer, buttons, rows: None }
 }
 
-/// Draws the open dialog; returns where the text cursor goes, if it has one.
-fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist) -> Option<Position> {
+/// Draws the open dialog; returns where the text cursor goes, if it has one, and where
+/// its buttons and rows are.
+fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist) -> (Option<Position>, DialogHit) {
     match dialog {
-        Dialog::Message { title, lines, error } => draw_message(frame, area, title, lines, dialog::OK, 0, *error),
+        Dialog::Message { title, lines, error } => (None, draw_message(frame, area, title, lines, dialog::OK, 0, *error)),
         Dialog::Confirm { title, lines, focus, danger, .. } => {
-            draw_message(frame, area, title, lines, dialog::YES_NO, *focus, *danger)
+            (None, draw_message(frame, area, title, lines, dialog::YES_NO, *focus, *danger))
         }
         Dialog::Question { title, lines, buttons, focus, error, .. } => {
-            draw_message(frame, area, title, lines, buttons, *focus, *error)
+            (None, draw_message(frame, area, title, lines, buttons, *focus, *error))
         }
         Dialog::Input { title, prompt, edit, .. } => {
             let width = (area.width * 2 / 3).clamp(40, 90).min(area.width);
-            let inner = dialog_frame(frame, area, width, 6, title, false);
+            let (outer, inner) = dialog_frame(frame, area, width, 6, title, false);
             let style = dialog_style(false);
             let field_w = inner.width as usize;
             let (text, cursor) = edit.view(field_w.saturating_sub(1));
@@ -309,37 +358,14 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
                 Line::from(Span::styled("Enter = OK   Esc = cancel", style.fg(Color::DarkGray))).right_aligned(),
             ];
             frame.render_widget(Paragraph::new(lines).style(style), inner);
-            return Some(Position::new(inner.x + cursor as u16, inner.y + 1));
+            let cursor = Position::new(inner.x + cursor as u16, inner.y + 1);
+            (Some(cursor), DialogHit { area: outer, ..DialogHit::default() })
         }
-        Dialog::Drives { drives, cursor, side, .. } => {
-            let title = if *side == 0 { "Left drive" } else { "Right drive" };
-            let inner = dialog_frame(frame, area, 52, drives.len() as u16 + 2, title, false);
-            let style = dialog_style(false);
-            let lines: Vec<Line> = drives
-                .iter()
-                .enumerate()
-                .map(|(i, drive)| {
-                    let space = drive
-                        .space
-                        .map(|(free, total)| format!("{} free of {}", util::human_size(free), util::human_size(total)))
-                        .unwrap_or_default();
-                    let text = format!(
-                        "{}  {} {} {}",
-                        drive.root.display(),
-                        util::fit(&drive.label, 12),
-                        util::pad(drive.kind, 9),
-                        space
-                    );
-                    let style = if i == *cursor { cursor_style() } else { style };
-                    Line::from(Span::styled(util::fit(&text, inner.width as usize), style))
-                })
-                .collect();
-            frame.render_widget(Paragraph::new(lines).style(style), inner);
-        }
-        Dialog::Hotlist { cursor } => draw_hotlist(frame, area, hotlist, *cursor),
+        Dialog::Drives { drives, cursor, side, .. } => (None, draw_drives(frame, area, drives, *cursor, *side)),
+        Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         Dialog::Help { scroll } => {
             let height = (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
-            let inner = dialog_frame(frame, area, 64, height, "rmc keys (Esc closes)", false);
+            let (outer, inner) = dialog_frame(frame, area, 64, height, "rmc keys (Esc closes)", false);
             let visible = inner.height as usize;
             let start = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
             let lines: Vec<Line> = dialog::HELP[start..]
@@ -352,16 +378,52 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines).style(dialog_style(false)), inner);
+            (None, DialogHit { area: outer, ..DialogHit::default() })
         }
     }
-    None
 }
 
-fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize) {
+/// The drive picker: letter, label (or network share), type and free space. Slow drives
+/// show "checking…" until their answer arrives.
+fn draw_drives(frame: &mut Frame, area: Rect, drives: &[DriveInfo], cursor: usize, side: usize) -> DialogHit {
+    let label_w = drives.iter().map(|d| util::width(&d.label)).max().unwrap_or(0).min(32);
+    let texts: Vec<String> = drives
+        .iter()
+        .map(|drive| {
+            let space = match (drive.space, drive.pending) {
+                (Some((free, total)), _) => format!("{} free of {}", util::human_size(free), util::human_size(total)),
+                (None, true) => "checking…".into(),
+                (None, false) if drive.kind == "network" => "not reachable".into(),
+                (None, false) => String::new(),
+            };
+            let label = if label_w > 0 { format!("{} ", util::fit(&drive.label, label_w)) } else { String::new() };
+            format!("{}  {label}{} {space}", drive.root.display(), util::pad(drive.kind, 9))
+        })
+        .collect();
+    // Room for "4.5T free of 10.9T" even before the answers arrive, so the box doesn't grow.
+    let widest = texts.iter().map(|t| util::width(t)).max().unwrap_or(0).max(label_w + 37);
+    let width = (widest as u16 + 4).max(30);
+    let title = if side == 0 { "Left drive" } else { "Right drive" };
+    let (outer, inner) = dialog_frame(frame, area, width, drives.len() as u16 + 2, title, false);
+    let style = dialog_style(false);
+    let lines: Vec<Line> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let row_style = if i == cursor { cursor_style() } else { style };
+            Line::from(Span::styled(util::fit(text, inner.width as usize), row_style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let rows = Rect::new(inner.x, inner.y, inner.width, (drives.len() as u16).min(inner.height));
+    DialogHit { area: outer, buttons: Vec::new(), rows: Some((rows, 0)) }
+}
+
+fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize) -> DialogHit {
     let rows = hotlist.dirs.len().max(1) as u16;
     let height = (rows + 4).min(area.height.saturating_sub(2)).max(6);
     let width = (area.width * 2 / 3).clamp(50, 100).min(area.width);
-    let inner = dialog_frame(frame, area, width, height, "Directory hotlist", false);
+    let (outer, inner) = dialog_frame(frame, area, width, height, "Directory hotlist", false);
     let style = dialog_style(false);
     let list_h = inner.height.saturating_sub(2) as usize;
     let field_w = inner.width as usize;
@@ -383,11 +445,14 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
     let hint = "Enter/1-9 go  Ins add here  Del remove  Shift+↑↓ move";
     lines.push(Line::from(Span::styled(util::fit_left(hint, field_w), style.fg(Color::DarkGray))).right_aligned());
     frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let shown = hotlist.dirs.len().saturating_sub(offset).min(list_h) as u16;
+    let rows = (shown > 0).then(|| (Rect::new(inner.x, inner.y, inner.width, shown), offset));
+    DialogHit { area: outer, buttons: Vec::new(), rows }
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
     let width = area.width.saturating_sub(4).clamp(30, 72);
-    let inner = dialog_frame(frame, area, width, 8, job.title, false);
+    let (_, inner) = dialog_frame(frame, area, width, 8, job.title, false);
     if inner.height < 6 {
         return;
     }
@@ -483,6 +548,26 @@ mod tests {
         assert!(screen.contains(r"2 E:\devel"));
         assert!(screen.contains("3072M"), "measured size shown");
         assert!(screen.contains("5.0M…"), "running total shown");
+    }
+
+    #[test]
+    fn drive_picker_fills_in_slow_drives() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new("ui-drives");
+        let mut app = app_for(&tmp);
+        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::ALT));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.is_busy() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            app.tick();
+        }
+        let screen = render(&mut app, 100, 20);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Left drive"));
+        assert!(!screen.contains("checking…") || Instant::now() >= deadline);
     }
 
     #[test]
