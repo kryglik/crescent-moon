@@ -40,21 +40,35 @@ Press **F1** inside rmc for the full list. The essentials:
 | F8, Delete | to the Recycle Bin (Shift: permanently) |
 | F9 | sort by name, extension, size, time |
 | Ctrl+S | quick search |
-| Ctrl+O | shell; Ctrl+O at its prompt (or `exit`) comes back, and the panel follows the shell's `cd` |
+| Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | F10 | quit |
 
-Typing anywhere goes to the command line; Enter runs it in the active panel's directory.
-`cd DIR` changes the panel's directory.
+Typing anywhere goes to the command line; Enter runs it in the shell (see below), in the
+active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder.
 
 Each panel remembers where it was on every drive: picking E: in the drive picker (or `cd e:`)
 returns to that folder, and picking the drive the panel is already on goes to its root.
 Network drives show the share they are mapped to and their free space, which is fetched in
 the background so an unreachable share can't freeze the screen.
 
-The Ctrl+O shell is a fresh pwsh each time (it starts in about 0.2 s): your PSReadLine history
-carries over, variables don't. rmc wraps your prompt so it notes the current folder, and binds
-Ctrl+O at the prompt to go back. With `RMC_SHELL=cmd` you leave with `exit` and the panel
-stays where it was.
+### The shell
+
+Like mc's subshell, there is one shell for the whole session. It starts with the first Ctrl+O
+(or the first command typed in rmc) and runs in a pseudo-console (ConPTY) that rmc owns, so it
+keeps going while the panels are shown: variables stay, and a long command keeps running in the
+background. Ctrl+O switches between the panels and the shell's screen, which rmc draws full
+screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
+
+- If you `cd` in the shell, the active panel follows when you come back to the panels.
+- If you move the panel and the shell is idle at its prompt, rmc types the `cd` for you when you
+  switch to it (as `__rmc_cd`, kept out of your history).
+- A command typed in rmc while the shell is busy is refused rather than typed into the running
+  program.
+- `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.
+
+This works with pwsh or Windows PowerShell: rmc starts it with a small script that wraps your
+prompt so each prompt reports its number and folder. With `RMC_SHELL=cmd` the shell still
+works, but the folders don't follow each other.
 
 ### Mouse
 
@@ -104,6 +118,7 @@ function rmc {
 | `src/ops.rs` | copy/move/delete jobs on a worker thread (progress, questions, cancel) |
 | `src/sizes.rs` | directory size measuring on a worker thread |
 | `src/mouse.rs` | mouse handling, using the screen areas `ui.rs` records each frame |
+| `src/subshell.rs` | the persistent shell: ConPTY via portable-pty, screen copy via vt100, key encoding |
 | `src/hotlist.rs` | favourite folders and their file |
 | `src/dialog.rs` | dialogs, buttons, line editor, help text |
 | `src/ui.rs` | drawing with ratatui |
@@ -112,4 +127,4 @@ function rmc {
 
 ## Not there yet
 
-Archives and SFTP, a persistent shell like mc's subshell, a user menu, themes.
+Archives and SFTP, a user menu, themes.

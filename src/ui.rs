@@ -17,6 +17,7 @@ use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
 use crate::panel::{Entry, Panel};
 use crate::platform::DriveInfo;
+use crate::subshell::Subshell;
 use crate::util;
 
 pub const KEYS: [&str; 10] =["Help", "Rename", "View", "Edit", "Copy", "Move", "Mkdir", "Delete", "Sort", "Quit"];
@@ -35,6 +36,20 @@ fn dialog_style(error: bool) -> Style {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    // The shell's screen always matches the terminal, shown or not, so its output wraps right.
+    app.screen_size = (area.height, area.width);
+    if let Some(shell) = app.subshell.as_mut() {
+        shell.resize(area.height, area.width);
+    }
+    if app.shell_shown
+        && let Some(shell) = &app.subshell
+    {
+        if let Some(cursor) = draw_shell(frame.buffer_mut(), area, shell) {
+            frame.set_cursor_position(cursor);
+        }
+        return;
+    }
+
     let [panels_area, cmd_area, keys_area] =
         Layout::vertical([Constraint::Min(4), Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panels_area);
@@ -184,6 +199,62 @@ fn draw_panel(
     };
     buf.set_string(inner.x, status_y, util::fit(&status, inner_w), base);
     (None, hit)
+}
+
+/// The persistent shell, full screen. Returns its cursor (none while scrolled back).
+fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell) -> Option<Position> {
+    shell
+        .with_screen(|screen| {
+            let (rows, cols) = screen.size();
+            for row in 0..area.height.min(rows.get()) {
+                for col in 0..area.width.min(cols.get()) {
+                    // The second half of a wide character belongs to the cell before it.
+                    let Some(cell) = screen.cell(row, col).filter(|c| !c.is_wide_continuation()) else {
+                        continue;
+                    };
+                    let target = &mut buf[(area.x + col, area.y + row)];
+                    target.set_symbol(if cell.has_contents() { cell.contents() } else { " " });
+                    target.set_style(shell_cell_style(cell));
+                }
+            }
+            let scrolled = screen.scrollback();
+            if scrolled > 0 {
+                let note = format!(" ↑ {scrolled} lines back · Shift+PgDn or any key returns ");
+                let w = util::width(&note).min(area.width as usize) as u16;
+                let style = Style::new().fg(Color::Black).bg(Color::Yellow);
+                buf.set_string(area.right() - w, area.y, util::take_width(&note, w as usize), style);
+                return None;
+            }
+            if screen.hide_cursor() {
+                return None;
+            }
+            let (row, col) = screen.cursor_position();
+            Some(Position::new(area.x + col.min(area.width - 1), area.y + row.min(area.height - 1)))
+        })
+        .flatten()
+}
+
+fn shell_cell_style(cell: &vt100::Cell) -> Style {
+    fn color(c: vt100::Color) -> Color {
+        match c {
+            vt100::Color::Default => Color::Reset,
+            vt100::Color::Idx(i) => Color::Indexed(i),
+            vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        }
+    }
+    let mut style = Style::new().fg(color(cell.fgcolor())).bg(color(cell.bgcolor()));
+    for (on, modifier) in [
+        (cell.bold(), Modifier::BOLD),
+        (cell.dim(), Modifier::DIM),
+        (cell.italic(), Modifier::ITALIC),
+        (cell.underline(), Modifier::UNDERLINED),
+        (cell.inverse(), Modifier::REVERSED),
+    ] {
+        if on {
+            style = style.add_modifier(modifier);
+        }
+    }
+    style
 }
 
 /// mc's type markers: `/` directory, `~` link to a directory, `@` link, `*` executable.
@@ -548,6 +619,37 @@ mod tests {
         assert!(screen.contains(r"2 E:\devel"));
         assert!(screen.contains("3072M"), "measured size shown");
         assert!(screen.contains("5.0M…"), "running total shown");
+    }
+
+    #[test]
+    fn draws_the_shell_full_screen() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use std::time::{Duration, Instant};
+        if !matches!(Shell::detect(), Shell::PowerShell(_)) {
+            return;
+        }
+        let tmp = TempDir::new("ui-shell");
+        let mut app = app_for(&tmp);
+        render(&mut app, 100, 20);
+        for c in "Write-Output 'Příliš žluťoučký'".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut screen = String::new();
+        while Instant::now() < deadline {
+            screen = render(&mut app, 100, 20);
+            if screen.lines().any(|l| l.trim() == "Příliš žluťoučký") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.lines().any(|l| l.trim() == "Příliš žluťoučký"), "{screen}");
+        assert!(screen.contains("PS "), "the prompt is there");
+        assert!(!screen.contains("10Quit"), "the panels are hidden");
     }
 
     #[test]

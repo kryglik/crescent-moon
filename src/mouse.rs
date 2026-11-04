@@ -69,6 +69,17 @@ impl App {
         if !wanted {
             return;
         }
+        if self.shell_shown {
+            // The wheel scrolls back through the shell's output.
+            if let Some(shell) = &self.subshell {
+                match event.kind {
+                    MouseEventKind::ScrollUp => shell.scroll(WHEEL_STEP),
+                    MouseEventKind::ScrollDown => shell.scroll(-WHEEL_STEP),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if self.dialog.is_some() {
             self.on_dialog_mouse(event.kind, pos);
             return;

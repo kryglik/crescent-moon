@@ -15,6 +15,7 @@ use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::panel::{DirSize, Panel};
 use crate::platform::{self, Shell};
 use crate::sizes::Sizer;
+use crate::subshell::Subshell;
 use crate::util;
 
 /// Something to run outside the TUI; the main loop gives it the terminal.
@@ -84,8 +85,14 @@ pub struct App {
     /// Screen areas from the last frame, for the mouse.
     pub hit: HitAreas,
     pub(crate) last_click: Option<LastClick>,
-    /// The "how to get back" line has been shown for the Ctrl+O shell.
+    /// The "how to get back" line has been shown for the one-off Ctrl+O shell.
     pub shell_hint_shown: bool,
+    /// The persistent shell, started by the first Ctrl+O (or command typed in rmc).
+    pub subshell: Option<Subshell>,
+    /// The shell is on screen instead of the panels; keys go to it.
+    pub shell_shown: bool,
+    /// Rows and columns of the whole screen at the last draw; the shell's screen matches it.
+    pub screen_size: (u16, u16),
     sizer: Option<Sizer>,
     /// Free space of network/optical drives, arriving while the drive picker is open.
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
@@ -109,6 +116,9 @@ impl App {
             hit: HitAreas::default(),
             last_click: None,
             shell_hint_shown: false,
+            subshell: None,
+            shell_shown: false,
+            screen_size: (24, 80),
             sizer: None,
             drive_space: None,
             history: Vec::new(),
@@ -119,7 +129,7 @@ impl App {
     /// Whether background work is running (the main loop then redraws more often).
     pub fn is_busy(&self) -> bool {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
-        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending
+        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending || self.shell_shown
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -142,7 +152,9 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        if self.dialog.is_some() {
+        if self.shell_shown {
+            self.on_shell_key(key);
+        } else if self.dialog.is_some() {
             self.on_dialog_key(key);
         } else if let Some(job) = &self.job {
             if key.code == KeyCode::Esc {
@@ -212,7 +224,7 @@ impl App {
             KeyCode::Char('h') if ctrl && !alt => self.toggle_hidden(),
             KeyCode::Char('.') if alt && !ctrl => self.toggle_hidden(),
             KeyCode::Char('u') if ctrl && !alt => self.panels.swap(0, 1),
-            KeyCode::Char('o') if ctrl && !alt => self.external = Some(External::Shell),
+            KeyCode::Char('o') if ctrl && !alt => self.show_shell(),
             // Ctrl+\ is a dead key on the Czech layout, so Ctrl+D (as in Total Commander) works too.
             KeyCode::Char('\\' | 'd' | '\u{1c}') if ctrl && !alt => self.open_hotlist(),
             KeyCode::Char(' ') if ctrl && !alt => self.calculate_sizes(),
@@ -357,6 +369,81 @@ impl App {
         }
     }
 
+    /// Keys while the shell is shown: Ctrl+O goes back to the panels, Shift+PgUp/PgDn scroll
+    /// through its output, everything else is typed into it.
+    fn on_shell_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let page = self.screen_size.0.saturating_sub(2).max(1) as isize;
+        let Some(shell) = self.subshell.as_mut() else {
+            self.shell_shown = false;
+            return;
+        };
+        match key.code {
+            KeyCode::Char('o') if ctrl && !alt => self.hide_shell(),
+            KeyCode::PageUp if shift => shell.scroll(page),
+            KeyCode::PageDown if shift => shell.scroll(-page),
+            _ => shell.send_key(&key),
+        }
+    }
+
+    /// Starts the persistent shell (in the active panel's folder) unless it is running.
+    fn ensure_subshell(&mut self) -> Result<(), String> {
+        if self.subshell.is_none() {
+            let (rows, cols) = self.screen_size;
+            let cwd = self.active_panel().cwd.clone();
+            self.subshell = Some(Subshell::start(&self.config.shell, &cwd, rows.max(2), cols.max(10))?);
+        }
+        Ok(())
+    }
+
+    /// Ctrl+O: shows the shell, moved to the panel's folder if it is idle somewhere else.
+    /// If the shell can't run inside rmc, a one-off shell takes over the console instead.
+    fn show_shell(&mut self) {
+        if self.ensure_subshell().is_err() {
+            self.external = Some(External::Shell);
+            return;
+        }
+        let cwd = self.active_panel().cwd.clone();
+        if let Some(shell) = self.subshell.as_mut() {
+            shell.follow_panel(&cwd, &self.config.shell);
+            shell.scroll_to_bottom();
+            self.shell_shown = true;
+        }
+    }
+
+    /// Back to the panels. If the user changed folder in the shell, the active panel follows.
+    pub(crate) fn hide_shell(&mut self) {
+        self.shell_shown = false;
+        let moved_to = self.subshell.as_ref().and_then(Subshell::moved_to);
+        // The shell may have created, changed or deleted files.
+        self.reload_panels();
+        if let Some(dir) = moved_to
+            && dir.is_dir()
+            && !util::same_path(&dir, &self.active_panel().cwd)
+        {
+            self.change_dir(self.active, dir);
+        }
+    }
+
+    /// Runs a command line in the persistent shell (in the panel's folder) and shows it.
+    fn run_in_shell(&mut self, line: String) {
+        if self.ensure_subshell().is_err() {
+            self.external = Some(External::Command(line));
+            return;
+        }
+        let cwd = self.active_panel().cwd.clone();
+        let Some(shell) = self.subshell.as_mut() else { return };
+        if !shell.is_idle() {
+            self.error("The shell is still busy with a command.\nPress Ctrl+O to see it.");
+            return;
+        }
+        shell.follow_panel(&cwd, &self.config.shell);
+        shell.send_text(&format!("{line}\r"));
+        self.shell_shown = true;
+    }
+
     fn open_hotlist(&mut self) {
         let cwd = &self.active_panel().cwd;
         let cursor = self.hotlist.dirs.iter().position(|d| util::same_path(d, cwd)).unwrap_or(0);
@@ -493,8 +580,16 @@ impl App {
         self.job = Some(ops::start(job));
     }
 
-    /// Picks up directory sizes and the progress, questions and end of a running job.
+    /// Picks up directory sizes, the end of the shell, and the progress, questions and end of
+    /// a running job.
     pub fn tick(&mut self) {
+        // The shell was closed with `exit`: back to the panels; the next Ctrl+O starts a new one.
+        if self.subshell.as_mut().is_some_and(Subshell::has_exited) {
+            if self.shell_shown {
+                self.hide_shell();
+            }
+            self.subshell = None;
+        }
         if let Some(answers) = &self.drive_space {
             while let Ok((root, space)) = answers.try_recv() {
                 if let Some(Dialog::Drives { drives, .. }) = &mut self.dialog
@@ -604,7 +699,7 @@ impl App {
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
         } else if entry.is_exec {
-            self.external = Some(External::Command(self.config.shell.run_file_line(&entry.path)));
+            self.run_in_shell(self.config.shell.run_file_line(&entry.path));
         } else if let Err(e) = platform::open_default(&entry.path) {
             self.error(e);
         }
@@ -770,7 +865,7 @@ impl App {
                 };
                 self.change_dir(self.active, target);
             }
-            None => self.external = Some(External::Command(line)),
+            None => self.run_in_shell(line),
         }
     }
 
@@ -1036,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn command_line_cd_and_external_commands() {
+    fn command_line_cd_and_history() {
         let tmp = TempDir::new("app-cmd");
         tmp.dir("sub dir");
         let mut app = test_app(tmp.path(), tmp.path());
@@ -1048,29 +1143,82 @@ mod tests {
         typing(&mut app, "cd..");
         app.on_key(key(KeyCode::Enter));
         assert!(util::same_path(&app.active_panel().cwd, tmp.path()));
-
-        typing(&mut app, "git status");
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.external.take(), Some(External::Command("git status".into())));
         assert!(app.cmdline.is_empty());
+        assert!(app.subshell.is_none(), "cd is handled by rmc itself");
 
-        // Alt+P brings it back.
+        // Alt+P brings commands back.
         app.on_key(with_mods(KeyCode::Char('p'), KeyModifiers::ALT));
-        assert_eq!(app.cmdline.text(), "git status");
+        assert_eq!(app.cmdline.text(), "cd..");
     }
 
     #[test]
-    fn panel_follows_the_ctrl_o_shell() {
+    fn panel_follows_the_one_off_shell() {
         let tmp = TempDir::new("app-shell");
         let sub = tmp.dir("sub");
         let mut app = test_app(tmp.path(), tmp.path());
-        app.on_key(ctrl('o'));
-        assert_eq!(app.external.take(), Some(External::Shell));
         app.after_external(Ok(()), Some(sub.clone()));
         assert!(util::same_path(&app.active_panel().cwd, &sub));
         // A folder that no longer exists is ignored.
         app.after_external(Ok(()), Some(tmp.path().join("gone")));
         assert!(util::same_path(&app.active_panel().cwd, &sub));
+    }
+
+    fn wait_until(what: &str, app: &mut App, mut done: impl FnMut(&mut App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+            app.tick();
+        }
+    }
+
+    fn shell_screen(app: &App) -> String {
+        app.subshell.as_ref().and_then(|s| s.with_screen(|screen| screen.contents())).unwrap_or_default()
+    }
+
+    fn shell_dir(app: &App) -> Option<PathBuf> {
+        app.subshell.as_ref().and_then(Subshell::report).map(|(_, dir)| dir)
+    }
+
+    #[test]
+    fn one_shell_for_the_whole_session() {
+        if !matches!(Shell::detect(), Shell::PowerShell(_)) {
+            eprintln!("no PowerShell here; skipped");
+            return;
+        }
+        let tmp = TempDir::new("app-subshell");
+        let sub = tmp.dir("Účty");
+        let mut app = test_app(tmp.path(), tmp.path());
+
+        // A command typed in rmc runs in the shell, which comes up to show it.
+        typing(&mut app, "$rmcX = 'kept'; \"out=$(6*7)\"");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.shell_shown);
+        wait_until("the output", &mut app, |app| shell_screen(app).contains("out=42"));
+
+        // Keys go to the shell; cd there, then Ctrl+O: the panel follows.
+        wait_until("the prompt", &mut app, |app| app.subshell.as_ref().is_some_and(Subshell::is_idle));
+        typing(&mut app, "cd Účty");
+        app.on_key(key(KeyCode::Enter));
+        wait_until("the shell's cd", &mut app, |app| shell_dir(app).is_some_and(|d| util::same_path(&d, &sub)));
+        app.on_key(ctrl('o'));
+        assert!(!app.shell_shown);
+        assert!(util::same_path(&app.active_panel().cwd, &sub));
+
+        // Move the panel up; Ctrl+O takes the same shell (variable intact) there.
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(ctrl('o'));
+        wait_until("rmc's cd", &mut app, |app| shell_dir(app).is_some_and(|d| util::same_path(&d, tmp.path())));
+        typing(&mut app, "\"var=$rmcX\"");
+        app.on_key(key(KeyCode::Enter));
+        wait_until("the variable", &mut app, |app| shell_screen(app).contains("var=kept"));
+
+        // `exit` ends it: back to the panels, and the next Ctrl+O would start a new shell.
+        wait_until("the prompt", &mut app, |app| app.subshell.as_ref().is_some_and(Subshell::is_idle));
+        typing(&mut app, "exit");
+        app.on_key(key(KeyCode::Enter));
+        wait_until("the shell to end", &mut app, |app| app.subshell.is_none());
+        assert!(!app.shell_shown);
     }
 
     #[test]

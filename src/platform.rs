@@ -1,5 +1,6 @@
 //! Operating-system specific parts: drives, free space, hidden files, opening files and shells.
 
+use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -218,22 +219,45 @@ pub fn is_executable(_name: &str, meta: Option<&Metadata>) -> bool {
     meta.is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Start-up script of the PowerShell behind Ctrl+O. Every prompt notes the current folder in
-/// `$env:RMC_CWD_FILE` (so rmc's panel can follow `cd`, however the shell ends), and Ctrl+O at
-/// the prompt ends the shell at once, back to the panels.
+/// Start-up script of the PowerShell behind Ctrl+O.
+///
+/// - Every prompt writes `<prompt number>|<current folder>` to `$env:RMC_CWD_FILE`. The folder
+///   lets rmc's panel follow `cd`; the number tells rmc whether the shell is idle (a prompt has
+///   appeared since it last typed anything) or busy with a command.
+/// - `__rmc_cd` is how rmc moves the shell to the panel's folder; it stays out of the history.
+/// - Ctrl+O at the prompt exits, for the one-off shell used when the persistent one can't start.
+///   (In the persistent shell rmc keeps Ctrl+O to itself.)
 const PWSH_SHELL_INIT: &str = r#"
+$global:__rmc_seq = 0
 function global:__rmc_save_cwd {
-    [IO.File]::WriteAllText($env:RMC_CWD_FILE, (Get-Location -PSProvider FileSystem).ProviderPath)
+    $global:__rmc_seq++
+    $here = (Get-Location -PSProvider FileSystem).ProviderPath
+    [IO.File]::WriteAllText($env:RMC_CWD_FILE, "$($global:__rmc_seq)|$here")
 }
 $global:__rmc_prompt = $function:prompt
 function global:prompt { __rmc_save_cwd; & $global:__rmc_prompt }
+function global:__rmc_cd([string] $Path) { Set-Location -LiteralPath $Path }
 if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
     Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to rmc' -ScriptBlock {
         __rmc_save_cwd
         [Environment]::Exit(0)
     }
+    $global:__rmc_history = (Get-PSReadLineOption).AddToHistoryHandler
+    Set-PSReadLineOption -AddToHistoryHandler {
+        param([string] $line)
+        if ($line -like '__rmc_cd *') { return $false }
+        if ($global:__rmc_history) { return & $global:__rmc_history $line }
+        return $true
+    }
 }
 "#;
+
+/// Reads what the shell's prompt wrote: the prompt number and the folder.
+pub fn parse_cwd_report(text: &str) -> Option<(u64, PathBuf)> {
+    let (number, dir) = text.trim_start_matches('\u{feff}').split_once('|')?;
+    let dir = dir.trim();
+    (!dir.is_empty()).then(|| (number.trim().parse().unwrap_or(0), PathBuf::from(dir)))
+}
 
 /// PowerShell's -EncodedCommand form of a script: base64 of UTF-16LE. It sidesteps quoting.
 fn encode_ps(script: &str) -> String {
@@ -311,19 +335,27 @@ impl Shell {
         }
     }
 
-    /// An interactive shell session (Ctrl+O). A PowerShell one reports its folder in
-    /// `cwd_file` and goes back to rmc on Ctrl+O; others are left with `exit`.
+    /// Program and arguments of an interactive session. PowerShell gets `PWSH_SHELL_INIT`.
+    pub fn interactive_argv(&self) -> Vec<OsString> {
+        match self {
+            Shell::PowerShell(program) => vec![
+                program.into(),
+                "-NoLogo".into(),
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                encode_ps(PWSH_SHELL_INIT).into(),
+            ],
+            Shell::Cmd => vec!["cmd.exe".into()],
+            Shell::Posix(program) => vec![program.into()],
+        }
+    }
+
+    /// A one-off interactive session in rmc's own console (the fallback for Ctrl+O). A
+    /// PowerShell one reports its folder in `cwd_file` and goes back to rmc on Ctrl+O.
     pub fn interactive(&self, cwd_file: &Path) -> Command {
-        let mut command = match self {
-            Shell::PowerShell(program) => {
-                let mut command = Command::new(program);
-                command.args(["-NoLogo", "-NoExit", "-EncodedCommand", &encode_ps(PWSH_SHELL_INIT)]);
-                command
-            }
-            Shell::Cmd => Command::new("cmd.exe"),
-            Shell::Posix(program) => Command::new(program),
-        };
-        command.env("RMC_CWD_FILE", cwd_file);
+        let argv = self.interactive_argv();
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]).env("RMC_CWD_FILE", cwd_file);
         command
     }
 
@@ -364,15 +396,26 @@ mod tests {
         let tmp = TempDir::new("shell-init");
         let target = tmp.dir("Účty a faktury");
         let file = tmp.path().join("cwd.txt");
-        // What an interactive session does: the start-up script, a `cd`, a prompt, then exit.
-        let script = format!("{PWSH_SHELL_INIT}\nSet-Location -LiteralPath '{}'\n$null = prompt\nexit", target.display());
+        // What an interactive session does: the start-up script, prompts, rmc's `cd`, then exit.
+        let script = format!(
+            "{PWSH_SHELL_INIT}\n$null = prompt\n__rmc_cd '{}'\n$null = prompt\nexit",
+            target.display()
+        );
         let status = Command::new(program)
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encode_ps(&script)])
             .env("RMC_CWD_FILE", &file)
             .status()
             .unwrap();
         assert!(status.success());
-        let reported = std::fs::read_to_string(&file).unwrap();
-        assert!(util::same_path(Path::new(&reported), &target), "{reported}");
+        let (number, reported) = parse_cwd_report(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(number, 2, "one report per prompt");
+        assert!(util::same_path(&reported, &target), "{}", reported.display());
+    }
+
+    #[test]
+    fn parsing_reports() {
+        assert_eq!(parse_cwd_report("7|E:\\devel\r\n"), Some((7, PathBuf::from(r"E:\devel"))));
+        assert_eq!(parse_cwd_report("\u{feff}1|C:\\"), Some((1, PathBuf::from(r"C:\"))));
+        assert_eq!(parse_cwd_report("no separator"), None);
     }
 }

@@ -8,6 +8,7 @@ mod ops;
 mod panel;
 mod platform;
 mod sizes;
+mod subshell;
 #[cfg(test)]
 mod testutil;
 mod ui;
@@ -134,7 +135,12 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
 
     while !app.quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
-        let timeout = Duration::from_millis(if app.is_busy() { 50 } else { 500 });
+        // The shell's output arrives on its own thread; check often while it's on screen.
+        let timeout = Duration::from_millis(match () {
+            _ if app.shell_shown => 10,
+            _ if app.is_busy() => 50,
+            _ => 500,
+        });
         if event::poll(timeout)? {
             // Handle everything already queued (fast typing, pastes, mouse moves) before drawing again.
             loop {
@@ -209,8 +215,8 @@ fn run_external(
 
     let shell_cwd = std::fs::read_to_string(&cwd_file)
         .ok()
-        .map(|text| PathBuf::from(text.trim_start_matches('\u{feff}').trim()))
-        .filter(|dir| !dir.as_os_str().is_empty());
+        .and_then(|text| platform::parse_cwd_report(&text))
+        .map(|(_, dir)| dir);
     let _ = std::fs::remove_file(&cwd_file);
     Ok((result, shell_cwd))
 }
