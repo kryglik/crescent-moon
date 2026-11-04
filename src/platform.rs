@@ -204,9 +204,22 @@ mod win {
                 "Access is denied: it belongs to {owner} (protected Windows files).\n\
                  An administrator has to take ownership of it before it can be deleted."
             ),
+            Some(owner) if is_me(&owner) => "Access is denied: it is yours, but you have no permission to delete it.\n\
+                 Give yourself full control first (icacls, as administrator)."
+                .into(),
             Some(owner) => format!("Access is denied: you may not delete it (it belongs to {owner})."),
             None => "Access is denied: you may not delete it.".into(),
         })
+    }
+
+    /// Whether `DOMAIN\name` is the account rmc runs as.
+    fn is_me(account: &str) -> bool {
+        let me = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap_or_default(),
+            std::env::var("USERNAME").unwrap_or_default()
+        );
+        account.eq_ignore_ascii_case(&me)
     }
 
     /// The owner of a file or folder, as `DOMAIN\name`.
