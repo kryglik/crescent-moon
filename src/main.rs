@@ -1,5 +1,6 @@
 //! rmc: a small Midnight Commander-style two-panel file manager for the terminal.
 
+mod admin;
 mod app;
 mod dialog;
 mod find;
@@ -13,6 +14,7 @@ mod platform;
 mod settings;
 mod sizes;
 mod subshell;
+mod survey;
 #[cfg(test)]
 mod testutil;
 mod ui;
@@ -141,6 +143,11 @@ fn parse_args() -> Result<Option<Args>, String> {
                 args.cwd_file = Some(iter.next().ok_or("--cwd-file needs a file name")?.into());
             }
             Some("--no-mouse") => args.mouse = false,
+            // Internal: the elevated helper of "As admin" (see admin.rs); no TUI.
+            Some("--admin-job") => {
+                let dir = PathBuf::from(iter.next().ok_or("--admin-job needs a folder")?);
+                std::process::exit(admin::run_helper(&dir));
+            }
             Some(s) if s.starts_with('-') => return Err(format!("unknown option {s} (try --help)")),
             _ if args.dirs.len() < 2 => args.dirs.push(arg.into()),
             _ => return Err("at most two directories can be given".into()),

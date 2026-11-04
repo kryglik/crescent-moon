@@ -207,7 +207,9 @@ impl App {
         };
         match action {
             DialogAction::Press(i) => {
-                if let Some(Dialog::Confirm { focus, .. } | Dialog::Question { focus, .. }) = &mut self.dialog {
+                if let Some(Dialog::Confirm { focus, .. } | Dialog::Question { focus, .. } | Dialog::Delete { focus, .. }) =
+                    &mut self.dialog
+                {
                     *focus = i;
                 }
                 self.on_key(KeyEvent::from(KeyCode::Enter));

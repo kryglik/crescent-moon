@@ -21,6 +21,19 @@ pub fn format_size(bytes: u64) -> String {
     format!("{}E", value.round() as u64)
 }
 
+/// A count with thousands separated: `41,023`.
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Short human-readable size such as `3.4M` or `67G`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];

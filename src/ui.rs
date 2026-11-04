@@ -618,6 +618,11 @@ fn draw_dialog(
         }
         Dialog::Drives { drives, cursor, side, .. } => (None, draw_drives(frame, area, drives, *cursor, *side)),
         Dialog::Sort { cursor, current, reverse, .. } => (None, draw_sort(frame, area, *cursor, *current, *reverse)),
+        Dialog::Delete { paths, to_trash, focus, survey } => {
+            let tally = survey.tally();
+            let (title, lines) = crate::app::delete_question(paths, *to_trash, &tally);
+            (None, draw_message(frame, area, title, &lines, dialog::delete_buttons(&tally), *focus, !*to_trash))
+        }
         Dialog::Options { cursor, edit, settings, automatic } => {
             draw_options(frame, area, *cursor, edit, settings, automatic, settings_file)
         }
@@ -887,6 +892,57 @@ mod tests {
         assert!(screen.contains("5.0M…"), "running total shown");
     }
 
+    /// F8 asks at once and fills in the counts; Windows' own files get "As admin". Only F8
+    /// and Esc are pressed: nothing is deleted.
+    #[test]
+    fn renders_the_delete_question_with_its_survey() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        use std::time::{Duration, Instant};
+        let wait = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.working() {
+                assert!(Instant::now() < deadline, "survey did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let tmp = TempDir::new("ui-delete");
+        tmp.file("old/a.txt", "12345");
+        tmp.file("old/sub/b.txt", "123");
+        let mut app = app_for(&tmp);
+        assert!(app.panels[0].select_name("old"));
+        app.on_key(KeyEvent::from(KeyCode::F(8)));
+        wait(&mut app);
+        let screen = render(&mut app, 100, 24);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Move \"old\" to"), "{screen}");
+        assert!(screen.contains("2 files in 2 folders, 8B."), "{screen}");
+        assert!(!screen.contains("As admin"));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.dialog.is_none());
+        assert!(tmp.path().join("old").exists());
+
+        #[cfg(windows)]
+        {
+            let mut app = App::new(PathBuf::from(r"C:\Windows\System32"), tmp.path().to_path_buf(), crate::testutil::config());
+            assert!(app.panels[0].select_name("drivers"));
+            app.on_key(KeyEvent::from(KeyCode::F(8)));
+            wait(&mut app);
+            let screen = render(&mut app, 120, 30);
+            if std::env::var_os("RMC_PRINT").is_some() {
+                println!("{screen}");
+            }
+            app.on_key(KeyEvent::from(KeyCode::Esc));
+            assert!(app.dialog.is_none());
+            // Without elevation Windows' own folders need an administrator.
+            if screen.contains("Needs administrator rights") {
+                assert!(screen.contains("TrustedInstaller"), "{screen}");
+                assert!(screen.contains("[ As admin ]"), "{screen}");
+            }
+        }
+    }
+
     #[test]
     fn renders_the_find_window() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1015,7 +1071,8 @@ mod tests {
         tmp.file("a.txt", "a");
         let mut app = app_for(&tmp);
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(1)));
-        let help = render(&mut app, 80, 40);
+        // Tall enough for all of it.
+        let help = render(&mut app, 80, 90);
         assert!(help.contains("rmc keys"));
         // The longest help lines fit whole.
         assert!(help.contains("Enter runs it in the shell, in the panel's folder"), "{help}");

@@ -11,12 +11,12 @@ use crate::options::OptionsAutomatic;
 use crate::panel::SortBy;
 use crate::platform::DriveInfo;
 use crate::settings::Settings;
+use crate::survey::Survey;
 use crate::util;
 
 /// What happens when a yes/no confirmation is answered with Yes.
 pub enum ConfirmAction {
     Quit,
-    Delete { paths: Vec<PathBuf>, to_trash: bool },
     /// A big file in the editor or viewer after all.
     Edit(PathBuf, Option<u64>),
     View(PathBuf, Option<u64>),
@@ -43,6 +43,9 @@ pub enum Dialog {
     Help { scroll: usize },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
+    /// F8 / Shift+F8: the question, filled in by `survey` while it counts. The buttons are
+    /// Yes, No, and once something needs administrator rights (on Windows) As admin.
+    Delete { paths: Vec<PathBuf>, to_trash: bool, focus: usize, survey: Survey },
     /// Ctrl+P: `settings` being edited; `edit` holds the text of the row under the cursor
     /// when that is a text row.
     Options { cursor: usize, edit: LineEdit, settings: Settings, automatic: OptionsAutomatic },
@@ -70,12 +73,29 @@ const fn button(label: &'static str, hotkey: char) -> Button {
 
 pub const OK: &[Button] = &[button("OK", 'o')];
 pub const YES_NO: &[Button] = &[button("Yes", 'y'), button("No", 'n')];
+pub const YES_NO_ADMIN: &[Button] = &[button("Yes", 'y'), button("No", 'n'), button("As admin", 'a')];
 pub const OVERWRITE: &[Button] =
     &[button("Yes", 'y'), button("No", 'n'), button("All", 'a'), button("None", 'o'), button("Cancel", 'c')];
 pub const OVERWRITE_ANSWERS: &[Answer] = &[Answer::Yes, Answer::No, Answer::All, Answer::None, Answer::Cancel];
 pub const FAILED: &[Button] =
     &[button("Retry", 'r'), button("Skip", 's'), button("Skip all", 'k'), button("Cancel", 'c')];
 pub const FAILED_ANSWERS: &[Answer] = &[Answer::Retry, Answer::Skip, Answer::SkipAll, Answer::Cancel];
+/// A permission error while deleting, which an administrator can get past.
+pub const FAILED_ADMIN: &[Button] = &[
+    button("Retry", 'r'),
+    button("Skip", 's'),
+    button("Skip all", 'k'),
+    button("As admin", 'a'),
+    button("Cancel", 'c'),
+];
+pub const FAILED_ADMIN_ANSWERS: &[Answer] =
+    &[Answer::Retry, Answer::Skip, Answer::SkipAll, Answer::AsAdmin, Answer::Cancel];
+
+/// The delete question's buttons: As admin joins Yes and No (keeping their places) once
+/// the survey finds something only an administrator may delete, on Windows.
+pub fn delete_buttons(tally: &crate::survey::Tally) -> &'static [Button] {
+    if cfg!(windows) && tally.denied.is_some() { YES_NO_ADMIN } else { YES_NO }
+}
 
 pub enum ButtonOutcome {
     Pressed(usize),
@@ -224,6 +244,8 @@ pub const HELP: &[&str] = &[
     "  F5 copy      F6 move    F7 make directory",
     "  F8, Delete               move to the Recycle Bin",
     "  Shift+F8, Shift+Delete   delete permanently",
+    "  The question counts what goes; As admin deletes protected files",
+    "  (Windows asks for administrator rights first)",
     "  Esc          close a dialog, stop a copy/move/delete",
     "",
     "Mouse",

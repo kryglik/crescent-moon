@@ -90,7 +90,8 @@ impl From<&Metadata> for FileInfo {
 #[derive(Debug)]
 pub enum Question {
     Overwrite { target: PathBuf, source: FileInfo, existing: FileInfo },
-    Failed { path: PathBuf, error: String },
+    /// `as_admin`: the "As admin" answer is offered, with this to say what it will do.
+    Failed { path: PathBuf, error: String, as_admin: Option<&'static str> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,13 +103,16 @@ pub enum Answer {
     Retry,
     Skip,
     SkipAll,
+    /// Hand the rest of the job to an elevated helper (see `admin`).
+    AsAdmin,
     Cancel,
 }
 
 pub enum Msg {
     Progress(Progress),
     Ask(Question, Sender<Answer>),
-    Done { errors: Vec<String>, cancelled: bool },
+    /// `as_admin`: the user chose to delete these (what was left) as administrator.
+    Done { errors: Vec<String>, cancelled: bool, as_admin: Option<Vec<PathBuf>> },
 }
 
 pub struct Running {
@@ -119,21 +123,37 @@ pub struct Running {
 }
 
 pub fn start(job: Job) -> Running {
+    run_job(job, false)
+}
+
+/// For the elevated helper: deletes with backup semantics (see `platform::delete_privileged`)
+/// and never offers "As admin" again.
+pub fn start_privileged(job: Job) -> Running {
+    run_job(job, true)
+}
+
+fn run_job(job: Job, privileged: bool) -> Running {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let title = job.title();
     let flag = cancel.clone();
     thread::spawn(move || {
         let mut worker = Worker::new(tx.clone(), flag);
-        let cancelled = worker.run(job).is_err();
-        let _ = tx.send(Msg::Done { errors: worker.errors, cancelled });
+        worker.privileged = privileged;
+        let result = worker.run(job);
+        let as_admin = worker.as_admin.take().filter(|_| matches!(result, Err(Stop::AsAdmin)));
+        let cancelled = matches!(result, Err(Stop::Cancelled));
+        let _ = tx.send(Msg::Done { errors: worker.errors, cancelled, as_admin });
     });
     Running { title, progress: Progress::default(), rx, cancel }
 }
 
-/// The user cancelled; unwinds the whole job.
-struct Cancelled;
-type Flow<T> = Result<T, Cancelled>;
+/// Why a job stops early: the user cancelled, or chose to go on as administrator.
+enum Stop {
+    Cancelled,
+    AsAdmin,
+}
+type Flow<T> = Result<T, Stop>;
 
 struct Worker {
     tx: Sender<Msg>,
@@ -144,6 +164,12 @@ struct Worker {
     skip_all: bool,
     errors: Vec<String>,
     buffer: Vec<u8>,
+    /// Running in the elevated helper.
+    privileged: bool,
+    /// What a permission error may offer to do as administrator (deleting only, on Windows).
+    admin_offer: Option<&'static str>,
+    /// What is left for the administrator when the user chose that.
+    as_admin: Option<Vec<PathBuf>>,
 }
 
 impl Worker {
@@ -157,6 +183,9 @@ impl Worker {
             skip_all: false,
             errors: Vec::new(),
             buffer: Vec::new(),
+            privileged: false,
+            admin_offer: None,
+            as_admin: None,
         }
     }
 
@@ -185,16 +214,26 @@ impl Worker {
                     }
                 }
             }
-            Job::Delete { paths, to_trash: true } => {
-                self.progress.files_total = paths.len() as u64;
-                for path in &paths {
-                    self.trash(path)?;
+            Job::Delete { paths, to_trash } => {
+                if cfg!(windows) && !self.privileged {
+                    self.admin_offer = Some(if to_trash {
+                        "As admin: deletes it permanently, as administrator (Windows asks first)."
+                    } else {
+                        "As admin: deletes the rest as administrator (Windows asks first)."
+                    });
                 }
-            }
-            Job::Delete { paths, to_trash: false } => {
-                self.scan_all(paths.iter().map(PathBuf::as_path), false)?;
-                for path in &paths {
-                    self.remove_tree(path, true)?;
+                if to_trash {
+                    self.progress.files_total = paths.len() as u64;
+                } else {
+                    self.scan_all(paths.iter().map(PathBuf::as_path), false)?;
+                }
+                for (i, path) in paths.iter().enumerate() {
+                    let result = if to_trash { self.trash(path) } else { self.remove_tree(path, true).map(drop) };
+                    if let Err(Stop::AsAdmin) = result {
+                        // This item and the ones after it go to the administrator.
+                        self.as_admin = Some(paths[i..].to_vec());
+                    }
+                    result?;
                 }
             }
         }
@@ -203,7 +242,7 @@ impl Worker {
     }
 
     fn check_cancel(&self) -> Flow<()> {
-        if self.cancel.load(Ordering::Relaxed) { Err(Cancelled) } else { Ok(()) }
+        if self.cancel.load(Ordering::Relaxed) { Err(Stop::Cancelled) } else { Ok(()) }
     }
 
     fn send_progress(&mut self, force: bool) {
@@ -217,10 +256,11 @@ impl Worker {
         self.send_progress(true);
         let (reply_tx, reply_rx) = mpsc::channel();
         if self.tx.send(Msg::Ask(question, reply_tx)).is_err() {
-            return Err(Cancelled);
+            return Err(Stop::Cancelled);
         }
         match reply_rx.recv() {
-            Ok(Answer::Cancel) | Err(_) => Err(Cancelled),
+            Ok(Answer::Cancel) | Err(_) => Err(Stop::Cancelled),
+            Ok(Answer::AsAdmin) => Err(Stop::AsAdmin),
             Ok(answer) => Ok(answer),
         }
     }
@@ -240,7 +280,8 @@ impl Worker {
                 self.errors.push(message);
                 return Ok(None);
             }
-            let question = Question::Failed { path: path.to_path_buf(), error: error.to_string() };
+            let as_admin = self.admin_offer.filter(|_| error.kind() == io::ErrorKind::PermissionDenied);
+            let question = Question::Failed { path: path.to_path_buf(), error: error.to_string(), as_admin };
             match self.ask(question)? {
                 Answer::Retry => continue,
                 Answer::SkipAll => self.skip_all = true,
@@ -469,10 +510,16 @@ impl Worker {
             for name in children {
                 complete &= self.remove_tree(&path.join(name), count)?;
             }
-            complete && self.attempt(path, |_| remove_dir(path))?.is_some()
+            let privileged = self.privileged;
+            complete
+                && self
+                    .attempt(path, |_| if privileged { platform::delete_privileged(path) } else { remove_dir(path) })?
+                    .is_some()
         } else {
             self.progress.current = path.display().to_string();
-            self.attempt(path, |_| remove_file_or_link(path))?.is_some()
+            let privileged = self.privileged;
+            self.attempt(path, |_| if privileged { platform::delete_privileged(path) } else { remove_file_or_link(path) })?
+                .is_some()
         };
         if count {
             self.advance((1, if meta.is_dir() { 0 } else { meta.len() }));
@@ -483,7 +530,7 @@ impl Worker {
     fn trash(&mut self, path: &Path) -> Flow<()> {
         self.progress.current = path.display().to_string();
         self.send_progress(true);
-        self.attempt(path, |_| trash::delete(path).map_err(|e| io::Error::other(trash_message(path, &e))))?;
+        self.attempt(path, |_| trash::delete(path).map_err(|e| trash_error(path, &e)))?;
         self.advance((1, 0));
         Ok(())
     }
@@ -496,19 +543,19 @@ fn child_names(dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 /// The trash crate's error in words. On Windows a refusal arrives as "Some operations were
 /// aborted" with no reason (the Recycle Bin is asked not to show any UI, such as the
 /// administrator prompt): usually a lack of permission, so rmc checks that itself.
-fn trash_message(path: &Path, error: &trash::Error) -> String {
-    if let Some(reason) = platform::delete_denied(path) {
-        return reason;
+fn trash_error(path: &Path, error: &trash::Error) -> io::Error {
+    if let Some(denied) = platform::delete_denied(path) {
+        return denied;
     }
     let detail = match error {
         trash::Error::Unknown { description } | trash::Error::Os { description, .. } => description.clone(),
         other => other.to_string(),
     };
-    format!(
+    io::Error::other(format!(
         "It could not be moved to {}: {}.\nShift+F8 deletes it permanently instead.",
         platform::TRASH_NAME,
         detail.trim_end_matches('.').to_lowercase()
-    )
+    ))
 }
 
 fn is_cross_device(error: &io::Error) -> bool {
@@ -566,7 +613,7 @@ mod tests {
                     questions += 1;
                     reply.send(answer).unwrap();
                 }
-                Msg::Done { errors, cancelled } => return (errors, cancelled, questions),
+                Msg::Done { errors, cancelled, .. } => return (errors, cancelled, questions),
             }
         }
     }
@@ -623,6 +670,48 @@ mod tests {
 
         let (_, _, _) = run(Job::Copy(vec![(src, dst.clone())]), Answer::Yes);
         assert_eq!(fs::read_to_string(&dst).unwrap(), "new");
+    }
+
+    /// A permission error while deleting offers "As admin"; choosing it stops the job and hands
+    /// over this item and the ones after it. (Nothing elevated starts here; app.rs does that.)
+    #[cfg(windows)]
+    #[test]
+    fn as_admin_hands_over_what_is_left() {
+        let tmp = TempDir::new("ops-admin");
+        let locked = tmp.file("a/locked.txt", "x");
+        let folder = tmp.path().join("a");
+        let later = tmp.file("b.txt", "y");
+        let user = std::env::var("USERNAME").unwrap();
+        let icacls = |path: &Path, args: &[&str]| {
+            let status = std::process::Command::new("icacls").arg(path).args(args).output().unwrap().status;
+            assert!(status.success(), "icacls {} {args:?}", path.display());
+        };
+        // Neither the file itself nor anything in its folder may be deleted.
+        icacls(&locked, &["/deny", &format!("{user}:(D)")]);
+        icacls(&folder, &["/deny", &format!("{user}:(DC)")]);
+
+        let running = start(Job::Delete { paths: vec![folder.clone(), later.clone()], to_trash: false });
+        let mut offered = false;
+        let handed_over = loop {
+            match running.rx.recv_timeout(Duration::from_secs(20)).expect("job hung") {
+                Msg::Progress(_) => {}
+                Msg::Ask(Question::Failed { as_admin, error, .. }, reply) => {
+                    offered = as_admin.is_some();
+                    assert!(error.contains("denied"), "{error}");
+                    reply.send(Answer::AsAdmin).unwrap();
+                }
+                Msg::Ask(other, _) => panic!("unexpected {other:?}"),
+                Msg::Done { as_admin, cancelled, .. } => {
+                    assert!(!cancelled);
+                    break as_admin;
+                }
+            }
+        };
+        icacls(&locked, &["/remove:d", &user]);
+        icacls(&folder, &["/remove:d", &user]);
+        assert!(offered, "a permission error offers As admin");
+        assert_eq!(handed_over, Some(vec![folder, later.clone()]));
+        assert!(later.exists(), "what is handed over is left alone");
     }
 
     #[test]

@@ -7,6 +7,8 @@ It runs natively on Windows (Windows Terminal, PowerShell) and on Linux, includi
 What it does differently from the Windows port of mc:
 
 - F8 and Delete move files to the **Recycle Bin**; only Shift+F8 / Shift+Delete delete permanently.
+  The question counts what would go while you decide, and for files only an administrator may
+  delete (Windows' own, owned by TrustedInstaller) it offers **As admin**, like Total Commander.
 - Long paths (over 260 characters) work.
 - Czech and other non-ASCII file names work everywhere, including opening a file in its app.
 - F3/F4 open files in **Neovim** (or any editor you set) instead of a built-in viewer and editor.
@@ -57,7 +59,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | F2 | rename |
 | F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
 | F5 / F6 / F7 | copy / move / make directory |
-| F8, Delete | to the Recycle Bin (Shift: permanently) |
+| F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
 | F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
@@ -73,6 +75,20 @@ Each panel remembers where it was on every drive: picking E: in the drive picker
 returns to that folder, and picking the drive the panel is already on goes to its root.
 Network drives show the share they are mapped to and their free space, which is fetched in
 the background so an unreachable share can't freeze the screen.
+
+### Deleting as administrator
+
+The delete question appears at once and fills in what would go (files, folders, size) while
+it counts in the background; Yes doesn't have to wait for it, No or Esc stops it. It also
+checks whether you may delete everything. Where you may not, it says which item and why
+(who owns it), and on Windows offers **As admin**, as does the error dialog if a delete runs
+into such a file halfway.
+
+As admin starts a second rmc with administrator rights, after Windows asks you (UAC). It
+turns on the backup and restore privileges an administrator has, so even files belonging to
+TrustedInstaller go, with no `takeown` or `icacls` needed, and deletes permanently: the
+Recycle Bin refuses protected files even then. Its progress shows as for any delete, and Esc
+stops it. On Linux there is no As admin.
 
 ### Find
 
@@ -190,6 +206,8 @@ function rmc {
 | `src/find.rs` | the Find search: ignore + grep crates on a background thread, cancellable |
 | `src/finder.rs` | the Find window's state: fields, results sorted by path, cursor |
 | `src/settings.rs` | `settings.ini`: loading, saving |
+| `src/survey.rs` | counting what a delete would remove, and checking permissions, in the background |
+| `src/admin.rs` | "As admin": starting the elevated helper (`rmc --admin-job`) and the helper itself |
 | `src/options.rs` | the options editor's rows |
 | `src/dialog.rs` | dialogs, buttons, line editor, help text |
 | `src/ui.rs` | drawing with ratatui |

@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::admin;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
 use crate::finder::{Field as FindField, Finder};
 use crate::hotlist::Hotlist;
@@ -19,6 +20,7 @@ use crate::platform::{self, OpenError, Shell};
 use crate::settings::Settings;
 use crate::sizes::Sizer;
 use crate::subshell::Subshell;
+use crate::survey::{Survey, Tally};
 use crate::util;
 
 /// Something to run outside the TUI; the main loop gives it the terminal.
@@ -229,7 +231,8 @@ impl App {
     pub fn working(&self) -> bool {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
         let finding = self.finder.as_ref().is_some_and(Finder::working);
-        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending || finding
+        let surveying = matches!(&self.dialog, Some(Dialog::Delete { survey, .. }) if !survey.is_done());
+        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending || finding || surveying
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -453,6 +456,23 @@ impl App {
                 _ => Some(Dialog::Drives { side, drives, cursor }),
             },
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
+            Dialog::Delete { paths, to_trash, mut focus, survey } => {
+                let buttons = dialog::delete_buttons(&survey.tally());
+                match dialog::handle_buttons(buttons, &mut focus, &key) {
+                    ButtonOutcome::Pressed(0) => {
+                        drop(survey);
+                        self.start_job(Job::Delete { paths, to_trash });
+                        None
+                    }
+                    // As admin: everything goes to the elevated helper, permanently.
+                    ButtonOutcome::Pressed(2) => {
+                        self.job = Some(admin::start(paths, Vec::new()));
+                        None
+                    }
+                    ButtonOutcome::Pressed(_) | ButtonOutcome::Cancel => None,
+                    ButtonOutcome::Pending => Some(Dialog::Delete { paths, to_trash, focus, survey }),
+                }
+            }
             Dialog::Options { cursor, edit, settings, automatic } => {
                 self.on_options_key(&key, cursor, edit, settings, automatic)
             }
@@ -876,7 +896,6 @@ impl App {
     fn on_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::Quit => self.quit = true,
-            ConfirmAction::Delete { paths, to_trash } => self.start_job(Job::Delete { paths, to_trash }),
             ConfirmAction::Edit(path, line) => self.external = Some(External::Edit(path, line)),
             ConfirmAction::View(path, line) => self.external = Some(External::View(path, line)),
         }
@@ -970,13 +989,18 @@ impl App {
             match msg {
                 Msg::Progress(progress) => job.progress = progress,
                 Msg::Ask(question, reply) => self.dialog = Some(question_dialog(question, reply)),
-                Msg::Done { errors, cancelled } => {
-                    finished = Some((errors, cancelled));
+                Msg::Done { errors, cancelled, as_admin } => {
+                    finished = Some((errors, cancelled, as_admin));
                     break;
                 }
             }
         }
-        let Some((errors, cancelled)) = finished else { return changed };
+        let Some((errors, cancelled, as_admin)) = finished else { return changed };
+        // "As admin": the rest goes to the elevated helper, shown as the same kind of job.
+        if let Some(paths) = as_admin {
+            self.job = Some(admin::start(paths, errors));
+            return true;
+        }
         self.job = None;
         for panel in &mut self.panels {
             panel.clear_marks();
@@ -1208,20 +1232,10 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        let what = describe(&paths);
-        let (title, lines) = if to_trash {
-            ("Delete", vec![format!("Move {what} to {}?", platform::TRASH_NAME)])
-        } else {
-            ("Delete permanently", vec![format!("Permanently delete {what}?"), "This cannot be undone.".into()])
-        };
-        self.dialog = Some(Dialog::Confirm {
-            title: title.into(),
-            lines,
-            // Permanent deletion defaults to No.
-            focus: if to_trash { 0 } else { 1 },
-            danger: !to_trash,
-            action: ConfirmAction::Delete { paths, to_trash },
-        });
+        // The question comes at once; the survey fills in what it would remove meanwhile.
+        let survey = Survey::start(paths.clone());
+        // Permanent deletion defaults to No.
+        self.dialog = Some(Dialog::Delete { paths, to_trash, focus: if to_trash { 0 } else { 1 }, survey });
     }
 
     fn toggle_hidden(&mut self) {
@@ -1316,6 +1330,38 @@ fn describe(paths: &[PathBuf]) -> String {
     }
 }
 
+/// The title and lines of the delete question, with what the survey has found so far.
+pub fn delete_question(paths: &[PathBuf], to_trash: bool, tally: &Tally) -> (&'static str, Vec<String>) {
+    let what = describe(paths);
+    let mut lines =
+        vec![if to_trash { format!("Move {what} to {}?", platform::TRASH_NAME) } else { format!("Permanently delete {what}?") }];
+    // A single file needs no counting.
+    if tally.folders > 0 || tally.files > 1 {
+        let plural = |n: u64, word: &str| format!("{} {word}{}", util::thousands(n), if n == 1 { "" } else { "s" });
+        let counts = format!("{} in {}, {}", plural(tally.files, "file"), plural(tally.folders, "folder"), util::human_size(tally.bytes));
+        lines.push(if tally.done { format!("{counts}.") } else { format!("Counting… {counts} so far") });
+    }
+    if let Some((path, reason)) = &tally.denied {
+        lines.push(String::new());
+        lines.push(format!("Needs administrator rights: {}", path.display()));
+        // "it belongs to …" as a sentence of its own.
+        let why = reason.lines().next().unwrap_or_default().trim_start_matches("Access is denied: ");
+        let mut chars = why.chars();
+        lines.push(chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default());
+        if cfg!(windows) {
+            lines.push(if to_trash {
+                "As admin deletes it permanently, as administrator (Windows asks first).".into()
+            } else {
+                "As admin deletes it as administrator (Windows asks first).".into()
+            });
+        }
+    }
+    if !to_trash {
+        lines.push("This cannot be undone.".into());
+    }
+    (if to_trash { "Delete" } else { "Delete permanently" }, lines)
+}
+
 fn question_dialog(question: Question, reply: Sender<Answer>) -> Dialog {
     let now = SystemTime::now();
     let describe_file = |info: &ops::FileInfo| {
@@ -1340,11 +1386,14 @@ fn question_dialog(question: Question, reply: Sender<Answer>) -> Dialog {
             error: false,
             reply,
         },
-        Question::Failed { path, error } => Dialog::Question {
+        Question::Failed { path, error, as_admin } => Dialog::Question {
             title: "Error".into(),
-            lines: std::iter::once(path.display().to_string()).chain(error.lines().map(String::from)).collect(),
-            buttons: dialog::FAILED,
-            answers: dialog::FAILED_ANSWERS,
+            lines: std::iter::once(path.display().to_string())
+                .chain(error.lines().map(String::from))
+                .chain(as_admin.map(String::from))
+                .collect(),
+            buttons: if as_admin.is_some() { dialog::FAILED_ADMIN } else { dialog::FAILED },
+            answers: if as_admin.is_some() { dialog::FAILED_ADMIN_ANSWERS } else { dialog::FAILED_ANSWERS },
             focus: 1,
             error: true,
             reply,

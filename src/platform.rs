@@ -38,7 +38,14 @@ pub fn query_space_later(roots: Vec<PathBuf>) -> Receiver<(PathBuf, Option<(u64,
 }
 
 #[cfg(windows)]
-pub use win::{delete_denied, disk_space, drives, init, open_default};
+pub use win::{
+    close_elevated, delete_denied, delete_privileged, disk_space, drives, enable_admin_privileges, init, open_default,
+    run_elevated, wait_elevated,
+};
+
+/// A process started as administrator (its Windows handle).
+#[cfg(windows)]
+pub struct Elevated(isize);
 
 /// The mount point holding `path`; on Windows the drive is in the path itself (`util::volume_key`).
 #[cfg(windows)]
@@ -168,10 +175,17 @@ mod win {
             .collect()
     }
 
-    /// Why `path` can't be deleted, if Windows says so: in use by another program, or no
-    /// permission (neither DELETE on it nor "delete child" on its folder), naming the owner.
-    /// None when nothing stands in the way, or it can't tell.
-    pub fn delete_denied(path: &Path) -> Option<String> {
+    /// Why `path` can't be deleted, if Windows says so: in use by another program (ResourceBusy),
+    /// or no permission (PermissionDenied: neither DELETE on it nor "delete child" on its
+    /// folder), naming the owner. None when nothing stands in the way, or it can't tell.
+    pub fn delete_denied(path: &Path) -> Option<std::io::Error> {
+        use std::io::{Error, ErrorKind};
+        let reason = delete_denied_reason(path)?;
+        let kind = if reason.starts_with("Access") { ErrorKind::PermissionDenied } else { ErrorKind::ResourceBusy };
+        Some(Error::new(kind, reason))
+    }
+
+    fn delete_denied_reason(path: &Path) -> Option<String> {
         use windows_sys::Win32::Foundation::{
             CloseHandle, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GetLastError, INVALID_HANDLE_VALUE,
         };
@@ -210,6 +224,117 @@ mod win {
             Some(owner) => format!("Access is denied: you may not delete it (it belongs to {owner})."),
             None => "Access is denied: you may not delete it.".into(),
         })
+    }
+
+    /// Deletes one file, link or empty folder by handle with backup semantics. With the restore
+    /// privilege enabled (the elevated helper does that) Windows skips the permission check,
+    /// so even TrustedInstaller's files go; read-only ones too.
+    pub fn delete_privileged(path: &Path) -> std::io::Result<()> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FileDispositionInfo, FileDispositionInfoEx, OPEN_EXISTING, SetFileInformationByHandle,
+        };
+        let name = wide(path);
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+        let handle = unsafe { CreateFileW(name.as_ptr(), DELETE, share, null(), OPEN_EXISTING, flags, null_mut()) };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let info = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE
+                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        let size = std::mem::size_of_val(&info) as u32;
+        let mut ok = unsafe { SetFileInformationByHandle(handle, FileDispositionInfoEx, (&raw const info).cast(), size) };
+        if ok == 0 {
+            // Older Windows or file systems without the "Ex" form.
+            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+            let size = std::mem::size_of_val(&info) as u32;
+            ok = unsafe { SetFileInformationByHandle(handle, FileDispositionInfo, (&raw const info).cast(), size) };
+        }
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(handle) };
+        if ok == 0 { Err(error) } else { Ok(()) }
+    }
+
+    /// Turns on the backup, restore and take-ownership privileges of this process, which an
+    /// elevated administrator has but are off by default. True if all of them could be.
+    pub fn enable_admin_privileges() -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, GetLastError, LUID};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+            TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) } == 0 {
+            return false;
+        }
+        let mut all = true;
+        for name in ["SeBackupPrivilege", "SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
+            let mut luid = LUID { LowPart: 0, HighPart: 0 };
+            let name = wide(name);
+            if unsafe { LookupPrivilegeValueW(null(), name.as_ptr(), &mut luid) } == 0 {
+                all = false;
+                continue;
+            }
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            let ok = unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, null_mut(), null_mut()) };
+            // It "succeeds" without the privilege too; only the last error tells.
+            if ok == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+                all = false;
+            }
+        }
+        unsafe { CloseHandle(token) };
+        all
+    }
+
+    /// Starts `program arguments` as administrator: Windows asks the user first (UAC).
+    /// Returns the process handle, or ErrorKind::PermissionDenied if the user said no.
+    pub fn run_elevated(program: &Path, arguments: &str) -> std::io::Result<super::Elevated> {
+        use windows_sys::Win32::Foundation::{ERROR_CANCELLED, GetLastError};
+        use windows_sys::Win32::UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+        let verb = wide("runas");
+        let file = wide(program);
+        let parameters = wide(arguments);
+        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = parameters.as_ptr();
+        info.nShow = SW_HIDE;
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            let code = unsafe { GetLastError() };
+            if code == ERROR_CANCELLED {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "administrator rights were not given"));
+            }
+            return Err(std::io::Error::from_raw_os_error(code as i32));
+        }
+        if info.hProcess.is_null() {
+            return Err(std::io::Error::other("Windows did not start the administrator helper"));
+        }
+        Ok(super::Elevated(info.hProcess as isize))
+    }
+
+    /// Waits up to `ms` for the process; true once it has ended.
+    pub fn wait_elevated(process: &super::Elevated, ms: u32) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(process.0 as _, ms) == WAIT_OBJECT_0 }
+    }
+
+    pub fn close_elevated(process: &super::Elevated) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(process.0 as _) };
     }
 
     /// Whether `DOMAIN\name` is the account rmc runs as.
@@ -292,7 +417,7 @@ mod win {
 }
 
 #[cfg(not(windows))]
-pub use unix::{delete_denied, disk_space, drives, init, mount_point, open_default, same_device};
+pub use unix::{delete_denied, delete_privileged, disk_space, drives, init, mount_point, open_default, same_device};
 
 #[cfg(not(windows))]
 mod unix {
@@ -308,11 +433,18 @@ mod unix {
     pub fn init() {}
 
     /// Why `path` can't be deleted: deleting needs write access to the folder it is in.
-    pub fn delete_denied(path: &Path) -> Option<String> {
+    pub fn delete_denied(path: &Path) -> Option<std::io::Error> {
         let parent = path.parent()?;
         let parent = CString::new(parent.as_os_str().as_bytes()).ok()?;
         let writable = unsafe { libc::access(parent.as_ptr(), libc::W_OK | libc::X_OK) } == 0;
-        (!writable).then(|| "Access is denied: you may not change the folder it is in.".to_string())
+        (!writable).then(|| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access is denied: you may not change the folder it is in.")
+        })
+    }
+
+    /// Only the Windows helper needs more than a plain delete.
+    pub fn delete_privileged(path: &Path) -> std::io::Result<()> {
+        if std::fs::symlink_metadata(path)?.is_dir() { std::fs::remove_dir(path) } else { std::fs::remove_file(path) }
     }
 
     /// Free and total bytes of the file system holding `path`.
@@ -917,11 +1049,12 @@ mod tests {
     fn says_why_something_cannot_be_deleted() {
         let tmp = TempDir::new("denied");
         let own = tmp.file("mine.txt", "x");
-        assert_eq!(delete_denied(&own), None, "your own file can go");
+        assert!(delete_denied(&own).is_none(), "your own file can go");
         // Windows' own files belong to TrustedInstaller: without elevation they can't go.
         #[cfg(windows)]
-        if let Some(reason) = delete_denied(Path::new(r"C:\Windows\System32\drivers")) {
-            assert!(reason.contains("TrustedInstaller"), "{reason}");
+        if let Some(denied) = delete_denied(Path::new(r"C:\Windows\System32\drivers")) {
+            assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(denied.to_string().contains("TrustedInstaller"), "{denied}");
         }
         if let Some(path) = std::env::var_os("RMC_PROBE") {
             println!("{}: {:?}", Path::new(&path).display(), delete_denied(Path::new(&path)));
