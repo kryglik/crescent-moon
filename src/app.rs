@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::admin;
+use crate::archive::{self, Archive};
 use crate::clipboard::{self, Clipboard, Effect};
 use crate::compare;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
@@ -19,7 +20,7 @@ use crate::lnk;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
-use crate::panel::{DirSize, Panel, SortBy};
+use crate::panel::{DirSize, Entry, Panel, SortBy};
 use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
 use crate::settings::Settings;
@@ -28,6 +29,15 @@ use crate::subshell::Subshell;
 use crate::survey::{Survey, Tally};
 use crate::util;
 use crate::watch::Watch;
+
+/// What happens to a file taken out of an archive (into rmc's temp folder) once it is out.
+#[derive(Debug)]
+enum AfterJob {
+    /// Enter: opened in its app; a zip in the zip opens in the panel, called `shown`.
+    Open { shown: PathBuf },
+    /// F3 (and F4: files in archives are read-only).
+    View,
+}
 
 /// Something to run outside the TUI; the main loop gives it the terminal.
 #[derive(Debug, PartialEq)]
@@ -238,6 +248,8 @@ pub struct App {
     pub terminal_clipboard: Option<String>,
     /// The running job pastes files that were cut: when it is done, the clipboard is emptied.
     pasting_cut: bool,
+    /// What to do with a file the running job takes out of an archive, once it is out.
+    after_job: Option<(AfterJob, PathBuf)>,
     /// Each panel's folder, watched for changes other programs make (see `watch`).
     watches: [Option<Watch>; 2],
 }
@@ -285,6 +297,7 @@ impl App {
             clipboard: Clipboard::default(),
             terminal_clipboard: None,
             pasting_cut: false,
+            after_job: None,
             watches: [None, None],
         }
     }
@@ -315,10 +328,19 @@ impl App {
         }
     }
 
-    /// What the quick view should show: the entry under the active panel's cursor.
+    /// What the quick view should show: the entry under the active panel's cursor (in an
+    /// archive, a file read from the zip; its folders show nothing).
     fn preview_key(&self) -> Option<PreviewKey> {
-        let entry = self.active_panel().current().filter(|e| !e.is_parent)?;
-        Some(PreviewKey { path: entry.path.clone(), size: entry.size, modified: entry.modified })
+        let panel = self.active_panel();
+        let entry = panel.current().filter(|e| !e.is_parent)?;
+        let archive = match &panel.archive {
+            Some(view) => {
+                let item = panel.archive_item(entry).filter(|item| !item.is_dir)?;
+                Some((view.archive.file.clone(), item.index?))
+            }
+            None => None,
+        };
+        Some(PreviewKey { path: entry.path.clone(), size: entry.size, modified: entry.modified, archive })
     }
 
     /// Keys while the quick view has the focus: the arrows and pages scroll it, Tab and Esc go
@@ -442,8 +464,18 @@ impl App {
             KeyCode::F(2) if shift => self.compare_dirs(),
             KeyCode::F(2) => self.start_rename(),
             KeyCode::F(3) => self.view_current(),
-            KeyCode::F(4) if shift => self.start_input("New file", "Create and edit file:", "", InputAction::NewFile),
+            // Making a folder inside an archive: archives open read-only.
+            KeyCode::F(7) if !alt && self.panels[self.active].archive.is_some() => {
+                self.refuse_in_archive(self.active);
+            }
+            KeyCode::F(4) if shift => {
+                if !self.refuse_in_archive(self.active) {
+                    self.start_input("New file", "Create and edit file:", "", InputAction::NewFile);
+                }
+            }
             KeyCode::F(4) => self.edit_current(),
+            KeyCode::F(5) if alt => self.start_pack(),
+            KeyCode::F(9) if alt => self.start_unpack(),
             KeyCode::F(5) => self.start_transfer(false),
             KeyCode::F(6) => self.start_transfer(true),
             // Alt+F7 as in Total Commander, Alt+? as in mc.
@@ -1059,6 +1091,20 @@ impl App {
     /// Ctrl+Space: measures the marked directories, the one under the cursor,
     /// or on ".." every directory in the panel.
     fn calculate_sizes(&mut self) {
+        // In an archive the sizes are all in its index: no measuring needed.
+        if let Some(view) = &self.panels[self.active].archive {
+            let sizes: Vec<(String, u64)> = view
+                .archive
+                .children(&view.inner)
+                .filter(|item| item.is_dir)
+                .map(|item| (item.name().to_string(), view.archive.size_below(&item.path)))
+                .collect();
+            let panel = &mut self.panels[self.active];
+            for (name, bytes) in sizes {
+                panel.dir_sizes.insert(name, DirSize { bytes, done: true });
+            }
+            return;
+        }
         let panel = &self.panels[self.active];
         let marked: Vec<_> = panel.entries.iter().filter(|e| e.is_dir && panel.is_marked(e)).collect();
         let targets: Vec<(String, PathBuf)> = if !marked.is_empty() {
@@ -1091,7 +1137,51 @@ impl App {
             ConfirmAction::Quit => self.quit = true,
             ConfirmAction::Edit(path, line) => self.external = Some(External::Edit(path, line)),
             ConfirmAction::View(path, line) => self.external = Some(External::View(path, line)),
+            ConfirmAction::Pack(sources, dest) => self.start_job(Job::Pack { sources, dest }),
         }
+    }
+
+    /// Alt+F5 (Total Commander's key): the marked files (or the one under the cursor) into a
+    /// new zip, in the other panel's folder by default.
+    fn start_pack(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
+        let sources = self.active_panel().selection();
+        let name = match sources.as_slice() {
+            [] => return,
+            [one] if one.is_dir() => one.file_name(),
+            [one] => one.file_stem(),
+            _ => self.active_panel().cwd.file_name(),
+        };
+        let name = name.map_or_else(|| "archive".to_string(), |n| n.to_string_lossy().into_owned());
+        let default = self.panels[1 - self.active].cwd.join(format!("{name}.zip"));
+        let prompt = format!("Pack {} into:", describe(&sources));
+        self.start_input("Pack", &prompt, &default.display().to_string(), InputAction::Pack(sources));
+    }
+
+    /// Alt+F9 (Total Commander's key): the zip under the cursor, unpacked into the other
+    /// panel's folder; one with several things at its top into a folder of its own name, as
+    /// 7-Zip's "Extract to name\" does.
+    fn start_unpack(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
+        let Some(entry) = self.active_panel().current().filter(|e| !e.is_dir && archive::is_archive(&e.path)).cloned() else {
+            self.notice = Some("Alt+F9 unpacks the zip under the cursor".into());
+            return;
+        };
+        let zip = match Archive::open(&entry.path) {
+            Ok(zip) => zip,
+            Err(e) => return self.error(format!("Cannot open \"{}\":\n{e}", entry.path.display())),
+        };
+        let items: Vec<String> = zip.children("").map(|item| item.path.clone()).collect();
+        let other = self.panels[1 - self.active].cwd.clone();
+        let stem = entry.path.file_stem().map_or_else(|| "unpacked".into(), |s| s.to_string_lossy().into_owned());
+        let dest = if items.len() > 1 { other.join(stem) } else { other };
+        let prompt = format!("Unpack \"{}\" to:", entry.name);
+        let default = util::with_trailing_separator(&dest);
+        self.start_input("Unpack", &prompt, &default, InputAction::Extract { archive: entry.path, items });
     }
 
     fn on_input(&mut self, action: InputAction, text: String) {
@@ -1113,6 +1203,40 @@ impl App {
             }
             InputAction::Unselect => {
                 self.active_panel_mut().mark_matching(&text, false);
+            }
+            InputAction::Extract { archive, items } => {
+                if text.trim().is_empty() {
+                    return;
+                }
+                let dest = util::resolve(&cwd, &text);
+                self.start_job(Job::Extract { archive, items, dest });
+            }
+            InputAction::Pack(sources) => {
+                if text.trim().is_empty() {
+                    return;
+                }
+                let mut dest = util::resolve(&cwd, &text);
+                if dest.is_dir() {
+                    let name = sources[0].file_name().map_or_else(|| "archive".into(), |n| n.to_string_lossy().into_owned());
+                    dest = dest.join(format!("{name}.zip"));
+                } else if dest.extension().is_none() {
+                    dest.set_extension("zip");
+                }
+                if let Some(inside) = sources.iter().find(|s| s.is_dir() && util::is_inside(&dest, s)) {
+                    return self.error(format!("\"{}\" can't hold a zip of itself.", inside.display()));
+                }
+                if dest.exists() {
+                    let name = dest.file_name().map_or_else(|| dest.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    self.dialog = Some(Dialog::Confirm {
+                        title: "Pack".into(),
+                        lines: vec![format!("{name} is there already."), "Replace it?".into()],
+                        focus: 1,
+                        danger: false,
+                        action: ConfirmAction::Pack(sources, dest),
+                    });
+                    return;
+                }
+                self.start_job(Job::Pack { sources, dest });
             }
             InputAction::Filter => {
                 let text = text.trim();
@@ -1231,6 +1355,13 @@ impl App {
         if std::mem::take(&mut self.pasting_cut) && errors.is_empty() && !cancelled {
             self.clipboard.moved();
         }
+        // A file taken out of an archive: now it can be opened.
+        if let Some((then, path)) = self.after_job.take()
+            && errors.is_empty()
+            && !cancelled
+        {
+            self.after_taking_out(then, path);
+        }
         for panel in &mut self.panels {
             // Done: the marks have served. Stopped or partly failed: they stay, to try again.
             if errors.is_empty() && !cancelled {
@@ -1302,6 +1433,9 @@ impl App {
     /// Explorer puts them there, so Explorer or a mail can paste them; their paths go along as
     /// text. Elsewhere than Windows the paths go to the terminal's clipboard (OSC 52).
     fn copy_to_clipboard(&mut self, effect: Effect) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
         let paths = self.active_panel().selection();
         if paths.is_empty() {
             return;
@@ -1322,6 +1456,9 @@ impl App {
     /// Ctrl+Shift+C: the full paths of the marked files (or the one under the cursor) to the
     /// clipboard as text.
     fn copy_paths(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
         let paths = self.active_panel().selection();
         if paths.is_empty() {
             return;
@@ -1342,6 +1479,9 @@ impl App {
     /// the active panel's folder, copied, or moved if they were cut. A copy into the folder it
     /// came from gets Explorer's "name - Copy" name.
     fn paste(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
         let Some(files) = self.clipboard.files() else {
             self.notice = Some("No files on the clipboard (Ctrl+C copies some, here or in Explorer)".into());
             return;
@@ -1444,15 +1584,16 @@ impl App {
     fn enter_current_dir(&mut self) {
         match self.active_panel().current() {
             Some(entry) if entry.is_parent => self.go_up(),
-            Some(entry) if entry.is_dir => {
-                let path = entry.path.clone();
-                self.change_dir(self.active, path);
-            }
+            Some(entry) if entry.is_dir => self.open_current(),
             _ => {}
         }
     }
 
     fn go_up(&mut self) {
+        // In an archive: up inside it, and out of it at its top.
+        if self.active_panel().archive.is_some() {
+            return self.panels[self.active].archive_up();
+        }
         match self.active_panel().cwd.parent() {
             Some(parent) => self.change_dir(self.active, parent.to_path_buf()),
             None => self.open_drives(self.active),
@@ -1485,10 +1626,18 @@ impl App {
 
     pub(crate) fn open_current(&mut self) {
         let Some(entry) = self.active_panel().current().cloned() else { return };
+        if self.active_panel().archive.is_some() {
+            return self.open_in_archive(&entry);
+        }
         if entry.is_parent {
             self.go_up();
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
+        } else if archive::is_archive(&entry.path) {
+            // A zip opens as a folder, as in Total Commander and mc.
+            if let Err(e) = self.panels[self.active].open_archive(&entry.path, entry.path.clone()) {
+                self.error(e);
+            }
         } else if let Some(folder) = lnk::is_shortcut(&entry.path).then(|| lnk::target(&entry.path)).flatten().filter(|t| t.is_dir()) {
             // A Windows shortcut to a folder: the panel goes there (not an Explorer window).
             self.change_dir(self.active, folder);
@@ -1512,9 +1661,64 @@ impl App {
         }
     }
 
+    /// Enter in an archive: folders open, `..` goes up (out at its top), and a file is taken
+    /// out and opened in its app (a zip in the zip opens in the panel).
+    fn open_in_archive(&mut self, entry: &Entry) {
+        let panel = &mut self.panels[self.active];
+        if entry.is_parent {
+            panel.archive_up();
+        } else if entry.is_dir {
+            panel.archive_enter(&entry.name);
+        } else {
+            let shown = panel.location().join(&entry.name);
+            self.take_out(entry, AfterJob::Open { shown });
+        }
+    }
+
+    /// A file in an archive goes out into rmc's temp folder (as a job: it may be big), and
+    /// `then` happens to it there.
+    fn take_out(&mut self, entry: &Entry, then: AfterJob) {
+        let Some(view) = self.active_panel().archive.as_ref() else { return };
+        let inner = archive::join(&view.inner, &entry.name);
+        let file = view.archive.file.clone();
+        static TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = archive::temp_dir().join(TAKEN.fetch_add(1, Ordering::Relaxed).to_string());
+        self.after_job = Some((then, dir.join(&entry.name)));
+        self.start_job(Job::Extract { archive: file, items: vec![inner], dest: dir });
+    }
+
+    /// The file a job took out of an archive is there: open it, view it, or open it as an
+    /// archive itself.
+    fn after_taking_out(&mut self, then: AfterJob, path: PathBuf) {
+        let size = fs::metadata(&path).map_or(0, |m| m.len());
+        match then {
+            AfterJob::Open { shown } if archive::is_archive(&path) => {
+                if let Err(e) = self.panels[self.active].open_archive(&path, shown) {
+                    self.error(e);
+                }
+            }
+            AfterJob::Open { .. } => match platform::open_default(&path) {
+                Ok(()) => {}
+                Err(OpenError::NoOpener) => self.view(path, size, None),
+                Err(OpenError::Failed(e)) => self.error(e),
+            },
+            AfterJob::View => self.view(path, size, None),
+        }
+    }
+
+    /// Archives open read-only: in panel `side` one is shown, say so and return true.
+    fn refuse_in_archive(&mut self, side: usize) -> bool {
+        if self.panels[side].archive.is_none() {
+            return false;
+        }
+        self.error("rmc opens archives read-only.\nF5 copies files out of one; Alt+F5 packs files into a new one.");
+        true
+    }
+
     fn view_current(&mut self) {
         match self.active_panel().current().cloned() {
             Some(entry) if entry.is_dir => self.open_current(),
+            Some(entry) if self.active_panel().archive.is_some() => self.take_out(&entry, AfterJob::View),
             Some(entry) => self.view(entry.path, entry.size, None),
             None => {}
         }
@@ -1534,9 +1738,16 @@ impl App {
 
     fn edit_current(&mut self) {
         let Some(entry) = self.active_panel().current().cloned() else { return };
-        if !entry.is_dir {
-            self.edit(entry.path, entry.size, None);
+        if entry.is_dir {
+            return;
         }
+        // A file in an archive can only be looked at here.
+        if self.active_panel().archive.is_some() {
+            self.take_out(&entry, AfterJob::View);
+            self.notice = Some("Files in archives open read-only".into());
+            return;
+        }
+        self.edit(entry.path, entry.size, None);
     }
 
     /// F4: the editor, after asking for a big file; at `line` if given.
@@ -1567,6 +1778,22 @@ impl App {
     }
 
     fn start_transfer(&mut self, is_move: bool) {
+        if self.refuse_in_archive(1 - self.active) || (is_move && self.refuse_in_archive(self.active)) {
+            return;
+        }
+        // Out of an archive: F5 extracts.
+        if let Some((archive, items)) = self.active_panel().archive_selection() {
+            if items.is_empty() {
+                return;
+            }
+            let default = util::with_trailing_separator(&self.panels[1 - self.active].cwd);
+            let what = match items.as_slice() {
+                [one] => format!("\"{}\"", one.rsplit('/').next().unwrap_or(one)),
+                many => format!("{} items", many.len()),
+            };
+            let prompt = format!("Copy {what} out of the archive to:");
+            return self.start_input("Copy", &prompt, &default, InputAction::Extract { archive, items });
+        }
         let sources = self.active_panel().selection();
         if sources.is_empty() {
             return;
@@ -1581,6 +1808,9 @@ impl App {
     }
 
     fn start_rename(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
         let (name, path) = (entry.name.clone(), entry.path.clone());
         self.start_input("Rename", &format!("Rename \"{name}\" to:"), &name, InputAction::Rename(path));
@@ -1652,6 +1882,9 @@ impl App {
     }
 
     fn confirm_delete(&mut self, to_trash: bool) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
         let paths = self.active_panel().selection();
         if paths.is_empty() {
             return;
@@ -2011,6 +2244,95 @@ mod tests {
         assert_eq!(app.clipboard.files(), None, "cut and pasted: nothing left to paste");
         app.on_key(alt_v);
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("No files")));
+    }
+
+    /// Enter on a zip opens it as a folder: in and out of its folders, `..` at its top back
+    /// out with the cursor on it. Nothing in it can be changed; F5 copies out of it, and F3
+    /// views a file from it (taken out into the temp folder).
+    #[test]
+    fn zips_open_as_folders_and_copy_out() {
+        let tmp = TempDir::new("app-zip");
+        let out = TempDir::new("app-zip-out");
+        crate::archive::tests::sample_zip(&tmp.path().join("photos.zip"));
+        let mut app = test_app(tmp.path(), out.path());
+        app.active_panel_mut().select_name("photos.zip");
+        app.on_key(key(KeyCode::Enter));
+        let names = |app: &App| app.active_panel().entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&app), ["..", "docs", "Účty", "top.txt"]);
+        assert!(app.active_panel().location().ends_with("photos.zip"));
+        app.active_panel_mut().select_name("Účty");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(names(&app), ["..", "2024"]);
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.active_panel().current().unwrap().name, "Účty", "back on the folder it came from");
+
+        // Read-only: deleting is refused.
+        app.on_key(key(KeyCode::F(8)));
+        assert!(matches!(&app.dialog, Some(Dialog::Message { lines, .. }) if lines[0].contains("read-only")));
+        app.dialog = None;
+
+        // F5 copies the folder out, with what is in it.
+        app.on_key(key(KeyCode::F(5)));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        assert_eq!(fs::read(out.path().join("Účty").join("2024").join("faktura.txt")).unwrap().len(), 1000);
+
+        // F3 takes a file out and views it.
+        app.active_panel_mut().select_name("top.txt");
+        app.on_key(key(KeyCode::F(3)));
+        wait_for_job(&mut app);
+        let Some(External::View(path, None)) = &app.external else { panic!("{:?}", app.external) };
+        assert_eq!(fs::read_to_string(path).unwrap(), "top");
+        app.external = None;
+
+        // `..` at the top leaves it, the cursor on the zip.
+        app.active_panel_mut().home();
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.active_panel().archive.is_none());
+        assert_eq!(app.active_panel().current().unwrap().name, "photos.zip");
+    }
+
+    /// Alt+F5 packs into a zip (in the other panel by default), Alt+F9 unpacks one; packing
+    /// a folder into itself is refused.
+    #[test]
+    fn packing_and_unpacking() {
+        let tmp = TempDir::new("app-pack");
+        let other = TempDir::new("app-pack-other");
+        tmp.file("trip/day 1/a.jpg", "aaa");
+        tmp.file("trip/notes.txt", "Účty");
+        let mut app = test_app(tmp.path(), other.path());
+        app.active_panel_mut().select_name("trip");
+        app.on_key(with_mods(KeyCode::F(5), KeyModifiers::ALT));
+        let Some(Dialog::Input { edit, .. }) = &app.dialog else { panic!() };
+        assert!(edit.text().ends_with("trip.zip"), "{}", edit.text());
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        let zip = other.path().join("trip.zip");
+        let packed = Archive::open(&zip).unwrap();
+        assert_eq!(packed.size_below("trip"), 3 + "Účty".len() as u64);
+        assert!(packed.find("trip/day 1/a.jpg").is_some());
+
+        // Unpacking it next to itself: one folder at its top, so straight in.
+        app.on_key(key(KeyCode::Tab));
+        app.active_panel_mut().select_name("trip.zip");
+        app.on_key(with_mods(KeyCode::F(9), KeyModifiers::ALT));
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        typing(&mut app, &other.path().join("unpacked").display().to_string());
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        assert_eq!(fs::read_to_string(other.path().join("unpacked/trip/notes.txt")).unwrap(), "Účty");
+        assert_eq!(fs::read_to_string(other.path().join("unpacked/trip/day 1/a.jpg")).unwrap(), "aaa");
+
+        // A folder can't hold a zip of itself.
+        app.on_key(key(KeyCode::Tab));
+        app.active_panel_mut().select_name("trip");
+        app.on_key(with_mods(KeyCode::F(5), KeyModifiers::ALT));
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        typing(&mut app, &tmp.path().join("trip").join("self.zip").display().to_string());
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.dialog, Some(Dialog::Message { lines, .. }) if lines[0].contains("zip of itself")));
     }
 
     /// Ctrl+F shows only matching files (folders stay); Ctrl+A marks all; Left/Right go up and

@@ -102,6 +102,27 @@ TrustedInstaller go, with no `takeown` or `icacls` needed, and deletes permanent
 Recycle Bin refuses protected files even then. Its progress shows as for any delete, and Esc
 stops it. On Linux there is no As admin.
 
+### Zip archives
+
+Enter on a `.zip` opens it in the panel as a folder, as Total Commander and mc do; the title
+shows the path through it (`E:\trips\2024.zip\day 1`), `..` goes up inside it and out at its
+top. Archives open read-only: copying into one, renaming, deleting and making folders in one
+say so.
+
+- **F5** copies the marked files and folders out of it, into the other panel's folder by
+  default, with the usual progress, overwrite questions and Esc.
+- **F3** and **Enter** take a file out into rmc's temp folder and view it or open it in its
+  app (a zip in the zip opens as a folder too); quick view (Ctrl+Q) reads files straight from
+  the zip. Ctrl+Space sizes its folders at once.
+- **Alt+F5** packs the marked files (folders with what they hold) into a new zip, in the
+  other panel's folder by default; **Alt+F9** unpacks the zip under the cursor into the other
+  panel's folder, and one with several things at its top into a folder of its own name, as
+  7-Zip's "Extract to name\" does. Both are Total Commander's keys.
+- Names are UTF-8 when the zip says so or when they read as UTF-8; older zips made by Windows
+  use its OEM code page (852 on a Czech Windows), which rmc reads too. Names that would climb
+  out of the folder they are unpacked into (`../x`) are left out. Packing writes UTF-8 names,
+  deflated, ZIP64 for files over 4 GB.
+
 ### Find
 
 Alt+F7 (or mc's Alt+?) searches below the active panel's folder the way
@@ -250,4 +271,4 @@ tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
 
 ## Not there yet
 
-Archives and SFTP, a user menu, themes.
+Writing into archives, other archive formats (7z, rar, tar), SFTP, a user menu, themes.

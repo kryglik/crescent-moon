@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::archive::{self, Archive};
 use crate::find::NameFilter;
 use crate::{platform, util};
 
@@ -136,6 +137,28 @@ pub struct Panel {
     /// Folders to go back and forward to (Alt+Left / Alt+Right), as in a browser.
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
+    /// A zip shown as a folder (Enter on it). `cwd` stays the real folder it is in, which
+    /// the shell, Find and the drive memory go by.
+    pub archive: Option<ArchiveView>,
+}
+
+/// The zip a panel shows, and where in it.
+pub struct ArchiveView {
+    pub archive: Archive,
+    /// The folder inside it ("" at the top).
+    pub inner: String,
+    /// What the title calls the zip: its path, or for one inside another the path through
+    /// that (the file itself was taken out into the temp folder).
+    pub shown: PathBuf,
+    /// The archive this one was opened from, to go back to.
+    pub outer: Option<Box<ArchiveView>>,
+}
+
+impl ArchiveView {
+    /// Where the panel is: `shown`, then the folder inside.
+    pub fn location(&self) -> PathBuf {
+        self.inner.split('/').filter(|p| !p.is_empty()).fold(self.shown.clone(), |path, part| path.join(part))
+    }
 }
 
 /// How many folders back the panel remembers.
@@ -160,6 +183,7 @@ impl Panel {
             drive_dirs: HashMap::new(),
             back: Vec::new(),
             forward: Vec::new(),
+            archive: None,
         };
         let cwd = util::normalize(&cwd);
         let candidates: Vec<PathBuf> = cwd
@@ -197,10 +221,18 @@ impl Panel {
     /// Re-reads the directory. Marks of entries that still exist are kept.
     pub fn load(&mut self) -> io::Result<()> {
         let filter = self.filter.as_deref().map(NameFilter::parse);
-        let mut entries = read_entries(&self.cwd, self.show_hidden, filter.as_ref())?;
+        let mut entries = match &self.archive {
+            Some(view) => archive_entries(view, filter.as_ref()),
+            None => read_entries(&self.cwd, self.show_hidden, filter.as_ref())?,
+        };
         sort_entries(&mut entries, self.sort, self.reverse, &self.dir_sizes);
-        // On Windows a drive root gets ".." too: it opens the drive picker.
-        if self.cwd.parent().is_some() || cfg!(windows) {
+        // On Windows a drive root gets ".." too: it opens the drive picker. In an archive ".."
+        // goes up inside it, and out of it at its top.
+        if let Some(view) = &self.archive {
+            let mut up = Entry::parent(&self.cwd);
+            up.path = view.location().parent().map_or_else(|| self.cwd.clone(), Path::to_path_buf);
+            entries.insert(0, up);
+        } else if self.cwd.parent().is_some() || cfg!(windows) {
             entries.insert(0, Entry::parent(&self.cwd));
         }
         self.entries = entries;
@@ -229,6 +261,7 @@ impl Panel {
     /// Reloads and keeps the cursor on the same name when it still exists.
     pub fn reload(&mut self) {
         let name = self.current().map(|e| e.name.clone());
+        self.reopen_archive();
         if self.load().is_err() {
             // The directory vanished (deleted, drive removed): climb to something that exists,
             // starting above it. When the whole drive is gone (a share offline), each step up
@@ -296,8 +329,94 @@ impl Panel {
         }
     }
 
+    /// The zip on disk changed since it was read (or is gone): read it again, staying in the
+    /// same folder inside if that is still there; gone, the panel leaves it.
+    fn reopen_archive(&mut self) {
+        let Some(view) = self.archive.as_mut() else { return };
+        if !view.archive.changed() {
+            return;
+        }
+        match Archive::open(&view.archive.file) {
+            Ok(archive) => {
+                if !view.inner.is_empty() && archive.find(&view.inner).is_none() {
+                    view.inner.clear();
+                }
+                view.archive = archive;
+            }
+            Err(_) => self.archive = None,
+        }
+    }
+
+    /// Enter on a zip: the panel shows what is in it. `shown` is what the title calls it.
+    pub fn open_archive(&mut self, file: &Path, shown: PathBuf) -> Result<(), String> {
+        let archive = Archive::open(file).map_err(|e| format!("Cannot open \"{}\":\n{e}", shown.display()))?;
+        let outer = self.archive.take().map(Box::new);
+        self.archive = Some(ArchiveView { archive, inner: String::new(), shown, outer });
+        self.enter_inner();
+        Ok(())
+    }
+
+    /// Into folder `name` inside the archive.
+    pub fn archive_enter(&mut self, name: &str) {
+        if let Some(view) = self.archive.as_mut() {
+            view.inner = archive::join(&view.inner, name);
+            self.enter_inner();
+        }
+    }
+
+    /// Up inside the archive; at its top, out of it (to the archive it came from, or the
+    /// folder), the cursor on the zip.
+    pub fn archive_up(&mut self) {
+        let Some(view) = self.archive.as_mut() else { return };
+        let left = if view.inner.is_empty() {
+            let view = self.archive.take().expect("in an archive");
+            self.archive = view.outer.map(|outer| *outer);
+            view.shown.file_name().map(|n| n.to_string_lossy().into_owned())
+        } else {
+            let name = view.inner.rsplit('/').next().map(str::to_string);
+            view.inner = archive::parent_of(&view.inner).to_string();
+            name
+        };
+        self.enter_inner();
+        if let Some(name) = left {
+            self.select_name(&name);
+        }
+    }
+
+    fn enter_inner(&mut self) {
+        self.marked.clear();
+        self.dir_sizes.clear();
+        (self.cursor, self.offset) = (0, 0);
+        let _ = self.load();
+    }
+
+    /// Where the panel is: its folder, or inside a zip (`E:\x\photos.zip\2024`).
+    pub fn location(&self) -> PathBuf {
+        self.archive.as_ref().map_or_else(|| self.cwd.clone(), ArchiveView::location)
+    }
+
+    /// The archive item of an entry of this panel.
+    pub fn archive_item(&self, entry: &Entry) -> Option<&archive::Item> {
+        let view = self.archive.as_ref()?;
+        view.archive.find(&archive::join(&view.inner, &entry.name))
+    }
+
+    /// In an archive: the zip on disk and the paths inside it of the marked entries (or the
+    /// one under the cursor).
+    pub fn archive_selection(&self) -> Option<(PathBuf, Vec<String>)> {
+        let view = self.archive.as_ref()?;
+        let names: Vec<&str> = if self.marked.is_empty() {
+            self.current().filter(|e| !e.is_parent).map(|e| vec![e.name.as_str()]).unwrap_or_default()
+        } else {
+            self.entries.iter().filter(|e| self.is_marked(e)).map(|e| e.name.as_str()).collect()
+        };
+        Some((view.archive.file.clone(), names.iter().map(|name| archive::join(&view.inner, name)).collect()))
+    }
+
     fn open_dir(&mut self, dir: PathBuf) -> Result<(), String> {
         let dir = util::normalize(&dir);
+        // Going anywhere else leaves the archive.
+        let archive = self.archive.take();
         let previous = std::mem::replace(&mut self.cwd, dir.clone());
         let marked = std::mem::take(&mut self.marked);
         let sizes = std::mem::take(&mut self.dir_sizes);
@@ -316,6 +435,7 @@ impl Panel {
                 self.cwd = previous;
                 self.marked = marked;
                 self.dir_sizes = sizes;
+                self.archive = archive;
                 let _ = self.load();
                 Err(format!("Cannot open \"{}\":\n{e}", dir.display()))
             }
@@ -517,6 +637,26 @@ fn effective_size(entry: &Entry, sizes: &HashMap<String, DirSize>) -> u64 {
         return entry.size;
     }
     sizes.get(&entry.name).filter(|s| s.done).map_or(0, |s| s.bytes)
+}
+
+/// The entries of the folder a panel shows inside a zip.
+fn archive_entries(view: &ArchiveView, filter: Option<&NameFilter>) -> Vec<Entry> {
+    let location = view.location();
+    view.archive
+        .children(&view.inner)
+        .filter(|item| item.is_dir || filter.is_none_or(|f| f.matches(item.name())))
+        .map(|item| Entry {
+            name: item.name().to_string(),
+            path: location.join(item.name()),
+            is_dir: item.is_dir,
+            is_link: false,
+            is_exec: false,
+            is_parent: false,
+            size: item.size,
+            modified: item.modified,
+            sort_name: item.name().to_lowercase(),
+        })
+        .collect()
 }
 
 fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {

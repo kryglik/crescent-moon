@@ -23,6 +23,7 @@ pub struct Files {
 
 /// The system's clipboard on Windows; rmc's own elsewhere, and in tests (so `cargo test`
 /// never replaces what the user copied).
+#[cfg_attr(not(windows), allow(dead_code))]
 const SYSTEM: bool = cfg!(all(windows, not(test)));
 
 #[derive(Default)]

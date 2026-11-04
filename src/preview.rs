@@ -34,6 +34,8 @@ pub struct Key {
     pub path: PathBuf,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// A file inside a zip: the zip on disk and the file's place in it.
+    pub archive: Option<(PathBuf, usize)>,
 }
 
 pub struct Preview {
@@ -59,7 +61,7 @@ impl Previewer {
                 while let Ok(newer) = wanted.try_recv() {
                     key = newer;
                 }
-                let content = load(&key.path);
+                let content = load_key(&key);
                 if done.send((key, content)).is_err() {
                     break;
                 }
@@ -118,6 +120,15 @@ impl Content {
     }
 }
 
+/// A file on disk, or the start of one inside a zip (only what is shown is unpacked).
+fn load_key(key: &Key) -> Content {
+    let Some((zip, index)) = &key.archive else { return load(&key.path) };
+    match crate::archive::read_start(zip, *index, READ_LIMIT) {
+        Ok(data) => content_of(&mut io::Cursor::new(data), key.size).unwrap_or_else(|e| Content::Message(format!("Cannot read it: {e}"))),
+        Err(e) => Content::Message(format!("Cannot read it from the archive: {e}")),
+    }
+}
+
 pub fn load(path: &Path) -> Content {
     match fs::metadata(path) {
         Ok(meta) if meta.is_dir() => load_folder(path),
@@ -151,13 +162,17 @@ fn load_folder(path: &Path) -> Content {
 }
 
 fn load_file(path: &Path, size: u64) -> io::Result<Content> {
-    let mut file = File::open(path)?;
-    if let Some((format, width, height)) = picture_size(&mut file)? {
+    content_of(&mut File::open(path)?, size)
+}
+
+/// What a file (`size` bytes long) is, from its start.
+fn content_of<R: Read + Seek>(file: &mut R, size: u64) -> io::Result<Content> {
+    if let Some((format, width, height)) = picture_size(file)? {
         return Ok(Content::Picture { format, width, height });
     }
     file.seek(SeekFrom::Start(0))?;
     let mut data = Vec::new();
-    file.take(READ_LIMIT).read_to_end(&mut data)?;
+    file.by_ref().take(READ_LIMIT).read_to_end(&mut data)?;
     let partial = size > data.len() as u64;
     if size == 0 {
         return Ok(Content::Message("The file is empty.".into()));
@@ -226,7 +241,7 @@ fn hex_dump(data: &[u8]) -> Vec<String> {
 }
 
 /// The format and size of a PNG, JPEG, GIF, BMP or WebP picture.
-fn picture_size(file: &mut File) -> io::Result<Option<(&'static str, u32, u32)>> {
+fn picture_size<R: Read + Seek>(file: &mut R) -> io::Result<Option<(&'static str, u32, u32)>> {
     let mut head = [0u8; 32];
     let n = read_up_to(file, &mut head)?;
     let head = &head[..n];
@@ -264,7 +279,7 @@ fn picture_size(file: &mut File) -> io::Result<Option<(&'static str, u32, u32)>>
 
 /// Walks a JPEG's segments to the frame header, skipping the rest (an EXIF block with its
 /// thumbnail can be big) without reading it.
-fn jpeg_size(file: &mut File) -> io::Result<Option<(&'static str, u32, u32)>> {
+fn jpeg_size<R: Read + Seek>(file: &mut R) -> io::Result<Option<(&'static str, u32, u32)>> {
     let mut pos = 2u64;
     for _ in 0..500 {
         file.seek(SeekFrom::Start(pos))?;
@@ -292,7 +307,7 @@ fn jpeg_size(file: &mut File) -> io::Result<Option<(&'static str, u32, u32)>> {
     Ok(None)
 }
 
-fn read_up_to(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+fn read_up_to<R: Read>(file: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match file.read(&mut buf[filled..])? {
@@ -373,7 +388,7 @@ mod tests {
         let tmp = TempDir::new("previewer");
         let a = tmp.file("a.txt", "aaa");
         let b = tmp.file("b.txt", "bbb");
-        let key = |path: &Path| Key { path: path.to_path_buf(), size: 3, modified: None };
+        let key = |path: &Path| Key { path: path.to_path_buf(), size: 3, modified: None, archive: None };
         let mut previewer = Previewer::new();
         previewer.show(Some(key(&a)));
         previewer.show(Some(key(&b)));

@@ -10,6 +10,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+use crate::archive::{self, Archive};
 use crate::{platform, util};
 
 /// Guards against link loops when copying through directory links.
@@ -22,6 +26,11 @@ pub enum Job {
     /// `admin_when_refused`: an item Windows refuses to put in the Recycle Bin goes to the
     /// administrator (permanently) without asking, and the rest still goes to the bin.
     Delete { paths: Vec<PathBuf>, to_trash: bool, admin_when_refused: bool },
+    /// Files and folders (`items`, paths inside the zip) out of the zip `archive` into the
+    /// folder `dest`, each with what is below it.
+    Extract { archive: PathBuf, items: Vec<String>, dest: PathBuf },
+    /// `sources` (with what is below them) into a new zip `dest`, by their names.
+    Pack { sources: Vec<PathBuf>, dest: PathBuf },
 }
 
 impl Job {
@@ -31,6 +40,8 @@ impl Job {
             Job::Move(_) => "Move",
             Job::Delete { to_trash: true, .. } => "Delete",
             Job::Delete { to_trash: false, .. } => "Delete permanently",
+            Job::Extract { .. } => "Extract",
+            Job::Pack { .. } => "Pack",
         }
     }
 }
@@ -264,9 +275,210 @@ impl Worker {
                     }
                 }
             }
+            Job::Extract { archive, items, dest } => self.extract(&archive, &items, &dest)?,
+            Job::Pack { sources, dest } => self.pack(&sources, &dest)?,
         }
         self.send_progress(true);
         Ok(())
+    }
+
+    /// Out of a zip: each item with what is below it, into `dest` (made if missing), with
+    /// the usual questions for files that are there already. Files in the zip whose names
+    /// would climb out of `dest` were left out when it was read.
+    fn extract(&mut self, file: &Path, items: &[String], dest: &Path) -> Flow<()> {
+        let Some(archive) = self.attempt(file, |_| Archive::open(file))? else { return Ok(()) };
+        let Some(mut zip) = self.attempt(file, |_| ZipArchive::new(File::open(file)?).map_err(archive::to_io))? else {
+            return Ok(());
+        };
+        // What goes where: paths relative to each item's folder in the zip.
+        let mut work: Vec<(archive::Item, PathBuf)> = Vec::new();
+        for item in items {
+            let base = archive::parent_of(item);
+            for entry in archive.below(item) {
+                let relative = if base.is_empty() { entry.path.as_str() } else { &entry.path[base.len() + 1..] };
+                let target = relative.split('/').fold(dest.to_path_buf(), |path, part| path.join(part));
+                work.push((entry.clone(), target));
+            }
+        }
+        self.progress.files_total = work.iter().filter(|(item, _)| !item.is_dir).count() as u64;
+        self.progress.bytes_total = work.iter().filter(|(item, _)| !item.is_dir).map(|(item, _)| item.size).sum();
+        for (item, target) in &work {
+            self.check_cancel()?;
+            if item.is_dir {
+                self.attempt(target, |_| fs::create_dir_all(target))?;
+                continue;
+            }
+            let Some(index) = item.index else { continue };
+            self.progress.current = format!("{}{}{}", file.display(), std::path::MAIN_SEPARATOR, item.path);
+            if let Ok(existing) = fs::symlink_metadata(target) {
+                let info = FileInfo { size: item.size, modified: item.modified };
+                if existing.is_dir() {
+                    self.errors.push(format!("{}: a directory with this name already exists", target.display()));
+                    self.skip_file(item.size);
+                    continue;
+                }
+                if !self.confirm_overwrite(target, info, &existing)? {
+                    self.skip_file(item.size);
+                    continue;
+                }
+            }
+            if let Some(parent) = target.parent()
+                && self.attempt(parent, |_| fs::create_dir_all(parent))?.is_none()
+            {
+                self.skip_file(item.size);
+                continue;
+            }
+            let done = self.attempt(target, |worker| worker.extract_file(&mut zip, index, item.modified, target))?;
+            if done.is_some() {
+                self.progress.files_done += 1;
+            } else {
+                self.skip_file(item.size);
+            }
+            self.send_progress(false);
+        }
+        Ok(())
+    }
+
+    /// One file out of the zip, in chunks (progress, cancelling), under a temporary name that
+    /// replaces the target at the end, as copies do.
+    fn extract_file(
+        &mut self,
+        zip: &mut ZipArchive<File>,
+        index: usize,
+        modified: Option<SystemTime>,
+        target: &Path,
+    ) -> io::Result<()> {
+        let start = self.progress.bytes_done;
+        let temp = temp_name(target);
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.resize(BUFFER_SIZE, 0);
+        let result = (|| {
+            let mut input = zip.by_index(index).map_err(archive::to_io)?;
+            let mut output = File::create_new(&temp)?;
+            loop {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                }
+                let n = match input.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                output.write_all(&buffer[..n])?;
+                self.progress.bytes_done += n as u64;
+                self.send_progress(false);
+            }
+            if let Some(time) = modified {
+                let _ = output.set_modified(time);
+            }
+            drop(output);
+            replace_with(&temp, target)
+        })();
+        self.buffer = buffer;
+        if result.is_err() {
+            self.progress.bytes_done = start;
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    /// Into a new zip: each source by its name, folders with what is below them (links
+    /// followed, as copies do on Windows). It is written aside and renamed at the end, so a
+    /// failed or stopped pack leaves no half zip (and an older zip of that name as it was).
+    fn pack(&mut self, sources: &[PathBuf], dest: &Path) -> Flow<()> {
+        self.scan_all(sources.iter().map(PathBuf::as_path), true)?;
+        let temp = temp_name(dest);
+        let Some(file) = self.attempt(dest, |_| File::create_new(&temp))? else { return Ok(()) };
+        let mut zip = ZipWriter::new(file);
+        let result = (|| {
+            for source in sources {
+                let Some(name) = source.file_name() else { continue };
+                self.pack_tree(&mut zip, source, &name.to_string_lossy(), &mut Vec::new())?;
+            }
+            Ok(())
+        })();
+        if let Err(stop) = result {
+            drop(zip);
+            let _ = fs::remove_file(&temp);
+            return Err(stop);
+        }
+        let finished = zip.finish().map(drop).map_err(archive::to_io).and_then(|()| replace_with(&temp, dest));
+        if let Err(e) = finished {
+            let _ = fs::remove_file(&temp);
+            self.errors.push(format!("{}: {e}", dest.display()));
+        }
+        Ok(())
+    }
+
+    fn pack_tree(&mut self, zip: &mut ZipWriter<File>, path: &Path, name: &str, ancestors: &mut Vec<PathBuf>) -> Flow<()> {
+        self.check_cancel()?;
+        let Some(meta) = self.attempt(path, |_| followed_metadata(path))? else { return Ok(()) };
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(meta.modified().ok().and_then(archive::to_zip_time).unwrap_or_default())
+            .large_file(meta.len() >= u32::MAX as u64);
+        if meta.is_dir() {
+            if ancestors.len() >= MAX_DEPTH || (is_link(path) && loops_back(path, ancestors)) {
+                self.errors.push(format!("{}: nested too deeply or a link back up, skipped", path.display()));
+                return Ok(());
+            }
+            self.attempt(path, |_| zip.add_directory(format!("{name}/"), options.clone()).map_err(archive::to_io))?;
+            let Some(children) = self.attempt(path, |_| child_names(path))? else { return Ok(()) };
+            ancestors.push(path.to_path_buf());
+            for child in children {
+                let child_name = format!("{name}/{}", child.to_string_lossy());
+                self.pack_tree(zip, &path.join(&child), &child_name, ancestors)?;
+            }
+            ancestors.pop();
+            return Ok(());
+        }
+        self.progress.current = path.display().to_string();
+        if !meta.is_file() {
+            self.errors.push(format!("{}: not a regular file (a pipe, socket or device), skipped", path.display()));
+            self.skip_file(0);
+            return Ok(());
+        }
+        let start = self.progress.bytes_done;
+        let packed = self.attempt(path, |worker| {
+            worker.progress.bytes_done = start;
+            let result = worker.pack_file(zip, path, name, options.clone());
+            if result.is_err() {
+                let _ = zip.abort_file();
+            }
+            result
+        })?;
+        if packed.is_some() {
+            self.progress.files_done += 1;
+        } else {
+            self.progress.bytes_done = start;
+            self.skip_file(meta.len());
+        }
+        self.send_progress(false);
+        Ok(())
+    }
+
+    fn pack_file(&mut self, zip: &mut ZipWriter<File>, path: &Path, name: &str, options: SimpleFileOptions) -> io::Result<()> {
+        let mut input = File::open(path)?;
+        zip.start_file(name, options).map_err(archive::to_io)?;
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.resize(BUFFER_SIZE, 0);
+        let result = (|| loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            let n = match input.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            zip.write_all(&buffer[..n])?;
+            self.progress.bytes_done += n as u64;
+            self.send_progress(false);
+        })();
+        self.buffer = buffer;
+        result
     }
 
     fn check_cancel(&self) -> Flow<()> {

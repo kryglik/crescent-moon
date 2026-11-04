@@ -2,6 +2,7 @@
 
 mod admin;
 mod app;
+mod archive;
 mod clipboard;
 mod compare;
 mod dialog;
@@ -201,6 +202,8 @@ fn main() -> ExitCode {
     ratatui::restore();
     title.restore();
     app.save_history();
+    // Files taken out of archives to be viewed (one still open in an app stays).
+    let _ = fs::remove_dir_all(archive::temp_dir());
 
     if let Some(file) = args.cwd_file {
         let _ = std::fs::write(file, app.active_panel().cwd.to_string_lossy().as_bytes());
@@ -383,8 +386,8 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
 
 /// "photos - rmc": the active panel's folder (the whole path for a drive root).
 fn window_title(app: &App) -> String {
-    let cwd = &app.active_panel().cwd;
-    let name = cwd.file_name().map_or_else(|| cwd.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let location = app.active_panel().location();
+    let name = location.file_name().map_or_else(|| location.display().to_string(), |n| n.to_string_lossy().into_owned());
     format!("{name} - rmc")
 }
 

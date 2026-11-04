@@ -275,7 +275,8 @@ fn draw_panel(
     let inner_w = area.width.saturating_sub(2) as usize;
     // The filter (Ctrl+F) after the path, so hidden files are never a mystery.
     let filter = panel.filter.as_deref().map(|f| format!("[{f}] ")).unwrap_or_default();
-    let path = util::fit_left(&panel.cwd.display().to_string(), inner_w.saturating_sub(4 + util::width(&filter)));
+    // In an archive, the path through it (E:\x\photos.zip\2024).
+    let path = util::fit_left(&panel.location().display().to_string(), inner_w.saturating_sub(4 + util::width(&filter)));
     let title_style = if active { cursor_style() } else { base };
     let mut title = vec![Span::styled(format!(" {path} "), title_style)];
     if !filter.is_empty() {

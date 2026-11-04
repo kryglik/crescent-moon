@@ -20,6 +20,8 @@ pub enum ConfirmAction {
     /// A big file in the editor or viewer after all.
     Edit(PathBuf, Option<u64>),
     View(PathBuf, Option<u64>),
+    /// Packing into a zip that is there already: replace it.
+    Pack(Vec<PathBuf>, PathBuf),
 }
 
 /// What happens with the text of an input dialog.
@@ -33,6 +35,11 @@ pub enum InputAction {
     Unselect,
     /// Ctrl+F: the active panel's file filter.
     Filter,
+    /// F5 in an archive, or Alt+F9 on one: these paths inside the zip `archive`, out into the
+    /// folder typed.
+    Extract { archive: PathBuf, items: Vec<String> },
+    /// Alt+F5: these into the zip typed.
+    Pack(Vec<PathBuf>),
 }
 
 pub enum Dialog {
@@ -269,6 +276,11 @@ pub const HELP: &[&str] = &[
     "  The question counts what goes; As admin deletes protected files",
     "  (Windows asks for administrator rights first)",
     "  Esc          close a dialog, stop a copy/move/delete",
+    "",
+    "Zip archives",
+    "  Enter        open a zip as a folder (read-only); .. leaves it",
+    "  F5           copy out of it    F3, Enter   view, open a file in it",
+    "  Alt+F5       pack into a zip   Alt+F9      unpack the zip",
     "",
     "Mouse",
     "  click        select       double-click  open",
