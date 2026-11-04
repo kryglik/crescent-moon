@@ -224,9 +224,10 @@ impl Finder {
     }
 }
 
-/// Paths sort case-insensitively, folders before the files in them.
+/// Paths sort case-insensitively, folders before the files in them, and a folder's files
+/// right after it: the separator sorts before any character (`src/…` before `src-old`).
 fn sort_key(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase().replace('\\', "/")
+    path.to_string_lossy().to_lowercase().replace(['\\', '/'], "\u{1}")
 }
 
 #[cfg(test)]
