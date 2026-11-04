@@ -227,14 +227,14 @@ pub const HELP: &[&str] = &[
     "",
     "Shell",
     "  Ctrl+O       switch between the panels and the shell. It is one",
-    "               pwsh for the whole session; panel and shell follow",
+    "               shell for the whole session; panel and shell follow",
     "               each other's cd",
     "  Shift+PgUp/PgDn, wheel   scroll back through its output",
     "",
     "  F10          quit",
     "",
     "Editor and viewer: RMC_EDITOR, RMC_VIEWER (nvim, nvim -R)",
-    "Shell: RMC_SHELL (pwsh, then powershell, then cmd)",
+    "Shell: RMC_SHELL (pwsh, then powershell, then cmd; on Linux $SHELL)",
 ];
 
 #[cfg(test)]

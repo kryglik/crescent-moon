@@ -1,9 +1,8 @@
 # rmc
 
 A small Midnight Commander-style two-panel file manager for the terminal, written in Rust.
-It runs natively on Windows (Windows Terminal, PowerShell). It also compiles for Linux
-(`cargo check --target x86_64-unknown-linux-gnu`), but there it is less complete: the drive
-picker shows only `/`, free space isn't shown, and the shell's folder doesn't follow the panel.
+It runs natively on Windows (Windows Terminal, PowerShell) and on Linux, including WSL
+(bash or zsh). It should build on macOS too, but that hasn't been tried.
 
 What it does differently from the Windows port of mc:
 
@@ -23,6 +22,25 @@ rmc                        # or: rmc LEFT_DIR RIGHT_DIR
 
 The release build links the C runtime statically (`.cargo/config.toml`), so `rmc.exe` can be
 copied to another PC without installing anything.
+
+On Linux the same `cargo install --path .` puts `rmc` into `~/.cargo/bin`. Building inside WSL
+from the Windows checkout works; keep the build output on the Linux side, where it is much
+faster:
+
+```bash
+cd /mnt/e/devel/midnight-commander
+CARGO_TARGET_DIR=~/rmc-target cargo install --path .
+```
+
+### On Linux
+
+- The drive picker (Alt+F1/F2) lists `/`, disks, removable media and network mounts, and in
+  WSL the Windows drives (`/mnt/c`…); a letter jumps to the mount whose folder starts with it.
+  Free space of network and Windows drives is fetched in the background.
+- Enter on a file opens it in the desktop's app (`xdg-open` in a graphical session; in WSL
+  the Windows app, via `wslview` or `explorer.exe`). Without one, it opens in the viewer.
+- The editor defaults to nvim, or the first of vim, vi and nano that is installed.
+- Terminals send Ctrl+\ as Ctrl+4; both open the hotlist.
 
 ## Keys
 
@@ -71,8 +89,11 @@ screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
   program.
 - `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.
 
-This works with pwsh or Windows PowerShell: rmc starts it with a small script that wraps your
-prompt so each prompt reports its number and folder. With `RMC_SHELL=cmd` (or bash on Linux)
+This works with pwsh or Windows PowerShell, bash and zsh: rmc starts the shell with a small
+start-up script that loads your usual one (your profile, `~/.bashrc`, or `.zshenv` and `.zshrc`
+from your ZDOTDIR), then hooks the prompt so each prompt reports its number and folder, and
+binds the silent follow key. bash redraws its prompt by drawing a new one in the old one's
+place (bash 4.4 or later; older ones get a visible ` cd`). With cmd, sh, fish or other shells
 the shell still works, but the folders don't follow each other, and rmc can't tell whether a
 command is still running, so it never refuses one.
 
@@ -89,9 +110,9 @@ While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Star
 
 | Variable | Default |
 | --- | --- |
-| `RMC_EDITOR` (then `VISUAL`, `EDITOR`) | `nvim` |
-| `RMC_VIEWER` | the editor, plus `-R` for vim/nvim |
-| `RMC_SHELL` | `pwsh`, then `powershell`, then `cmd` |
+| `RMC_EDITOR` (then `VISUAL`, `EDITOR`) | `nvim` (if missing: vim, vi, nano) |
+| `RMC_VIEWER` | the editor, plus `-R` for vim/nvim or `-v` for nano |
+| `RMC_SHELL` | `pwsh`, then `powershell`, then `cmd`; on Linux `$SHELL` |
 | `RMC_LOG` | file to log the shell's pseudo-console traffic to, for debugging (typed input is logged as a byte count only) |
 
 Favourite folders are saved in `%APPDATA%\rmc\hotlist.txt` (one path per line; you can edit it).
@@ -129,13 +150,21 @@ function rmc {
 | `src/hotlist.rs` | favourite folders and their file |
 | `src/dialog.rs` | dialogs, buttons, line editor, help text |
 | `src/ui.rs` | drawing with ratatui |
-| `src/platform.rs` | Windows bits: drives, free space, hidden files, ShellExecute, shells |
+| `src/platform.rs` | OS bits: drives and mounts, free space, hidden files, opening files, shells and their start-up scripts |
 | `src/util.rs` | formatting, path resolution, wildcard matching, column fitting |
 
 ## Testing in a real terminal
 
-`cargo test` covers most things, including a real pwsh in the embedded shell. To check rmc
-itself in a Windows Terminal window, the scripts in `tools/` attach to its console:
+`cargo test` covers most things, including a real shell in the embedded terminal: pwsh on
+Windows, bash and zsh on Linux (`RMC_TEST_ZSH` can point at a zsh that isn't on the PATH).
+Run the Linux tests from Windows with WSL:
+
+```bash
+wsl -- bash -lc 'cd /mnt/e/devel/midnight-commander && CARGO_TARGET_DIR=~/rmc-target cargo test'
+```
+
+To check rmc itself in a Windows Terminal window, the scripts in `tools/` attach to its
+console. That works for rmc inside WSL too: give them the pid of its `wsl.exe`.
 
 ```powershell
 wt -w new cmd /c rmc E:\some\dir          # then find its pid: Get-Process rmc

@@ -145,10 +145,12 @@ pub struct Subshell {
     report_file: PathBuf,
     /// Where rmc puts the folder for the shell's follow key.
     request_file: PathBuf,
+    /// rmc's start-up files for bash and zsh.
+    init_dir: PathBuf,
     /// The prompt number when rmc last typed into the shell. A later prompt means it is idle.
     prompt_at_last_input: u64,
     typed_anything: bool,
-    /// Whether the shell's prompt writes `report_file` (only PowerShell's does, so far).
+    /// Whether the shell's prompt writes `report_file` (PowerShell, bash, zsh).
     reports_prompts: bool,
     /// The shell's folder when it was last shown; if it has moved by the time the panels come
     /// back, the panel follows.
@@ -168,10 +170,21 @@ impl Subshell {
         // Unique per shell: a new one may start while the old one's file is still being removed.
         static STARTED: AtomicU32 = AtomicU32::new(0);
         let n = STARTED.fetch_add(1, Ordering::Relaxed);
-        let file = |what: &str| std::env::temp_dir().join(format!("rmc-{}-shell-{n}{what}.txt", std::process::id()));
+        let name = format!("rmc-{}-shell-{n}", std::process::id());
+        let file = |what: &str| std::env::temp_dir().join(format!("{name}{what}.txt"));
         let (report_file, request_file) = (file(""), file("-cd"));
+        let init_dir = std::env::temp_dir().join(&name);
         let _ = fs::remove_file(&report_file);
-        let mut command = CommandBuilder::from_argv(shell.interactive_argv());
+        let session = shell.session(&init_dir).map_err(|e| error(&e))?;
+        let mut command = CommandBuilder::from_argv(session.argv);
+        for (key, value) in session.env {
+            command.env(key, value);
+        }
+        // What rmc's screen copy (vt100) understands; without it readline and zle fall back
+        // to a dumb terminal. ConPTY on Windows ignores it.
+        if cfg!(unix) {
+            command.env("TERM", "xterm-256color");
+        }
         command.cwd(cwd);
         command.env("RMC_CWD_FILE", &report_file);
         command.env("RMC_REQUEST_FILE", &request_file);
@@ -204,9 +217,10 @@ impl Subshell {
             size: (rows, cols),
             report_file,
             request_file,
+            init_dir,
             prompt_at_last_input: 0,
             typed_anything: false,
-            reports_prompts: matches!(shell, Shell::PowerShell(_)),
+            reports_prompts: shell.reports_prompts(),
             cwd_when_shown: None,
         })
     }
@@ -305,18 +319,19 @@ impl Subshell {
     /// Before the shell is shown: if it sits idle in another folder than the panel's, move it
     /// there, as mc does with its subshell. That is silent: rmc writes the folder to the request
     /// file and presses the follow key, and the shell changes folder and redraws its prompt in
-    /// place. (Without PSReadLine a visible `Set-Location` is typed instead.)
+    /// place. (Without the key, e.g. PowerShell without PSReadLine or bash before 4.4, a visible
+    /// `cd` is typed instead.) Shells that don't report their folder are left alone.
     /// Remembers where the shell is, for `moved_to`.
     pub fn follow_panel(&mut self, dir: &Path, shell: &Shell) {
         let report = self.report();
         let elsewhere = report.as_ref().is_some_and(|r| !util::same_path(&r.dir, dir));
-        if elsewhere && self.is_idle() && matches!(shell, Shell::PowerShell(_)) {
+        if elsewhere && self.is_idle() && self.reports_prompts {
             let silent = report.as_ref().is_some_and(|r| r.can_follow)
                 && fs::write(&self.request_file, dir.to_string_lossy().as_bytes()).is_ok();
             if silent {
                 self.send_text(platform::FOLLOW_KEY);
-            } else {
-                self.send_text(&format!("Set-Location -LiteralPath {}\r", shell.quote(&dir.display().to_string())));
+            } else if let Some(line) = shell.cd_line(dir) {
+                self.send_text(&line);
             }
             self.cwd_when_shown = Some(dir.to_path_buf());
         } else {
@@ -338,6 +353,7 @@ impl Drop for Subshell {
         let _ = self.child.kill();
         let _ = fs::remove_file(&self.report_file);
         let _ = fs::remove_file(&self.request_file);
+        let _ = fs::remove_dir_all(&self.init_dir);
     }
 }
 
@@ -495,7 +511,65 @@ mod tests {
         wait_for("exit", || shell.has_exited());
     }
 
-    /// cmd (and bash on Linux) don't report their prompts: rmc can't see when a command ends,
+    /// bash and zsh, with rmc's start-up files: the same as the PowerShell test above.
+    #[cfg(unix)]
+    fn posix_shell_keeps_its_state_and_follows_the_panel(program: &str, set_prompt: &str) {
+        let shell_kind = Shell::Posix(program.into());
+        let tmp = TempDir::new("subshell-posix");
+        let other = tmp.dir("Účty");
+        let mut shell = Subshell::start(&shell_kind, tmp.path(), 30, 100).unwrap();
+        assert!(shell.is_idle(), "a new shell is ready for typing");
+
+        // A plain prompt showing the folder's name, "[name]> "; a variable to check later.
+        shell.send_text(&format!("{set_prompt}; x=$((6 * 7)); echo answer=$x\r"));
+        wait_for("the command's output", || screen_text(&shell).contains("answer=42"));
+        wait_for("the next prompt", || shell.is_idle());
+
+        assert!(shell.report().is_some_and(|r| r.can_follow), "the follow key is bound");
+        shell.follow_panel(&other, &shell_kind);
+        wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
+        wait_for("the redrawn prompt", || screen_text(&shell).contains("[Účty]> "));
+        let screen = screen_text(&shell);
+        assert!(!screen.contains("cd --") && !screen.contains("__rmc"), "no visible cd:\n{screen}");
+        assert_eq!(screen.matches("]> ").count(), 1, "the prompt is redrawn in place:\n{screen}");
+        assert!(shell.is_idle(), "still idle after the silent cd");
+        assert_eq!(shell.moved_to(), None, "rmc's own cd doesn't count as the user moving");
+
+        shell.send_text("echo still=$x; cd ..\r");
+        wait_for("the variable", || screen_text(&shell).contains("still=42"));
+        wait_for("the user's cd", || shell.moved_to().is_some_and(|dir| util::same_path(&dir, tmp.path())));
+        shell.send_text("exit\r");
+        wait_for("exit", || shell.has_exited());
+    }
+
+    // The prompts are set as '[...]''> ' so the typed command itself doesn't contain "]> ".
+    #[cfg(unix)]
+    #[test]
+    fn bash_keeps_its_state_and_follows_the_panel() {
+        let Some(bash) = util::find_in_path("bash") else {
+            eprintln!("no bash here; skipped");
+            return;
+        };
+        posix_shell_keeps_its_state_and_follows_the_panel(&bash.to_string_lossy(), r"PS1='[\W]''> '");
+    }
+
+    /// RMC_TEST_ZSH can point at a zsh that isn't on the PATH.
+    #[cfg(unix)]
+    #[test]
+    fn zsh_keeps_its_state_and_follows_the_panel() {
+        let zsh = std::env::var_os("RMC_TEST_ZSH").map(PathBuf::from).or_else(|| util::find_in_path("zsh"));
+        let Some(zsh) = zsh else {
+            eprintln!("no zsh here; skipped");
+            return;
+        };
+        // The binary may be called zsh-static; rmc goes by the name, so give it a zsh one.
+        let tmp = TempDir::new("zsh-link");
+        let link = tmp.path().join("zsh");
+        std::os::unix::fs::symlink(&zsh, &link).unwrap();
+        posix_shell_keeps_its_state_and_follows_the_panel(&link.to_string_lossy(), "PROMPT='[%1~]''> '");
+    }
+
+    /// cmd (and sh, fish) don't report their prompts: rmc can't see when a command ends,
     /// so it must not refuse the second command as "still busy".
     #[test]
     fn a_shell_without_prompt_reports_takes_one_command_after_another() {

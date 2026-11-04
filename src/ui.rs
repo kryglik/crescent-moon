@@ -606,7 +606,15 @@ mod tests {
     fn renders_panels_and_key_bar() {
         let tmp = TempDir::new("ui-render");
         tmp.file("Příliš žluťoučký kůň.txt", "kůň");
-        tmp.file("run.bat", "@echo hi");
+        let script = tmp.file("run.bat", "@echo hi");
+        // Executable by extension on Windows, by its x bit elsewhere.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        let _ = script;
         tmp.dir("Účty");
         let mut app = app_for(&tmp);
         let screen = render(&mut app, 100, 16);

@@ -13,7 +13,7 @@ use crate::hotlist::Hotlist;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::panel::{DirSize, Panel};
-use crate::platform::{self, Shell};
+use crate::platform::{self, OpenError, Shell};
 use crate::sizes::Sizer;
 use crate::subshell::Subshell;
 use crate::util;
@@ -36,11 +36,13 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let editor = env_command(&["RMC_EDITOR", "VISUAL", "EDITOR"]).unwrap_or_else(|| vec!["nvim".into()]);
+        let editor = env_command(&["RMC_EDITOR", "VISUAL", "EDITOR"]).unwrap_or_else(|| vec![default_editor()]);
         let viewer = env_command(&["RMC_VIEWER"]).unwrap_or_else(|| {
             let mut viewer = editor.clone();
             if is_vim(&editor[0]) {
                 viewer.push("-R".into());
+            } else if is_nano(&editor[0]) {
+                viewer.push("-v".into());
             }
             viewer
         });
@@ -69,6 +71,21 @@ fn parse_command(value: &str) -> Vec<String> {
 fn is_vim(program: &str) -> bool {
     let stem = Path::new(program).file_stem().map(|s| s.to_string_lossy().to_lowercase());
     matches!(stem.as_deref(), Some("nvim" | "vim" | "vi" | "gvim"))
+}
+
+fn is_nano(program: &str) -> bool {
+    Path::new(program).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("nano"))
+}
+
+/// nvim, or where it isn't installed (a server, WSL) the first of vim, vi and nano that is.
+/// With none of them, still nvim, so the error says what to install.
+fn default_editor() -> String {
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    ["nvim", "vim", "vi", "nano"]
+        .into_iter()
+        .find(|name| util::find_in_path(&format!("{name}{exe}")).is_some())
+        .unwrap_or("nvim")
+        .to_string()
 }
 
 pub struct App {
@@ -226,7 +243,8 @@ impl App {
             KeyCode::Char('u') if ctrl && !alt => self.panels.swap(0, 1),
             KeyCode::Char('o') if ctrl && !alt => self.show_shell(),
             // Ctrl+\ is a dead key on the Czech layout, so Ctrl+D (as in Total Commander) works too.
-            KeyCode::Char('\\' | 'd' | '\u{1c}') if ctrl && !alt => self.open_hotlist(),
+            // Unix terminals send Ctrl+\ as 0x1C, which crossterm reports as Ctrl+4.
+            KeyCode::Char('\\' | 'd' | '\u{1c}' | '4') if ctrl && !alt => self.open_hotlist(),
             KeyCode::Char(' ') if ctrl && !alt => self.calculate_sizes(),
             // Ctrl+S or Alt+S, as in mc (both together is AltGr, which types a character).
             KeyCode::Char('s') if ctrl != alt => self.quicksearch = Some(String::new()),
@@ -338,8 +356,15 @@ impl App {
                     None
                 }
                 KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                    // `E:\` on Windows; elsewhere the mount whose folder starts with it (/mnt/e).
                     let wanted = format!("{}:", c.to_ascii_uppercase());
-                    match drives.iter().find(|d| d.root.to_string_lossy().starts_with(&wanted)) {
+                    let starts = |d: &&platform::DriveInfo| {
+                        let root = d.root.to_string_lossy();
+                        root.starts_with(&wanted)
+                            || (!cfg!(windows)
+                                && d.root.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with(c.to_ascii_lowercase())))
+                    };
+                    match drives.iter().find(starts) {
                         Some(drive) => {
                             self.switch_drive(side, &drive.root);
                             None
@@ -498,7 +523,7 @@ impl App {
                 self.save_hotlist();
             }
             KeyCode::Esc | KeyCode::F(10) => return None,
-            KeyCode::Char('\\' | 'd' | '\u{1c}') if ctrl => return None,
+            KeyCode::Char('\\' | 'd' | '\u{1c}' | '4') if ctrl => return None,
             _ => {}
         }
         Some(Dialog::Hotlist { cursor })
@@ -678,11 +703,14 @@ impl App {
 
     fn open_drives(&mut self, side: usize) {
         let drives = platform::drives();
-        let cwd = self.panels[side].cwd.to_string_lossy().to_lowercase();
+        let cwd = &self.panels[side].cwd;
+        // The most specific drive holding the panel's folder (on Linux everything is under /).
         let cursor = drives
             .iter()
-            .position(|d| cwd.starts_with(&d.root.to_string_lossy().to_lowercase()))
-            .unwrap_or(0);
+            .enumerate()
+            .filter(|(_, d)| util::is_inside(cwd, &d.root))
+            .max_by_key(|(_, d)| d.root.components().count())
+            .map_or(0, |(i, _)| i);
         let slow: Vec<PathBuf> = drives.iter().filter(|d| d.pending).map(|d| d.root.clone()).collect();
         self.drive_space = (!slow.is_empty()).then(|| platform::query_space_later(slow));
         self.dialog = Some(Dialog::Drives { side, drives, cursor });
@@ -692,7 +720,8 @@ impl App {
     /// is already on goes to its root, as in Total Commander.
     fn switch_drive(&mut self, side: usize, root: &Path) {
         let panel = &self.panels[side];
-        let target = if util::same_volume(root, &panel.cwd) { root.to_path_buf() } else { panel.dir_on_drive(root) };
+        let here = util::volume_key(root) == util::volume_key(&panel.cwd);
+        let target = if here { root.to_path_buf() } else { panel.dir_on_drive(root) };
         self.change_dir(side, target);
     }
 
@@ -704,8 +733,13 @@ impl App {
             self.change_dir(self.active, entry.path);
         } else if entry.is_exec {
             self.run_in_shell(self.config.shell.run_file_line(&entry.path));
-        } else if let Err(e) = platform::open_default(&entry.path) {
-            self.error(e);
+        } else {
+            match platform::open_default(&entry.path) {
+                Ok(()) => {}
+                // A server or WSL has nothing to open files with: show the file instead.
+                Err(OpenError::NoOpener) => self.external = Some(External::View(entry.path)),
+                Err(OpenError::Failed(e)) => self.error(e),
+            }
         }
     }
 
@@ -1016,7 +1050,7 @@ mod tests {
         assert_eq!(app.hotlist.dirs.len(), 1);
 
         // Ctrl+D works too; add a second folder from elsewhere.
-        typing(&mut app, "cd deep\\inside");
+        typing(&mut app, &format!("cd deep{}inside", std::path::MAIN_SEPARATOR));
         app.on_key(key(KeyCode::Enter));
         app.on_key(ctrl('d'));
         app.on_key(key(KeyCode::Insert));

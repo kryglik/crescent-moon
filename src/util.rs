@@ -118,7 +118,6 @@ pub fn config_dir() -> Option<PathBuf> {
     base.map(|dir| dir.join("rmc"))
 }
 
-#[cfg(windows)]
 pub fn find_in_path(program: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -159,17 +158,25 @@ pub fn child_name(dir: &Path, path: &Path) -> Option<String> {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
 }
 
-/// The drive part of a path (`e:` or `\\server\share`, lower-cased); None without one.
+/// The drive part of a path (`e:` or `\\server\share`, lower-cased); elsewhere the mount point
+/// holding it (`/mnt/e`). Panels remember their last folder per key.
 pub fn volume_key(path: &Path) -> Option<String> {
     match normalize(path).components().next() {
         Some(Component::Prefix(p)) => Some(p.as_os_str().to_string_lossy().to_lowercase()),
-        _ => None,
+        _ => crate::platform::mount_point(path).map(|dir| dir.to_string_lossy().into_owned()),
     }
 }
 
 /// Whether two paths are on the same drive, so a move can be a plain rename.
+#[cfg(windows)]
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     volume_key(a) == volume_key(b)
+}
+
+/// Whether two paths are on the same file system, so a move can be a plain rename.
+#[cfg(not(windows))]
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    crate::platform::same_device(a, b)
 }
 
 /// `e:` alone (a whole drive rather than a place on it) as that drive's root.
