@@ -100,7 +100,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let visible = help_height(area).saturating_sub(2) as usize;
         *scroll = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
     }
-    if let Some(dialog) = &app.dialog {
+    if let Some(Dialog::History { filter, cursor }) = &app.dialog {
+        let rows = app.history_rows(filter.text());
+        let (position, dialog_hit) = draw_history(frame, area, &rows, filter, *cursor);
+        frame.set_cursor_position(position);
+        hit.dialog = Some(dialog_hit);
+    } else if let Some(dialog) = &app.dialog {
         let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist, app.config.settings_file.as_deref());
         if let Some(position) = cursor {
             frame.set_cursor_position(position);
@@ -500,8 +505,16 @@ fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
     let cwd = app.active_panel().cwd.display().to_string();
     let prompt = format!("{}>", util::fit_left(&cwd, (area.width as usize / 3).max(10)));
     let prompt_w = util::width(&prompt) + 1;
-    let (text, cursor) = app.cmdline.view((area.width as usize).saturating_sub(prompt_w + 1));
-    frame.render_widget(Paragraph::new(Line::from(vec![Span::raw(prompt), Span::raw(" "), Span::raw(text)])), area);
+    let room = (area.width as usize).saturating_sub(prompt_w + 1);
+    let (text, cursor) = app.cmdline.view(room);
+    let mut spans = vec![Span::raw(prompt), Span::raw(" "), Span::raw(text)];
+    // A short message from the last action, until the next key.
+    if app.cmdline.is_empty()
+        && let Some(notice) = &app.notice
+    {
+        spans.push(Span::styled(util::take_width(notice, room).to_string(), Style::new().fg(Color::Yellow)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
     Position::new(area.x + (prompt_w + cursor) as u16, area.y)
 }
 
@@ -650,6 +663,8 @@ fn draw_dialog(
             draw_options(frame, area, *cursor, edit, settings, automatic, settings_file)
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
+        // Drawn by `draw`, which has the rows.
+        Dialog::History { .. } => (None, DialogHit::default()),
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
@@ -812,6 +827,40 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
     let shown = hotlist.dirs.len().saturating_sub(offset).min(list_h) as u16;
     let rows = (shown > 0).then(|| (Rect::new(inner.x, inner.y, inner.width, shown), offset));
     DialogHit { area: outer, buttons: Vec::new(), rows }
+}
+
+/// Alt+H: the filter line, then the folders, newest first. Returns the text cursor and
+/// where the rows are, for the mouse.
+fn draw_history(frame: &mut Frame, area: Rect, rows: &[std::path::PathBuf], filter: &LineEdit, cursor: usize) -> (Position, DialogHit) {
+    let height = (rows.len() as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
+    let width = (area.width * 2 / 3).clamp(50, 100).min(area.width);
+    let (outer, inner) = dialog_frame(frame, area, width, height, "Folder history", false);
+    let style = dialog_style(false);
+    let grey = style.fg(Color::DarkGray);
+    let field_w = inner.width as usize;
+    const LABEL: &str = "Filter: ";
+    let (text, column) = filter.view(field_w.saturating_sub(LABEL.len() + 1));
+    let mut lines =
+        vec![Line::from(vec![Span::styled(LABEL, style), Span::styled(util::pad(&text, field_w.saturating_sub(LABEL.len())), cursor_style())])];
+    let list_h = inner.height.saturating_sub(3) as usize;
+    let cursor = cursor.min(rows.len().saturating_sub(1));
+    let offset = (cursor + 1).saturating_sub(list_h);
+    if rows.is_empty() {
+        let empty = if filter.text().is_empty() { "No other folders visited yet." } else { "No folder matches." };
+        lines.push(Line::from(Span::styled(empty, grey)));
+    }
+    for (i, dir) in rows.iter().enumerate().skip(offset).take(list_h) {
+        let text = util::fit_left(&dir.display().to_string(), field_w);
+        let row_style = if i == cursor { cursor_style() } else { style };
+        lines.push(Line::from(Span::styled(util::pad(&text, field_w), row_style)));
+    }
+    lines.resize(list_h + 2, Line::default());
+    lines.push(Line::from(Span::styled(util::fit_left("type to narrow · Enter goes there · Del forgets · Esc", field_w), grey)).right_aligned());
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let shown = rows.len().saturating_sub(offset).min(list_h) as u16;
+    let rows_area = (shown > 0).then(|| (Rect::new(inner.x, inner.y + 1, inner.width, shown), offset));
+    let position = Position::new(inner.x + (LABEL.len() + column) as u16, inner.y);
+    (position, DialogHit { area: outer, buttons: Vec::new(), rows: rows_area })
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
@@ -1114,6 +1163,20 @@ mod tests {
             render(&mut app, w, h);
         }
         assert!(render(&mut app, 18, 4).contains("rmc: the window"));
+    }
+
+    #[test]
+    fn renders_the_folder_history() {
+        let tmp = TempDir::new("ui-history");
+        let mut app = app_for(&tmp);
+        app.history.dirs = vec![PathBuf::from(r"E:\Fotky\2024 Léto"), PathBuf::from(r"C:\Users\me\Downloads")];
+        app.dialog = Some(Dialog::History { filter: LineEdit::new("fot"), cursor: 0 });
+        let screen = render(&mut app, 100, 20);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Folder history") && screen.contains("Filter: fot"));
+        assert!(screen.contains(r"E:\Fotky\2024 Léto") && !screen.contains("Downloads"));
     }
 
     /// Scrolling help past its end doesn't build up a dead zone: Up moves at once.

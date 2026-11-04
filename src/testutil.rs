@@ -19,6 +19,7 @@ pub fn config() -> Config {
         big_file: BIG_FILE,
         hotlist_file: None,
         settings_file: None,
+        history_file: None,
         settings: Settings::default(),
     }
 }

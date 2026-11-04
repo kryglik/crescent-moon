@@ -71,6 +71,7 @@ impl App {
         if !wanted {
             return;
         }
+        self.notice = None;
         if event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some((at, place)) = self.closing_click.take()
             && place == pos
@@ -234,9 +235,14 @@ impl App {
                     self.click_option(i);
                     return;
                 }
+                let history_len = match &self.dialog {
+                    Some(Dialog::History { filter, .. }) => self.history_rows(filter.text()).len(),
+                    _ => 0,
+                };
                 match &mut self.dialog {
                     Some(Dialog::Drives { cursor, drives, .. }) if i < drives.len() => *cursor = i,
                     Some(Dialog::Hotlist { cursor }) if i < self.hotlist.dirs.len() => *cursor = i,
+                    Some(Dialog::History { cursor, .. }) if i < history_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
                     _ => return,
                 }
@@ -255,6 +261,7 @@ impl App {
                         Dialog::Help { .. }
                             | Dialog::Drives { .. }
                             | Dialog::Hotlist { .. }
+                            | Dialog::History { .. }
                             | Dialog::Sort { .. }
                             | Dialog::Options { .. }
                             | Dialog::Message { .. }

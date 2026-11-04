@@ -11,6 +11,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::admin;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
 use crate::finder::{Field as FindField, Finder};
+use crate::history::History;
 use crate::hotlist::Hotlist;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
@@ -52,6 +53,8 @@ pub struct Config {
     pub hotlist_file: Option<PathBuf>,
     /// The options editor saves here; None in tests.
     pub settings_file: Option<PathBuf>,
+    /// Folders visited and commands typed, kept between sessions; None in tests.
+    pub history_file: Option<PathBuf>,
     pub settings: Settings,
 }
 
@@ -59,11 +62,13 @@ impl Config {
     /// The settings file, the hotlist file, and from them the commands.
     pub fn load() -> Self {
         let settings_file = Settings::default_file();
-        match Settings::load(settings_file.as_deref()) {
+        let mut config = match Settings::load(settings_file.as_deref()) {
             Ok(settings) => Config::new(settings, Hotlist::default_file(), settings_file),
             // There but unreadable: defaults, and the file is left alone (never saved over).
             Err(_) => Config::new(Settings::default(), Hotlist::default_file(), None),
-        }
+        };
+        config.history_file = History::default_file();
+        config
     }
 
     /// Commands come from the settings, or when those are empty from the environment
@@ -78,7 +83,17 @@ impl Config {
             .unwrap_or_else(|| viewer_for(&editor));
         let pager = chosen(&settings.pager).or(auto.pager);
         let shell = if settings.shell.trim().is_empty() { auto.shell } else { Shell::from_program(settings.shell.trim()) };
-        Config { editor, viewer, pager, shell, big_file: settings.big_file_bytes(), hotlist_file, settings_file, settings }
+        Config {
+            editor,
+            viewer,
+            pager,
+            shell,
+            big_file: settings.big_file_bytes(),
+            hotlist_file,
+            settings_file,
+            history_file: None,
+            settings,
+        }
     }
 }
 
@@ -199,8 +214,14 @@ pub struct App {
     sizer: Option<Sizer>,
     /// Free space of network/optical drives, arriving while the drive picker is open.
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
-    history: Vec<String>,
+    /// Folders visited and commands typed (Alt+H, Alt+P/N), saved now and then and on exit.
+    pub history: History,
+    history_changed: bool,
+    history_saved: Instant,
     history_pos: Option<usize>,
+    /// A short message on the command line ("3 items copied to the clipboard"), gone at the
+    /// next key.
+    pub notice: Option<String>,
     /// Each panel's folder, watched for changes other programs make (see `watch`).
     watches: [Option<Watch>; 2],
 }
@@ -208,12 +229,16 @@ pub struct App {
 impl App {
     pub fn new(left: PathBuf, right: PathBuf, config: Config) -> Self {
         let show_hidden = config.settings.show_hidden;
+        let mut history = History::load(config.history_file.clone());
+        let panels = [Panel::new(left, show_hidden), Panel::new(right, show_hidden)];
+        history.visit(&panels[1].cwd);
+        history.visit(&panels[0].cwd);
         App {
             mouse: config.settings.mouse,
             mouse_allowed: true,
             finder: None,
             find_shown: false,
-            panels: [Panel::new(left, show_hidden), Panel::new(right, show_hidden)],
+            panels,
             active: 0,
             cmdline: LineEdit::default(),
             dialog: None,
@@ -232,9 +257,21 @@ impl App {
             screen_size: (24, 80),
             sizer: None,
             drive_space: None,
-            history: Vec::new(),
+            history,
+            history_changed: false,
+            history_saved: Instant::now(),
             history_pos: None,
+            notice: None,
             watches: [None, None],
+        }
+    }
+
+    /// Saves the history file (on exit, and from `tick` now and then).
+    pub fn save_history(&mut self) {
+        if self.history_changed {
+            let _ = self.history.save();
+            self.history_changed = false;
+            self.history_saved = Instant::now();
         }
     }
 
@@ -311,6 +348,7 @@ impl App {
         {
             key.code = KeyCode::Char(c.to_ascii_lowercase());
         }
+        self.notice = None;
         if self.shell_shown {
             self.on_shell_key(key);
         } else if self.dialog.is_some() {
@@ -352,6 +390,10 @@ impl App {
             KeyCode::F(10) => self.request_quit(),
             KeyCode::Char('p') if ctrl && !alt => self.open_options(),
             KeyCode::Tab => self.active = 1 - self.active,
+            // Back and forward as in a browser or Explorer, and mc's Alt+Y / Alt+U.
+            KeyCode::Left | KeyCode::Char('y') if alt && !ctrl => self.step_back(true),
+            KeyCode::Right | KeyCode::Char('u') if alt && !ctrl => self.step_back(false),
+            KeyCode::Down | KeyCode::Char('h') if alt && !ctrl => self.open_dir_history(),
             KeyCode::Up | KeyCode::Down if shift => {
                 let panel = self.active_panel_mut();
                 panel.toggle_mark();
@@ -512,6 +554,7 @@ impl App {
                 _ => Some(Dialog::Drives { side, drives, cursor }),
             },
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
+            Dialog::History { filter, cursor } => self.on_history_key(&key, filter, cursor),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
                 let buttons = dialog::delete_buttons(&survey.tally());
                 match dialog::handle_buttons(buttons, &mut focus, &key) {
@@ -851,7 +894,9 @@ impl App {
         }
         self.mouse = settings.mouse && self.mouse_allowed;
         let (hotlist_file, settings_file) = (self.config.hotlist_file.take(), self.config.settings_file.take());
+        let history_file = self.config.history_file.take();
         self.config = Config::new(settings, hotlist_file, settings_file);
+        self.config.history_file = history_file;
     }
 
     /// F9: a menu of sort orders, the cursor on the current one (so F9 F9 reverses it).
@@ -1039,6 +1084,10 @@ impl App {
             changed |= finder.tick();
         }
         changed |= self.follow_changes();
+        // Now and then rather than only on exit: closing the window ends rmc without one.
+        if self.history_changed && self.history_saved.elapsed() > std::time::Duration::from_secs(5) {
+            self.save_history();
+        }
         self.tick_job() || changed
     }
 
@@ -1116,9 +1165,82 @@ impl App {
     }
 
     fn change_dir(&mut self, side: usize, dir: PathBuf) {
-        if let Err(e) = self.panels[side].change_dir(dir) {
-            self.error(e);
+        match self.panels[side].change_dir(dir) {
+            Ok(()) => self.visited(side),
+            Err(e) => self.error(e),
         }
+    }
+
+    /// The panel arrived in a folder: it goes to the top of the folder history (Alt+H).
+    fn visited(&mut self, side: usize) {
+        let cwd = self.panels[side].cwd.clone();
+        self.history.visit(&cwd);
+        self.history_changed = true;
+    }
+
+    /// Alt+Left / Alt+Right (and mc's Alt+Y / Alt+U): back and forward through the folders
+    /// the active panel has been in.
+    fn step_back(&mut self, back: bool) {
+        let panel = &mut self.panels[self.active];
+        let stepped = if back { panel.go_back() } else { panel.go_forward() };
+        match stepped {
+            Ok(true) => self.visited(self.active),
+            Ok(false) => {
+                self.notice = Some(if back { "No folder to go back to" } else { "No folder to go forward to" }.into());
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Alt+H (or Alt+Down, as in Total Commander): the folders visited lately, newest first,
+    /// with the current one left out; typing narrows the list.
+    fn open_dir_history(&mut self) {
+        self.dialog = Some(Dialog::History { filter: LineEdit::default(), cursor: 0 });
+    }
+
+    /// The folder history's rows for `filter`, without the folder the panel is in. (Whether
+    /// each still exists isn't checked: a network drive could make that slow.)
+    pub fn history_rows(&self, filter: &str) -> Vec<PathBuf> {
+        let cwd = &self.active_panel().cwd;
+        self.history.matching(filter).into_iter().filter(|dir| !util::same_path(dir, cwd)).cloned().collect()
+    }
+
+    fn on_history_key(&mut self, key: &KeyEvent, mut filter: LineEdit, mut cursor: usize) -> Option<Dialog> {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let rows = self.history_rows(filter.text());
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => return None,
+            KeyCode::Char('h') if alt => return None,
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(last),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+            KeyCode::PageDown => cursor = (cursor + 10).min(last),
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => cursor = 0,
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => cursor = last,
+            KeyCode::Enter => {
+                if let Some(dir) = rows.get(cursor).cloned() {
+                    self.change_dir(self.active, dir);
+                }
+                return None;
+            }
+            // Forget a folder.
+            KeyCode::Delete => {
+                if let Some(dir) = rows.get(cursor) {
+                    self.history.dirs.retain(|d| !util::same_path(d, dir));
+                    self.history_changed = true;
+                    cursor = cursor.min(rows.len().saturating_sub(2));
+                }
+            }
+            _ => {
+                let before = filter.text().to_string();
+                filter.handle_key(key);
+                if filter.text() != before {
+                    cursor = 0;
+                }
+            }
+        }
+        Some(Dialog::History { filter, cursor })
     }
 
     fn go_up(&mut self) {
@@ -1348,13 +1470,14 @@ impl App {
         if line.is_empty() {
             return;
         }
-        if self.history.last() != Some(&line) {
-            self.history.push(line.clone());
-        }
+        self.history.command(&line);
+        self.history_changed = true;
         // The folder as the shell would read it (quotes, variables): Ctrl+Enter inserts names
         // quoted for the shell, so `cd 'Účty a faktury'` must work.
         let posix = self.shell().is_posix();
         match cd_argument(&line).map(|arg| util::shell_word(arg, posix)) {
+            // `cd -`: back to the folder before, as in bash and PowerShell.
+            Some(Some(arg)) if arg == "-" => self.step_back(true),
             Some(Some(arg)) => {
                 let panel = self.active_panel();
                 let cwd = panel.cwd.clone();
@@ -1374,10 +1497,11 @@ impl App {
     }
 
     fn history_step(&mut self, direction: isize) {
-        if self.history.is_empty() {
+        let commands = &self.history.commands;
+        if commands.is_empty() {
             return;
         }
-        let last = self.history.len() - 1;
+        let last = commands.len() - 1;
         let pos = match (self.history_pos, direction < 0) {
             (None, true) => Some(last),
             (None, false) => None,
@@ -1387,7 +1511,7 @@ impl App {
         };
         self.history_pos = pos;
         match pos {
-            Some(p) => self.cmdline.set(self.history[p].clone()),
+            Some(p) => self.cmdline.set(self.history.commands[p].clone()),
             None => self.cmdline.clear(),
         }
     }
@@ -1575,6 +1699,66 @@ mod tests {
         typing(&mut app, "Účty a faktury");
         app.on_key(key(KeyCode::Enter));
         assert!(matches!(&app.dialog, Some(Dialog::Message { lines, .. }) if lines[0].contains("already exists")));
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        with_mods(code, KeyModifiers::ALT)
+    }
+
+    /// Alt+Left / Alt+Right (and Alt+Y / Alt+U) go back and forward like a browser; `cd -`
+    /// goes back too.
+    #[test]
+    fn back_and_forward_through_visited_folders() {
+        let tmp = TempDir::new("app-back");
+        let (a, b) = (tmp.dir("a"), tmp.dir("a/b"));
+        let mut app = test_app(&a, &a);
+        app.change_dir(0, b.clone());
+        let here = |app: &App| app.active_panel().cwd.clone();
+        app.on_key(alt(KeyCode::Left));
+        assert!(util::same_path(&here(&app), &a));
+        app.on_key(alt(KeyCode::Char('u')));
+        assert!(util::same_path(&here(&app), &b));
+        typing(&mut app, "cd -");
+        app.on_key(key(KeyCode::Enter));
+        assert!(util::same_path(&here(&app), &a));
+        app.on_key(alt(KeyCode::Left));
+        app.on_key(alt(KeyCode::Left));
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("back")), "nothing further back: {:?}", app.notice);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.notice, None, "the notice goes with the next key");
+    }
+
+    /// Alt+H lists the folders visited (the current one left out); typing narrows the list,
+    /// Enter goes there, and it is all kept for the next session with the commands typed.
+    #[test]
+    fn folder_history_lists_narrows_and_persists() {
+        let tmp = TempDir::new("app-history");
+        let store = TempDir::new("app-history-store");
+        let file = store.path().join("history.txt");
+        let (photos, docs) = (tmp.dir("Fotky 2024"), tmp.dir("documents"));
+        let config = Config { history_file: Some(file.clone()), ..crate::testutil::config() };
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        app.change_dir(0, photos.clone());
+        app.change_dir(0, docs.clone());
+        typing(&mut app, "echo remembered");
+        app.history.command("echo remembered");
+        app.cmdline.clear();
+        app.on_key(alt(KeyCode::Char('h')));
+        assert!(matches!(app.dialog, Some(Dialog::History { .. })));
+        let rows = app.history_rows("");
+        assert!(util::same_path(&rows[0], &photos), "newest first, the current folder left out: {rows:?}");
+        typing(&mut app, "FOT");
+        let Some(Dialog::History { filter, .. }) = &app.dialog else { panic!() };
+        assert_eq!(app.history_rows(filter.text()).len(), 1);
+        app.on_key(key(KeyCode::Enter));
+        assert!(util::same_path(&app.active_panel().cwd, &photos));
+        app.history_changed = true;
+        app.save_history();
+
+        let config = Config { history_file: Some(file), ..crate::testutil::config() };
+        let next = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        assert!(next.history.dirs.iter().any(|d| util::same_path(d, &docs)), "{:?}", next.history.dirs);
+        assert_eq!(next.history.commands, ["echo remembered"]);
     }
 
     /// With Caps Lock on, Windows reports Ctrl+D as Ctrl with a capital D: it still works.

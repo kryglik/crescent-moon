@@ -54,6 +54,8 @@ Press **F1** inside rmc for the full list. The essentials:
 | Enter / Backspace | open directory or file / parent directory |
 | Alt+F1, Alt+F2 | drive picker for the left / right panel |
 | Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
+| Alt+Left / Alt+Right | back / forward through the folders the panel was in, as in a browser (mc's Alt+Y / Alt+U too); `cd -` goes back |
+| Alt+H or Alt+Down | folder history: the folders visited lately, newest first, kept between sessions; type part of a path to narrow it, Enter goes there, Del forgets one |
 | Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
 | F2 | rename |
@@ -171,6 +173,8 @@ Environment variables, used when the matching option is empty:
 | `RMC_TRACE` | file to log a line per frame to: what woke rmc, how long until the frame was sent, drawing time and bytes; tells a slow rmc from a slow terminal |
 
 Favourite folders are saved in `%APPDATA%\rmc\hotlist.txt` (one path per line; you can edit it).
+The folders visited (Alt+H) and the commands typed (Alt+P / Alt+N) are kept in `history.txt`
+beside it: the last 300 folders and 500 commands.
 
 Ctrl+\ only works while a US-style layout is active (on the Czech layout that key is a dead
 key), hence Ctrl+D. Directory sizes don't follow links or junctions, so nothing is counted twice;

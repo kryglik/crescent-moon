@@ -129,7 +129,13 @@ pub struct Panel {
     pub space: Option<(u64, u64)>,
     /// Where this panel last was on each drive (keyed by `util::volume_key`).
     drive_dirs: HashMap<String, PathBuf>,
+    /// Folders to go back and forward to (Alt+Left / Alt+Right), as in a browser.
+    back: Vec<PathBuf>,
+    forward: Vec<PathBuf>,
 }
+
+/// How many folders back the panel remembers.
+const BACK_LIMIT: usize = 100;
 
 impl Panel {
     /// Opens `cwd`, falling back to its parents, the home directory or the system root.
@@ -147,6 +153,8 @@ impl Panel {
             page: 20,
             space: None,
             drive_dirs: HashMap::new(),
+            back: Vec::new(),
+            forward: Vec::new(),
         };
         let cwd = util::normalize(&cwd);
         let candidates: Vec<PathBuf> = cwd
@@ -228,8 +236,10 @@ impl Panel {
             let show_hidden = self.show_hidden;
             let (sort, reverse) = (self.sort, self.reverse);
             let drive_dirs = std::mem::take(&mut self.drive_dirs);
+            let (mut back, forward) = (std::mem::take(&mut self.back), std::mem::take(&mut self.forward));
+            back.push(cwd);
             *self = Panel::new(start, show_hidden);
-            (self.sort, self.reverse) = (sort, reverse);
+            (self.sort, self.reverse, self.back, self.forward) = (sort, reverse, back, forward);
             for (drive, dir) in drive_dirs {
                 self.drive_dirs.entry(drive).or_insert(dir);
             }
@@ -241,7 +251,46 @@ impl Panel {
         }
     }
 
+    /// Goes to `dir`; the folder it leaves is the one Alt+Left goes back to.
     pub fn change_dir(&mut self, dir: PathBuf) -> Result<(), String> {
+        let previous = self.cwd.clone();
+        self.open_dir(dir)?;
+        if !util::same_path(&previous, &self.cwd) {
+            self.back.push(previous);
+            if self.back.len() > BACK_LIMIT {
+                self.back.remove(0);
+            }
+            self.forward.clear();
+        }
+        Ok(())
+    }
+
+    /// Alt+Left: back to the folder before this one (passing over any that are gone).
+    /// Returns whether it went anywhere.
+    pub fn go_back(&mut self) -> Result<bool, String> {
+        self.step(true)
+    }
+
+    /// Alt+Right: forward again, after going back.
+    pub fn go_forward(&mut self) -> Result<bool, String> {
+        self.step(false)
+    }
+
+    fn step(&mut self, back: bool) -> Result<bool, String> {
+        loop {
+            let next = if back { self.back.pop() } else { self.forward.pop() };
+            let Some(dir) = next else { return Ok(false) };
+            if !dir.is_dir() {
+                continue;
+            }
+            let here = self.cwd.clone();
+            self.open_dir(dir)?;
+            if back { self.forward.push(here) } else { self.back.push(here) }
+            return Ok(true);
+        }
+    }
+
+    fn open_dir(&mut self, dir: PathBuf) -> Result<(), String> {
         let dir = util::normalize(&dir);
         let previous = std::mem::replace(&mut self.cwd, dir.clone());
         let marked = std::mem::take(&mut self.marked);

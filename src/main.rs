@@ -5,6 +5,7 @@ mod app;
 mod dialog;
 mod find;
 mod finder;
+mod history;
 mod hotlist;
 mod mouse;
 mod ops;
@@ -195,6 +196,7 @@ fn main() -> ExitCode {
     Mouse(app.mouse).release();
     ratatui::restore();
     title.restore();
+    app.save_history();
 
     if let Some(file) = args.cwd_file {
         let _ = std::fs::write(file, app.active_panel().cwd.to_string_lossy().as_bytes());

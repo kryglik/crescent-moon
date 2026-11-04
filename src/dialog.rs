@@ -40,6 +40,8 @@ pub enum Dialog {
     Drives { side: usize, drives: Vec<DriveInfo>, cursor: usize },
     /// The list itself lives in `App::hotlist`.
     Hotlist { cursor: usize },
+    /// Alt+H: folders visited lately (`App::history_rows`), narrowed by what is typed.
+    History { filter: LineEdit, cursor: usize },
     Help { scroll: usize },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
@@ -232,6 +234,8 @@ pub const HELP: &[&str] = &[
     "  Alt+F1/F2    choose the drive of the left/right panel",
     "               (back to the panel's last folder on that drive)",
     "  Ctrl+\\ or Ctrl+D   favourite folders (hotlist)",
+    "  Alt+Left/Right   back / forward through folders (or Alt+Y/U)",
+    "  Alt+H, Alt+Down  folder history: type to narrow, Enter goes",
     "  Ctrl+Space   size of the directory (on '..': all of them)",
     "  Insert, Shift+Up/Down   mark files",
     "  + - *        mark by pattern, unmark by pattern, invert",
@@ -262,9 +266,9 @@ pub const HELP: &[&str] = &[
     "",
     "Command line",
     "  Type a command, Enter runs it in the shell, in the panel's folder",
-    "  cd DIR       change directory (cd e: switches drive)",
+    "  cd DIR       change directory (cd e: switches drive, cd - back)",
     "  Ctrl+Enter   put the file name on the command line",
-    "  Alt+P/Alt+N  previous/next command",
+    "  Alt+P/Alt+N  previous/next command (kept between sessions)",
     "  Esc          clear the command line",
     "",
     "Shell",
@@ -280,6 +284,7 @@ pub const HELP: &[&str] = &[
     "  Files: *.rs *.toml, !*test* to leave out, or part of a name",
     "  Tab switches field   Up/Down, PgUp/PgDn move   Alt+U all files",
     "  Enter goes there   F3/F4 view/edit at the line   Esc closes",
+    "",
     "  F10          quit",
     "",
     "Editor, viewer, pager, shell: Ctrl+P, or when empty there",
