@@ -107,7 +107,7 @@ fn job_folder(paths: &[PathBuf]) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("there is no folder outside what is being deleted to keep the job in"))?;
     fs::create_dir_all(&base)?;
     for _ in 0..100 {
-        let dir = base.join(format!("rmc-admin-{}-{:016x}", std::process::id(), random()));
+        let dir = base.join(format!("rmc-admin-{}-{:016x}", std::process::id(), crate::util::random()));
         match fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -115,14 +115,6 @@ fn job_folder(paths: &[PathBuf]) -> io::Result<PathBuf> {
         }
     }
     Err(io::Error::other("no folder could be made for the job"))
-}
-
-/// A number nobody can predict (std seeds its hash keys from the system's randomness).
-fn random() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
-    hasher.finish()
 }
 
 #[cfg(windows)]

@@ -740,28 +740,32 @@ pub const FOLLOW_KEY: &str = "\x1b[24;8~";
 
 /// Start-up script of the PowerShell behind Ctrl+O.
 ///
-/// - Every prompt writes `<prompt number>|<current folder>[|f]` to `$env:RMC_CWD_FILE`. The
-///   folder lets rmc's panel follow `cd`; the number tells rmc whether the shell is idle (a
-///   prompt has appeared since it last typed anything) or busy with a command; `f` says the
-///   follow key below works.
+/// - Every prompt writes `<prompt number>|<f or ->|<current folder>` to `$env:RMC_CWD_FILE`.
+///   The folder lets rmc's panel follow `cd`; the number tells rmc whether the shell is idle
+///   (a prompt has appeared since it last typed anything) or busy with a command; `f` says the
+///   follow key below works. The folder comes last, so any name fits.
+/// - The user's prompt runs first, so prompt themes still see `$?` of the last command.
 /// - Ctrl+Alt+Shift+F12 (`FOLLOW_KEY`) moves the shell to the folder in
 ///   `$env:RMC_REQUEST_FILE` and redraws the prompt in place: no command line, no history entry.
-/// - Ctrl+O at the prompt exits, for the one-off shell used when the persistent one can't start.
-///   (In the persistent shell rmc keeps Ctrl+O to itself.)
+/// - Ctrl+O at the prompt exits, only in the one-off shell used when the persistent one can't
+///   start (`RMC_ONE_OFF`). In the persistent shell rmc keeps Ctrl+O to itself, and a Ctrl+O
+///   that slips through (Caps Lock) mustn't end the session.
 const PWSH_SHELL_INIT: &str = r#"
 $global:__rmc_seq = 0
-$global:__rmc_follow = ''
+$global:__rmc_follow = '-'
 function global:__rmc_save_cwd {
     $global:__rmc_seq++
     $here = (Get-Location -PSProvider FileSystem).ProviderPath
-    [IO.File]::WriteAllText($env:RMC_CWD_FILE, "$($global:__rmc_seq)|$here$($global:__rmc_follow)")
+    [IO.File]::WriteAllText($env:RMC_CWD_FILE, "$($global:__rmc_seq)|$($global:__rmc_follow)|$here")
 }
 $global:__rmc_prompt = $function:prompt
-function global:prompt { __rmc_save_cwd; & $global:__rmc_prompt }
+function global:prompt { $p = & $global:__rmc_prompt; __rmc_save_cwd; $p }
 if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
-    Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to rmc' -ScriptBlock {
-        __rmc_save_cwd
-        [Environment]::Exit(0)
+    if ($env:RMC_ONE_OFF) {
+        Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to rmc' -ScriptBlock {
+            __rmc_save_cwd
+            [Environment]::Exit(0)
+        }
     }
     Set-PSReadLineKeyHandler -Chord Ctrl+Alt+Shift+F12 -BriefDescription 'Go to the rmc panel folder' -ScriptBlock {
         try {
@@ -778,15 +782,15 @@ if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
             [Console]::OutputEncoding = $encoding
         }
     }
-    $global:__rmc_follow = '|f'
+    $global:__rmc_follow = 'f'
 }
 "#;
 
 /// Start-up file of the bash behind Ctrl+O (`bash --rcfile`): the user's ~/.bashrc, then the
 /// same reports as `PWSH_SHELL_INIT`.
 ///
-/// - `PROMPT_COMMAND` writes `<prompt number>|<folder>[|f]` to `$RMC_CWD_FILE`, keeping `$?`
-///   for whatever runs after it.
+/// - `PROMPT_COMMAND` writes `<prompt number>|<f or ->|<folder>` to `$RMC_CWD_FILE` (with
+///   `>|`, so `set -o noclobber` doesn't stop it), keeping `$?` for whatever runs after it.
 /// - The follow key (bash 4.4+) runs `__rmc_cd` and then presses Enter on the empty line, as
 ///   bash can only redraw its prompt by drawing a new one. The next prompt first moves the
 ///   cursor back over the old prompt, so the new one takes its place. Empty lines don't go
@@ -796,7 +800,7 @@ const BASH_SHELL_INIT: &str = r#"
 
 __rmc_seq=0
 __rmc_redraw=
-__rmc_follow=
+__rmc_follow=-
 __rmc_prompt() {
     local ret=$?
     if [ -n "$__rmc_redraw" ]; then
@@ -806,7 +810,7 @@ __rmc_prompt() {
         printf '\e[%dA\r\e[J' "$(( ${#newlines} + 1 ))"
     fi
     __rmc_seq=$(( __rmc_seq + 1 ))
-    printf '%s|%s%s' "$__rmc_seq" "$PWD" "$__rmc_follow" > "$RMC_CWD_FILE"
+    printf '%s|%s|%s' "$__rmc_seq" "$__rmc_follow" "$PWD" >| "$RMC_CWD_FILE"
     return $ret
 }
 PROMPT_COMMAND="__rmc_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
@@ -823,7 +827,7 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
         bind -m "$__rmc_map" '"\e[24;8~": "\e[24;7~\C-m"'
     done
     unset __rmc_map
-    __rmc_follow='|f'
+    __rmc_follow=f
 fi
 "#;
 
@@ -844,11 +848,12 @@ ZDOTDIR=$__rmc_user_zdotdir
 unset __rmc_zdotdir __rmc_user_zdotdir
 [[ -r $ZDOTDIR/.zshrc ]] && builtin source $ZDOTDIR/.zshrc
 
-typeset -gi __rmc_seq=0
+typeset -gi __rmc_seq=0 __rmc_status=0
 __rmc_report() {
     local ret=$?
+    __rmc_status=$ret
     __rmc_seq+=1
-    print -rn -- "$__rmc_seq|$PWD|f" >| $RMC_CWD_FILE
+    print -rn -- "$__rmc_seq|f|$PWD" >| $RMC_CWD_FILE
     return $ret
 }
 precmd_functions+=(__rmc_report)
@@ -857,9 +862,13 @@ __rmc_follow() {
     local target f
     { target=$(<$RMC_REQUEST_FILE) } 2>/dev/null
     [[ -d $target ]] && builtin cd -q -- $target
-    # What a new prompt would run: themes update from precmd, and it reports the folder.
+    # What a new prompt would run: themes update from precmd (seeing the last command's
+    # status, not this widget's), and it reports the folder.
     for f in precmd $precmd_functions; do
-        (( $+functions[$f] )) && $f
+        if (( $+functions[$f] )); then
+            () { return $__rmc_status }
+            $f
+        fi
     done
     zle reset-prompt
 }
@@ -880,13 +889,31 @@ pub struct ShellReport {
     pub can_follow: bool,
 }
 
-/// Reads what the shell's prompt wrote: `<number>|<folder>[|f]`.
+/// Reads what the shell's prompt wrote: `<number>|<f or ->|<folder>`. The folder is the rest
+/// as it is: a `|` or spaces at either end belong to it.
 pub fn parse_cwd_report(text: &str) -> Option<ShellReport> {
-    let mut parts = text.trim_start_matches('\u{feff}').trim().split('|');
+    let text = text.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']);
+    let mut parts = text.splitn(3, '|');
     let prompt = parts.next()?.trim().parse().unwrap_or(0);
-    let dir = parts.next()?.trim();
-    let can_follow = parts.next() == Some("f");
+    let can_follow = parts.next()? == "f";
+    let dir = parts.next()?;
     (!dir.is_empty()).then(|| ShellReport { prompt, dir: PathBuf::from(dir), can_follow })
+}
+
+/// The same from the file's bytes. On Linux a folder name needn't be UTF-8, so it is taken
+/// byte for byte.
+pub fn parse_cwd_report_bytes(bytes: &[u8]) -> Option<ShellReport> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut parts = bytes.splitn(3, |&b| b == b'|');
+        let prompt = std::str::from_utf8(parts.next()?).ok()?.trim().parse().unwrap_or(0);
+        let can_follow = parts.next()? == b"f";
+        let dir = parts.next()?;
+        (!dir.is_empty()).then(|| ShellReport { prompt, dir: PathBuf::from(std::ffi::OsStr::from_bytes(dir)), can_follow })
+    }
+    #[cfg(not(unix))]
+    parse_cwd_report(&String::from_utf8_lossy(bytes))
 }
 
 /// PowerShell's -EncodedCommand form of a script: base64 of UTF-16LE. It sidesteps quoting.
@@ -1009,7 +1036,7 @@ impl Shell {
     pub fn interactive(&self, cwd_file: &Path) -> Command {
         let argv = self.interactive_argv();
         let mut command = Command::new(&argv[0]);
-        command.args(&argv[1..]).env("RMC_CWD_FILE", cwd_file);
+        command.args(&argv[1..]).env("RMC_CWD_FILE", cwd_file).env("RMC_ONE_OFF", "1");
         command
     }
 
@@ -1075,7 +1102,18 @@ impl Shell {
 
     pub fn quote(&self, s: &str) -> String {
         match self {
-            Shell::PowerShell(_) => format!("'{}'", s.replace('\'', "''")),
+            // PowerShell takes ‘ ’ ‚ ‛ as single quotes as well; each is doubled like '.
+            Shell::PowerShell(_) => {
+                let mut quoted = String::from("'");
+                for c in s.chars() {
+                    if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                        quoted.push(c);
+                    }
+                    quoted.push(c);
+                }
+                quoted.push('\'');
+                quoted
+            }
             Shell::Cmd => format!("\"{s}\""),
             Shell::Posix(_) => format!("'{}'", s.replace('\'', "'\\''")),
         }
@@ -1141,8 +1179,20 @@ mod tests {
     #[test]
     fn parsing_reports() {
         let report = |prompt, dir: &str, can_follow| Some(ShellReport { prompt, dir: PathBuf::from(dir), can_follow });
-        assert_eq!(parse_cwd_report("7|E:\\devel\r\n"), report(7, r"E:\devel", false));
-        assert_eq!(parse_cwd_report("\u{feff}1|C:\\|f"), report(1, r"C:\", true));
+        assert_eq!(parse_cwd_report("7|-|E:\\devel\r\n"), report(7, r"E:\devel", false));
+        assert_eq!(parse_cwd_report("\u{feff}1|f|C:\\"), report(1, r"C:\", true));
         assert_eq!(parse_cwd_report("no separator"), None);
+        // On Linux a folder may hold a `|` or end in spaces: it is all the folder.
+        assert_eq!(parse_cwd_report("3|f|/tmp/a|b "), report(3, "/tmp/a|b ", true));
+        assert_eq!(parse_cwd_report_bytes(b"3|f|/tmp/a|b"), report(3, "/tmp/a|b", true));
+    }
+
+    /// PowerShell takes ‘ ’ ‚ ‛ as single quotes too: a name with them can't end the quoting.
+    #[test]
+    fn powershell_quoting_covers_its_other_quotes() {
+        let shell = Shell::PowerShell(PathBuf::from("pwsh"));
+        assert_eq!(shell.quote("Rock’n’Roll"), "'Rock’’n’’Roll'");
+        assert_eq!(shell.quote("it's"), "'it''s'");
+        assert_eq!(shell.quote("x‘;Write-Output INJECTED;’ .txt"), "'x‘‘;Write-Output INJECTED;’’ .txt'");
     }
 }

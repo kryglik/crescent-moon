@@ -286,7 +286,21 @@ impl App {
         }
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) {
+    /// The shell commands are typed into: the running one, or the one the options name.
+    fn shell(&self) -> &Shell {
+        self.subshell.as_ref().map_or(&self.config.shell, Subshell::shell)
+    }
+
+    pub fn on_key(&mut self, mut key: KeyEvent) {
+        // With Caps Lock on, Windows reports Ctrl+O as Ctrl with a capital O (and no Shift):
+        // every Ctrl+letter shortcut would be dead, and Ctrl+O would go into the shell.
+        if let KeyCode::Char(c) = key.code
+            && c.is_ascii_uppercase()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            key.code = KeyCode::Char(c.to_ascii_lowercase());
+        }
         if self.shell_shown {
             self.on_shell_key(key);
         } else if self.dialog.is_some() {
@@ -607,7 +621,7 @@ impl App {
         }
         let cwd = self.active_panel().cwd.clone();
         if let Some(shell) = self.subshell.as_mut() {
-            shell.follow_panel(&cwd, &self.config.shell);
+            shell.follow_panel(&cwd);
             shell.scroll_to_bottom();
             self.shell_shown = true;
         }
@@ -639,7 +653,7 @@ impl App {
             self.error("The shell is still busy with a command.\nPress Ctrl+O to see it.");
             return;
         }
-        shell.follow_panel(&cwd, &self.config.shell);
+        shell.follow_panel(&cwd);
         shell.send_text(&format!("{line}\r"));
         self.shell_shown = true;
     }
@@ -1132,7 +1146,7 @@ impl App {
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
         } else if entry.is_exec {
-            self.run_in_shell(self.config.shell.run_file_line(&entry.path));
+            self.run_in_shell(self.shell().run_file_line(&entry.path));
         } else {
             match platform::open_default(&entry.path) {
                 Ok(()) => {}
@@ -1299,8 +1313,9 @@ impl App {
     fn insert_current_name(&mut self) {
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
         let name = &entry.name;
-        let needs_quotes = name.chars().any(|c| c.is_whitespace() || "'\"&()[]{};,$`#@|<>".contains(c));
-        let mut text = if needs_quotes { self.config.shell.quote(name) } else { name.clone() };
+        // PowerShell also takes ‘ ’ ‚ ‛ as single quotes and “ ” „ as double ones.
+        let needs_quotes = name.chars().any(|c| c.is_whitespace() || "'\"&()[]{};,$`#@|<>‘’‚‛“”„".contains(c));
+        let mut text = if needs_quotes { self.shell().quote(name) } else { name.clone() };
         text.push(' ');
         if !self.cmdline.is_empty() && !self.cmdline.text().ends_with(' ') {
             text.insert(0, ' ');
@@ -1518,6 +1533,15 @@ mod tests {
         assert!(names(&app).contains(&"new.txt".to_string()) && app.panels[1].entries.iter().any(|e| e.name == "new.txt"));
         assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
         assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
+    }
+
+    /// With Caps Lock on, Windows reports Ctrl+D as Ctrl with a capital D: it still works.
+    #[test]
+    fn ctrl_shortcuts_work_with_caps_lock() {
+        let tmp = TempDir::new("app-caps");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(ctrl('D'));
+        assert!(matches!(app.dialog, Some(Dialog::Hotlist { .. })));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -141,20 +141,31 @@ pub struct Subshell {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     size: (u16, u16),
-    /// Where the shell's prompt reports `<number>|<folder>[|f]` (see `PWSH_SHELL_INIT`).
+    /// Where the shell's prompt reports `<number>|<f or ->|<folder>` (see `PWSH_SHELL_INIT`).
     report_file: PathBuf,
     /// Where rmc puts the folder for the shell's follow key.
     request_file: PathBuf,
-    /// rmc's start-up files for bash and zsh.
+    /// A folder of this shell's own (private, with a name nobody can guess): the two files
+    /// above and rmc's start-up files for bash and zsh.
     init_dir: PathBuf,
-    /// The prompt number when rmc last typed into the shell. A later prompt means it is idle.
+    /// The prompt number at which the line rmc last typed will be read. A later prompt means
+    /// the shell is idle: that line has run and the new prompt's line is empty.
     prompt_at_last_input: u64,
+    /// The prompt at which rmc last pressed Enter: until the next prompt, a command runs, and
+    /// anything typed meanwhile waits for the prompt after it.
+    submitted_at: Option<u64>,
     typed_anything: bool,
+    /// The shell it runs, for quoting and the lines rmc types into it (the options may name
+    /// another one meanwhile).
+    shell: Shell,
     /// Whether the shell's prompt writes `report_file` (PowerShell, bash, zsh).
     reports_prompts: bool,
     /// The shell's folder when it was last shown; if it has moved by the time the panels come
     /// back, the panel follows.
     pub cwd_when_shown: Option<PathBuf>,
+    /// The report (prompt number, folder) from before rmc last pressed the follow key. Until a
+    /// newer one comes, or if the shell couldn't go there, it hasn't moved by itself.
+    followed_from: Option<(u64, PathBuf)>,
 }
 
 impl Subshell {
@@ -167,19 +178,15 @@ impl Subshell {
             e.to_string()
         };
         let pair = native_pty_system().openpty(pty_size(rows, cols)).map_err(|e| error(&e))?;
-        // Unique per shell: a new one may start while the old one's file is still being removed.
-        static STARTED: AtomicU32 = AtomicU32::new(0);
-        let n = STARTED.fetch_add(1, Ordering::Relaxed);
-        let name = format!("rmc-{}-shell-{n}", std::process::id());
-        let file = |what: &str| std::env::temp_dir().join(format!("{name}{what}.txt"));
-        let (report_file, request_file) = (file(""), file("-cd"));
-        let init_dir = std::env::temp_dir().join(&name);
-        let _ = fs::remove_file(&report_file);
+        let init_dir = private_dir().map_err(|e| error(&e))?;
+        let (report_file, request_file) = (init_dir.join("report.txt"), init_dir.join("cd.txt"));
         let session = shell.session(&init_dir).map_err(|e| error(&e))?;
         let mut command = CommandBuilder::from_argv(session.argv);
         for (key, value) in session.env {
             command.env(key, value);
         }
+        // Ctrl+O exits only the one-off shell of the fallback, never this one.
+        command.env_remove("RMC_ONE_OFF");
         // What rmc's screen copy (vt100) understands; without it readline and zle fall back
         // to a dumb terminal. ConPTY on Windows ignores it.
         if cfg!(unix) {
@@ -219,10 +226,18 @@ impl Subshell {
             request_file,
             init_dir,
             prompt_at_last_input: 0,
+            submitted_at: None,
             typed_anything: false,
+            shell: shell.clone(),
             reports_prompts: shell.reports_prompts(),
             cwd_when_shown: None,
+            followed_from: None,
         })
+    }
+
+    /// The shell this is (which may differ from the one the options now name).
+    pub fn shell(&self) -> &Shell {
+        &self.shell
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -254,7 +269,9 @@ impl Subshell {
     }
 
     pub fn send_key(&mut self, key: &KeyEvent) {
-        let bytes = encode_key(key);
+        // Programs like less and htop ask for "application cursor keys".
+        let application_cursor = self.with_screen(vt100::Screen::application_cursor).unwrap_or(false);
+        let bytes = encode_key(key, application_cursor);
         if !bytes.is_empty() {
             self.send(&bytes);
         }
@@ -271,7 +288,15 @@ impl Subshell {
         let _ = self.input.send(bytes.to_vec());
         self.typed_anything = true;
         // Text typed before the first prompt is read at that prompt, so it counts as prompt 1's.
-        self.prompt_at_last_input = self.report().map_or(1, |report| report.prompt.max(1));
+        let prompt = self.report().map_or(1, |report| report.prompt.max(1));
+        // Typed while a command runs (Enter was pressed at this prompt and no new one came):
+        // it waits for the next prompt, whose line it then is. That prompt is not idle, or
+        // the follow key (which presses Enter in bash) would run it.
+        let line_prompt = if self.submitted_at == Some(prompt) { prompt + 1 } else { prompt };
+        self.prompt_at_last_input = line_prompt;
+        if bytes.contains(&b'\r') {
+            self.submitted_at = Some(line_prompt);
+        }
     }
 
     /// Scrolls the view back (positive) or forward through the output.
@@ -300,9 +325,9 @@ impl Subshell {
         exited
     }
 
-    /// What the shell's last prompt reported (PowerShell only).
+    /// What the shell's last prompt reported (PowerShell, bash, zsh).
     pub fn report(&self) -> Option<ShellReport> {
-        platform::parse_cwd_report(&fs::read_to_string(&self.report_file).ok()?)
+        platform::parse_cwd_report_bytes(&fs::read(&self.report_file).ok()?)
     }
 
     /// Waiting at an empty prompt: a prompt has appeared since rmc last typed anything.
@@ -322,29 +347,40 @@ impl Subshell {
     /// place. (Without the key, e.g. PowerShell without PSReadLine or bash before 4.4, a visible
     /// `cd` is typed instead.) Shells that don't report their folder are left alone.
     /// Remembers where the shell is, for `moved_to`.
-    pub fn follow_panel(&mut self, dir: &Path, shell: &Shell) {
+    pub fn follow_panel(&mut self, dir: &Path) {
         let report = self.report();
         let elsewhere = report.as_ref().is_some_and(|r| !util::same_path(&r.dir, dir));
-        if elsewhere && self.is_idle() && self.reports_prompts {
-            let silent = report.as_ref().is_some_and(|r| r.can_follow)
-                && fs::write(&self.request_file, dir.to_string_lossy().as_bytes()).is_ok();
-            if silent {
-                self.send_text(platform::FOLLOW_KEY);
-            } else if let Some(line) = shell.cd_line(dir) {
-                self.send_text(&line);
+        let follow = elsewhere && self.is_idle() && self.reports_prompts;
+        self.followed_from = None;
+        match report {
+            Some(report) if follow => {
+                let silent = report.can_follow && fs::write(&self.request_file, path_bytes(dir)).is_ok();
+                if silent {
+                    self.send_text(platform::FOLLOW_KEY);
+                } else if let Some(line) = self.shell.cd_line(dir) {
+                    self.send_text(&line);
+                }
+                self.followed_from = Some((report.prompt, report.dir));
+                self.cwd_when_shown = Some(dir.to_path_buf());
             }
-            self.cwd_when_shown = Some(dir.to_path_buf());
-        } else {
             // A brand-new shell has no report yet; it started in the panel's folder.
-            self.cwd_when_shown = report.map(|r| r.dir).or_else(|| Some(dir.to_path_buf()));
+            report => self.cwd_when_shown = report.map(|r| r.dir).or_else(|| Some(dir.to_path_buf())),
         }
     }
 
-    /// Where the shell went since it was shown, if it changed folder.
+    /// Where the shell went since it was shown, if it changed folder. A report from before
+    /// the follow key took effect (Ctrl+O pressed twice quickly), or the shell still where it
+    /// was because it couldn't go to the panel's folder, isn't a move of the user's.
     pub fn moved_to(&self) -> Option<PathBuf> {
-        let here = self.report()?.dir;
-        let moved = !self.cwd_when_shown.as_deref().is_some_and(|before| util::same_path(before, &here));
-        moved.then_some(here)
+        let report = self.report()?;
+        // The follow key gives exactly one new prompt; any later one is the user's doing.
+        if let Some((prompt, from)) = &self.followed_from
+            && (report.prompt <= *prompt || (report.prompt == prompt + 1 && util::same_path(&report.dir, from)))
+        {
+            return None;
+        }
+        let moved = !self.cwd_when_shown.as_deref().is_some_and(|before| util::same_path(before, &report.dir));
+        moved.then_some(report.dir)
     }
 }
 
@@ -361,41 +397,79 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
+/// A new folder in the temp folder for one shell's files, made fresh with a name nobody can
+/// guess, and on Linux readable by its owner only: the shell runs the start-up file in it,
+/// and /tmp is shared with other users.
+fn private_dir() -> std::io::Result<PathBuf> {
+    for _ in 0..100 {
+        let dir = std::env::temp_dir().join(format!("rmc-{}-shell-{:016x}", std::process::id(), util::random()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no folder could be made for the shell's files"))
+}
+
+/// A path as the bytes to write to a file the shell reads (on Linux not necessarily UTF-8).
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
 fn non_zero(n: u16) -> NonZeroU16 {
     NonZeroU16::new(n).unwrap_or(NonZeroU16::MIN)
 }
 
 /// The bytes a terminal (xterm, Windows Terminal) sends for a key. ConPTY turns them back into
-/// Windows key events for the shell.
-pub fn encode_key(key: &KeyEvent) -> Vec<u8> {
+/// Windows key events for the shell. `application_cursor`: the program asked for the cursor
+/// keys' "application" form (less, htop and other full-screen programs on Linux).
+pub fn encode_key(key: &KeyEvent, application_cursor: bool) -> Vec<u8> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // xterm's modifier parameter: 1 + Shift + 2·Alt + 4·Ctrl.
     let m = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
     let csi = |end: char| if m == 1 { format!("\x1b[{end}") } else { format!("\x1b[1;{m}{end}") };
+    let cursor = |end: char| if m == 1 && application_cursor { format!("\x1bO{end}") } else { csi(end) };
     let tilde = |n: u8| if m == 1 { format!("\x1b[{n}~") } else { format!("\x1b[{n};{m}~") };
     let text = match key.code {
-        // Plain and shifted characters, and AltGr ones (Ctrl+Alt on Windows).
-        KeyCode::Char(c) if dialog::is_text_input(key) => c.to_string(),
+        // Plain and shifted characters, and AltGr ones, which Windows reports as Ctrl+Alt.
+        KeyCode::Char(c) if dialog::is_text_input(key) && (cfg!(windows) || !(ctrl && alt)) => c.to_string(),
+        // Ctrl+key; with Alt too (outside Windows), ESC first, as for any Alt key.
         KeyCode::Char(c) if ctrl => match control_byte(c) {
+            Some(byte) if alt => format!("\x1b{}", byte as char),
             Some(byte) => (byte as char).to_string(),
             None => return Vec::new(),
         },
         KeyCode::Char(c) => format!("\x1b{c}"),
+        KeyCode::Enter if alt => "\x1b\r".into(),
         KeyCode::Enter => "\r".into(),
         KeyCode::Tab => "\t".into(),
         KeyCode::BackTab => "\x1b[Z".into(),
         // Windows Terminal's convention, which ConPTY expects: DEL is Backspace, BS is Ctrl+Backspace.
         KeyCode::Backspace if ctrl => "\x08".into(),
+        // Alt+Backspace deletes a word in bash, zsh and PSReadLine's Emacs mode.
+        KeyCode::Backspace if alt => "\x1b\x7f".into(),
         KeyCode::Backspace => "\x7f".into(),
+        KeyCode::Esc if alt => "\x1b\x1b".into(),
         KeyCode::Esc => "\x1b".into(),
-        KeyCode::Up => csi('A'),
-        KeyCode::Down => csi('B'),
-        KeyCode::Right => csi('C'),
-        KeyCode::Left => csi('D'),
-        KeyCode::Home => csi('H'),
-        KeyCode::End => csi('F'),
+        KeyCode::Up => cursor('A'),
+        KeyCode::Down => cursor('B'),
+        KeyCode::Right => cursor('C'),
+        KeyCode::Left => cursor('D'),
+        KeyCode::Home => cursor('H'),
+        KeyCode::End => cursor('F'),
         KeyCode::Insert => tilde(2),
         KeyCode::Delete => tilde(3),
         KeyCode::PageUp => tilde(5),
@@ -441,7 +515,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
-        encode_key(&KeyEvent::new(code, modifiers))
+        encode_key(&KeyEvent::new(code, modifiers), false)
+    }
+
+    #[test]
+    fn alt_keys_and_application_cursor_keys() {
+        assert_eq!(key(KeyCode::Backspace, KeyModifiers::ALT), b"\x1b\x7f", "Alt+Backspace deletes a word");
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::ALT), b"\x1b\r");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(encode_key(&up, true), b"\x1bOA", "less and htop ask for these");
+        assert_eq!(encode_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), true), b"\x1b[1;5A");
+        // Ctrl+Alt+E is AltGr on Windows, Alt + Ctrl+E elsewhere.
+        let ctrl_alt_e = key(KeyCode::Char('e'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(ctrl_alt_e, if cfg!(windows) { b"e".to_vec() } else { b"\x1b\x05".to_vec() });
     }
 
     #[test]
@@ -449,6 +535,7 @@ mod tests {
         let none = KeyModifiers::NONE;
         assert_eq!(key(KeyCode::Char('ů'), none), "ů".as_bytes());
         assert_eq!(key(KeyCode::Char('A'), KeyModifiers::SHIFT), b"A");
+        #[cfg(windows)]
         assert_eq!(key(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT), b"@", "AltGr");
         assert_eq!(key(KeyCode::Char('c'), KeyModifiers::CONTROL), [3]);
         assert_eq!(key(KeyCode::Char(' '), KeyModifiers::CONTROL), [0]);
@@ -495,7 +582,7 @@ mod tests {
 
         // rmc moves it to the panel's folder silently (no command line); the variable survives.
         assert!(shell.report().is_some_and(|r| r.can_follow), "PSReadLine's follow key is there");
-        shell.follow_panel(&other, &shell_kind);
+        shell.follow_panel(&other);
         wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
         wait_for("the redrawn prompt", || screen_text(&shell).contains("Účty>"));
         let screen = screen_text(&shell);
@@ -526,7 +613,7 @@ mod tests {
         wait_for("the next prompt", || shell.is_idle());
 
         assert!(shell.report().is_some_and(|r| r.can_follow), "the follow key is bound");
-        shell.follow_panel(&other, &shell_kind);
+        shell.follow_panel(&other);
         wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
         wait_for("the redrawn prompt", || screen_text(&shell).contains("[Účty]> "));
         let screen = screen_text(&shell);
@@ -567,6 +654,37 @@ mod tests {
         let link = tmp.path().join("zsh");
         std::os::unix::fs::symlink(&zsh, &link).unwrap();
         posix_shell_keeps_its_state_and_follows_the_panel(&link.to_string_lossy(), "PROMPT='[%1~]''> '");
+    }
+
+    /// Text typed while a command runs waits at the next prompt: that prompt isn't idle, so
+    /// rmc neither types a command after it nor presses the follow key (bash's ends in Enter,
+    /// which would run the text).
+    #[test]
+    fn text_typed_ahead_keeps_the_shell_busy() {
+        let (shell_kind, sleep) = if cfg!(windows) {
+            match Shell::detect() {
+                shell @ Shell::PowerShell(_) => (shell, "Start-Sleep -Milliseconds 700\r"),
+                _ => return eprintln!("no PowerShell here; skipped"),
+            }
+        } else {
+            match util::find_in_path("bash") {
+                Some(bash) => (Shell::Posix(bash), "sleep 0.7\r"),
+                None => return eprintln!("no bash here; skipped"),
+            }
+        };
+        let tmp = TempDir::new("subshell-ahead");
+        let mut shell = Subshell::start(&shell_kind, tmp.path(), 30, 100).unwrap();
+        wait_for("the first prompt", || shell.report().is_some());
+        let first = shell.report().unwrap().prompt;
+        shell.send_text(sleep);
+        shell.send_text("echo typed-ahead");
+        wait_for("the prompt after the sleep", || shell.report().is_some_and(|r| r.prompt > first));
+        assert!(!shell.is_idle(), "the new prompt holds the typed-ahead text");
+        shell.send_text("\r");
+        wait_for("the typed-ahead command", || screen_text(&shell).matches("typed-ahead").count() >= 2);
+        wait_for("idle again", || shell.is_idle());
+        shell.send_text("exit\r");
+        wait_for("exit", || shell.has_exited());
     }
 
     /// cmd (and sh, fish) don't report their prompts: rmc can't see when a command ends,

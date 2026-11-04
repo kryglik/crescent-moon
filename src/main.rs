@@ -414,7 +414,7 @@ fn run_external(
         }
         _ => {}
     }
-    let result = match command.status() {
+    let result = match run_shielded(&mut command) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             Err(format!("\"{name}\" was not found.\nInstall it, or set RMC_EDITOR, RMC_VIEWER, RMC_PAGER or RMC_SHELL."))
@@ -435,6 +435,58 @@ fn run_external(
         .map(|report| report.dir);
     let _ = std::fs::remove_file(&cwd_file);
     Ok((result, shell_cwd))
+}
+
+/// Runs a program in the foreground. Ctrl+C there is meant for it (stopping a search in
+/// less, say), but the terminal sends it to rmc too, which would end, taking its shell along:
+/// rmc ignores it until the program ends.
+fn run_shielded(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    let mut child = command.spawn()?;
+    let _shield = IgnoreInterrupts::new();
+    child.wait()
+}
+
+/// Ctrl+C (and Ctrl+\, Ctrl+Break) ignored while it lives. Set after the child has started,
+/// so the child doesn't inherit it.
+struct IgnoreInterrupts {
+    #[cfg(unix)]
+    previous: (libc::sighandler_t, libc::sighandler_t),
+}
+
+impl IgnoreInterrupts {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            let previous = unsafe { (libc::signal(libc::SIGINT, libc::SIG_IGN), libc::signal(libc::SIGQUIT, libc::SIG_IGN)) };
+            IgnoreInterrupts { previous }
+        }
+        #[cfg(windows)]
+        {
+            unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ignore_interrupt), 1) };
+            IgnoreInterrupts {}
+        }
+    }
+}
+
+impl Drop for IgnoreInterrupts {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous.0);
+            libc::signal(libc::SIGQUIT, self.previous.1);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ignore_interrupt), 0);
+        }
+    }
+}
+
+/// Ctrl+C and Ctrl+Break are handled (ignored); closing the window goes on as usual.
+#[cfg(windows)]
+unsafe extern "system" fn ignore_interrupt(kind: u32) -> windows_sys::core::BOOL {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
 }
 
 /// The editor, viewer or pager command for `path`, at `line` (`+42`) for the programs that
