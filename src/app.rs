@@ -145,8 +145,14 @@ impl App {
 
     /// Whether background work is running (the main loop then redraws more often).
     pub fn is_busy(&self) -> bool {
+        self.working() || self.shell_shown
+    }
+
+    /// Work in the background that changes the screen by itself: a copy, move or delete,
+    /// directory sizes, or drive space still to arrive.
+    pub fn working(&self) -> bool {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
-        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending || self.shell_shown
+        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -646,18 +652,22 @@ impl App {
         self.job = Some(ops::start(job));
     }
 
-    /// Picks up directory sizes, the end of the shell, and the progress, questions and end of
-    /// a running job.
-    pub fn tick(&mut self) {
+    /// Picks up directory sizes, drive space, the end of the shell, and the progress, questions
+    /// and end of a running job. Returns whether any of that arrived, so the screen is redrawn:
+    /// work can finish between two looks, so "was it running before or after" isn't enough.
+    pub fn tick(&mut self) -> bool {
+        let mut changed = false;
         // The shell was closed with `exit`: back to the panels; the next Ctrl+O starts a new one.
         if self.subshell.as_mut().is_some_and(Subshell::has_exited) {
             if self.shell_shown {
                 self.hide_shell();
             }
             self.subshell = None;
+            changed = true;
         }
         if let Some(answers) = &self.drive_space {
             while let Ok((root, space)) = answers.try_recv() {
+                changed = true;
                 if let Some(Dialog::Drives { drives, .. }) = &mut self.dialog
                     && let Some(drive) = drives.iter_mut().find(|d| d.root == root)
                 {
@@ -668,6 +678,7 @@ impl App {
         }
         if let Some(sizer) = &self.sizer {
             while let Ok(update) = sizer.updates.try_recv() {
+                changed = true;
                 for panel in &mut self.panels {
                     panel.set_dir_size(&update.dir, update.bytes, update.done);
                 }
@@ -677,10 +688,16 @@ impl App {
                 sizer.cancel();
             }
         }
+        self.tick_job() || changed
+    }
 
-        let Some(job) = self.job.as_mut() else { return };
+    /// The running job's progress, questions and end. Returns whether any of them arrived.
+    fn tick_job(&mut self) -> bool {
+        let Some(job) = self.job.as_mut() else { return false };
         let mut finished = None;
+        let mut changed = false;
         while let Ok(msg) = job.rx.try_recv() {
+            changed = true;
             match msg {
                 Msg::Progress(progress) => job.progress = progress,
                 Msg::Ask(question, reply) => self.dialog = Some(question_dialog(question, reply)),
@@ -690,7 +707,7 @@ impl App {
                 }
             }
         }
-        let Some((errors, cancelled)) = finished else { return };
+        let Some((errors, cancelled)) = finished else { return changed };
         self.job = None;
         for panel in &mut self.panels {
             panel.clear_marks();
@@ -709,6 +726,7 @@ impl App {
             let title = if cancelled { "Stopped" } else { "Problems" };
             self.dialog = Some(Dialog::Message { title: title.into(), lines, error: true });
         }
+        true
     }
 
     /// Called after an editor, viewer, shell or command has run. `shell_cwd` is where a Ctrl+O
@@ -1124,11 +1142,14 @@ mod tests {
         app.on_key(key(KeyCode::Home));
         app.on_key(ctrl(' '));
         let deadline = Instant::now() + Duration::from_secs(20);
-        while app.is_busy() || app.active_panel().has_pending_sizes() {
+        // The measuring can finish completely between two ticks; the tick that picks up the
+        // results must still say the screen changed (or the sizes would never be drawn).
+        while app.working() {
             assert!(Instant::now() < deadline, "sizes did not arrive");
             std::thread::sleep(Duration::from_millis(10));
-            app.tick();
         }
+        assert!(app.tick(), "picking up the results asks for a redraw");
+        assert!(!app.tick(), "nothing new: no redraw");
         let panel = app.active_panel();
         let size_of = |name: &str| panel.dir_size(panel.entries.iter().find(|e| e.name == name).unwrap()).unwrap();
         assert_eq!(size_of("big").bytes, 8000);

@@ -116,6 +116,7 @@ While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Star
 | `RMC_VIEWER` | the editor, plus `-R` for vim/nvim or `-v` for nano |
 | `RMC_SHELL` | `pwsh`, then `powershell`, then `cmd`; on Linux `$SHELL` |
 | `RMC_LOG` | file to log the shell's pseudo-console traffic to, for debugging (typed input is logged as a byte count only) |
+| `RMC_TRACE` | file to log a line per frame to: what woke rmc, how long until the frame was sent, drawing time and bytes; tells a slow rmc from a slow terminal |
 
 Favourite folders are saved in `%APPDATA%\rmc\hotlist.txt` (one path per line; you can edit it).
 

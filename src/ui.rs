@@ -317,8 +317,10 @@ fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool) -> Style {
         Some(e) if e.is_exec => Color::LightGreen,
         _ => Color::Gray,
     };
+    // Folders stand out by their brighter white and the "/" before the name; only marked
+    // entries are bold.
     let mut style = Style::new().fg(fg).bg(Color::Blue);
-    if marked || entry.is_some_and(|e| e.is_dir) {
+    if marked {
         style = style.add_modifier(Modifier::BOLD);
     }
     if on_cursor {

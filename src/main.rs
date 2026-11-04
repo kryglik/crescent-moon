@@ -14,16 +14,90 @@ mod testutil;
 mod ui;
 mod util;
 
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
 use ratatui::crossterm::{cursor, execute, terminal};
 
 use app::{App, Config, External};
+
+/// rmc's terminal: frames go out through `Output`.
+type Tui = Terminal<CrosstermBackend<Output>>;
+
+/// What rmc writes to the terminal. ratatui flushes at the end of each frame, and only then
+/// does the frame go out, in one write. Rust's stdout alone sends it in 1 KB pieces, and the
+/// terminal may show a half-drawn screen in between. Counts the bytes for RMC_TRACE.
+#[derive(Default)]
+struct Output {
+    frame: Vec<u8>,
+}
+
+/// Bytes `Output` has sent so far.
+static SENT: AtomicU64 = AtomicU64::new(0);
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.frame.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.frame.is_empty() {
+            let mut out = io::stdout().lock();
+            out.write_all(&self.frame)?;
+            out.flush()?;
+            SENT.fetch_add(self.frame.len() as u64, Ordering::Relaxed);
+            self.frame.clear();
+        }
+        Ok(())
+    }
+}
+
+/// RMC_TRACE=FILE: a line per frame, to tell a slow rmc from a slow terminal. It says what
+/// woke rmc (k key, m mouse move, c click, w wheel, r resize; nothing for a timer), how long
+/// from the first of those events until the frame was sent, how long drawing took, and how
+/// many bytes went to the terminal.
+struct Trace {
+    file: Option<fs::File>,
+    start: Instant,
+}
+
+impl Trace {
+    fn from_env() -> Self {
+        let file = std::env::var_os("RMC_TRACE").and_then(|path| fs::File::create(path).ok());
+        Trace { file, start: Instant::now() }
+    }
+
+    fn frame(&mut self, events: &str, woke: Option<Instant>, draw: Duration, bytes: u64) {
+        let Some(file) = &mut self.file else { return };
+        let latency = woke.map_or(String::new(), |t| format!(" latency={}us", t.elapsed().as_micros()));
+        let at = self.start.elapsed().as_millis();
+        let _ = writeln!(file, "{at:>7}ms [{events}]{latency} draw={}us bytes={bytes}", draw.as_micros());
+    }
+
+    fn event(&self, events: &mut String, event: &Event) {
+        if self.file.is_none() {
+            return;
+        }
+        events.push(match event {
+            Event::Key(_) => 'k',
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => 'm',
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => 'w',
+                _ => 'c',
+            },
+            Event::Resize(..) => 'r',
+            _ => '?',
+        });
+    }
+}
 
 const USAGE: &str = "\
 rmc - two-panel file manager
@@ -87,9 +161,18 @@ fn main() -> ExitCode {
     let right = dirs.get(1).cloned().unwrap_or_else(|| left.clone());
     let mut app = App::new(left, right, Config::from_env());
 
-    let mut terminal = ratatui::init();
     let mouse = Mouse(args.mouse);
-    let result = mouse.capture().and_then(|()| run(&mut terminal, &mut app, mouse));
+    // A panic must not leave the terminal in raw mode, or reporting mouse movements as text.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        mouse.release();
+        ratatui::restore();
+        previous_hook(info);
+    }));
+    let result = init_terminal().and_then(|mut terminal| {
+        mouse.capture()?;
+        run(&mut terminal, &mut app, mouse)
+    });
     mouse.release();
     ratatui::restore();
 
@@ -110,38 +193,66 @@ fn main() -> ExitCode {
 #[derive(Clone, Copy)]
 struct Mouse(bool);
 
+/// On Unix rmc asks the terminal for clicks and the wheel only: normal tracking (1000) with
+/// SGR coordinates (1006). crossterm's EnableMouseCapture also turns on any-motion tracking
+/// (1003), so the terminal sends a report for every cell the pointer crosses, which rmc
+/// doesn't use. On Windows mouse input is a console mode instead.
+#[cfg(unix)]
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+#[cfg(unix)]
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+
 impl Mouse {
     fn capture(self) -> io::Result<()> {
         if self.0 {
-            execute!(io::stdout(), EnableMouseCapture)?;
+            #[cfg(unix)]
+            {
+                let mut out = io::stdout();
+                out.write_all(MOUSE_ON)?;
+                out.flush()?;
+            }
+            #[cfg(not(unix))]
+            execute!(io::stdout(), event::EnableMouseCapture)?;
         }
         Ok(())
     }
 
     fn release(self) {
         if self.0 {
-            let _ = execute!(io::stdout(), DisableMouseCapture);
+            #[cfg(unix)]
+            {
+                let mut out = io::stdout();
+                let _ = out.write_all(MOUSE_OFF).and_then(|()| out.flush());
+            }
+            #[cfg(not(unix))]
+            let _ = execute!(io::stdout(), event::DisableMouseCapture);
         }
     }
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Result<()> {
-    // A panic must not leave the terminal reporting mouse movements as text.
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        mouse.release();
-        previous_hook(info);
-    }));
+/// Raw mode and the alternate screen, with frames going out through `Output`.
+fn init_terminal() -> io::Result<Tui> {
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), terminal::EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(Output::default()))
+}
 
+fn run(terminal: &mut Tui, app: &mut App, mouse: Mouse) -> io::Result<()> {
+    let mut trace = Trace::from_env();
+    let mut events = String::new();
+    let mut woke = None;
     let mut dirty = true;
     while !app.quit {
-        // The panels are cheap to redraw every time. The shell's screen is drawn only when it
-        // changed: redrawing it 100 times a second re-sends the cursor and makes it flicker.
+        // Draw only when something changed: every frame re-sends the cursor, which keeps it
+        // from blinking (and makes the shell's screen flicker), and is work for the terminal.
         let shell_changed = app.subshell.as_ref().is_some_and(|s| s.take_changed() || s.starting_for().is_some());
-        if dirty || !app.shell_shown || shell_changed {
+        if dirty || shell_changed {
+            let (started, sent) = (Instant::now(), SENT.load(Ordering::Relaxed));
             terminal.draw(|frame| ui::draw(frame, app))?;
+            trace.frame(&events, woke, started.elapsed(), SENT.load(Ordering::Relaxed) - sent);
         }
-        dirty = false;
+        (dirty, woke) = (false, None);
+        events.clear();
         // The shell's output arrives on its own thread; check often while it's on screen.
         let timeout = Duration::from_millis(match () {
             _ if app.shell_shown => 10,
@@ -149,23 +260,35 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
             _ => 500,
         });
         if event::poll(timeout)? {
-            dirty = true;
+            woke = Some(Instant::now());
             // Handle everything already queued (fast typing, pastes, mouse moves) before drawing again.
             loop {
-                match event::read()? {
+                let event = event::read()?;
+                trace.event(&mut events, &event);
+                dirty |= match event {
                     // Windows reports key releases too; only presses (and repeats) count.
-                    Event::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
-                    Event::Mouse(event) => app.on_mouse(event),
-                    _ => {}
-                }
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        app.on_key(key);
+                        true
+                    }
+                    Event::Key(_) => false,
+                    // Moving the pointer changes nothing (Windows reports it even so).
+                    Event::Mouse(event) if event.kind == MouseEventKind::Moved => false,
+                    Event::Mouse(event) => {
+                        app.on_mouse(event);
+                        true
+                    }
+                    _ => true,
+                };
                 if app.quit || app.external.is_some() || !event::poll(Duration::ZERO)? {
                     break;
                 }
             }
         }
+        // Results of background work (directory sizes, drive space, a copy's progress, the
+        // shell exiting) change the screen by themselves; so does time while a job runs.
         let shown = app.shell_shown;
-        app.tick();
-        dirty |= app.shell_shown != shown;
+        dirty |= app.tick() || app.working() || app.shell_shown != shown;
         if let Some(external) = app.external.take() {
             let (result, shell_cwd) = run_external(terminal, app, external, mouse)?;
             app.after_external(result, shell_cwd);
@@ -178,7 +301,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
 /// Hands the terminal to an editor, viewer, shell or command, then takes it back.
 /// After a Ctrl+O shell it also returns the folder the shell was last in.
 fn run_external(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut Tui,
     app: &mut App,
     external: External,
     mouse: Mouse,
