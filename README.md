@@ -126,6 +126,17 @@ function rmc {
 | `src/platform.rs` | Windows bits: drives, free space, hidden files, ShellExecute, shells |
 | `src/util.rs` | formatting, path resolution, wildcard matching, column fitting |
 
+## Testing in a real terminal
+
+`cargo test` covers most things, including a real pwsh in the embedded shell. To check rmc
+itself in a Windows Terminal window, the scripts in `tools/` attach to its console:
+
+```powershell
+wt -w new cmd /c rmc E:\some\dir          # then find its pid: Get-Process rmc
+tools\sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:dir', 'enter'
+tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
+```
+
 ## Not there yet
 
 Archives and SFTP, a user menu, themes.
