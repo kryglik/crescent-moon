@@ -49,8 +49,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.shell_shown
         && let Some(shell) = &app.subshell
     {
-        if let Some(cursor) = draw_shell(frame.buffer_mut(), area, shell) {
+        if area.width > 0
+            && area.height > 0
+            && let Some(cursor) = draw_shell(frame.buffer_mut(), area, shell)
+        {
             frame.set_cursor_position(cursor);
+        }
+        return;
+    }
+    // Too small for the panels (a narrow split pane): say so rather than draw out of bounds.
+    if area.height < 6 || area.width < 20 {
+        app.hit = HitAreas::default();
+        let text = util::take_width("rmc: the window is too small", area.width as usize);
+        if area.height > 0 {
+            frame.buffer_mut().set_string(area.x, area.y, text, Style::new().fg(Color::Yellow));
         }
         return;
     }
@@ -82,6 +94,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(job) = &app.job {
         draw_progress(frame, area, job);
+    }
+    // Help can't scroll past its end (or keys up would first have to undo the excess).
+    if let Some(Dialog::Help { scroll }) = &mut app.dialog {
+        let visible = help_height(area).saturating_sub(2) as usize;
+        *scroll = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
     }
     if let Some(dialog) = &app.dialog {
         let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist, app.config.settings_file.as_deref());
@@ -502,6 +519,11 @@ fn draw_keybar(buf: &mut Buffer, area: Rect) {
     }
 }
 
+/// The help box's height, border included.
+fn help_height(area: Rect) -> u16 {
+    (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2))
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let (w, h) = (width.min(area.width), height.min(area.height));
     Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
@@ -565,7 +587,8 @@ fn draw_message(
     error: bool,
 ) -> DialogHit {
     let widest = lines.iter().map(|l| util::width(l)).max().unwrap_or(0).max(util::width(title) + 4);
-    let width = (widest as u16 + 4).clamp(34, area.width.saturating_sub(4).max(10));
+    // At least 34 wide, but never wider than the screen (clamp would panic on a narrow one).
+    let width = (widest as u16 + 4).max(34).min(area.width.saturating_sub(4).max(10));
     let height = lines.len() as u16 + 4;
     let (outer, inner) = dialog_frame(frame, area, width, height, title, error);
     let style = dialog_style(error);
@@ -628,7 +651,7 @@ fn draw_dialog(
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         Dialog::Help { scroll } => {
-            let height = (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
             let (outer, inner) = dialog_frame(frame, area, 72, height, "rmc keys (Esc closes)", false);
             let visible = inner.height as usize;
@@ -1081,9 +1104,31 @@ mod tests {
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(7)));
         let mkdir = render(&mut app, 80, 24);
         assert!(mkdir.contains("New directory name:"));
-        // Tiny terminals must not panic.
-        for (w, h) in [(10, 3), (20, 6), (40, 8)] {
+        // Tiny terminals must not panic, with or without a dialog (a message box wanted 34
+        // columns; five rows left no room for the key bar).
+        for (w, h) in [(10, 3), (20, 6), (40, 8), (30, 5), (37, 24), (100, 5), (12, 1), (0, 0)] {
             render(&mut app, w, h);
         }
+        app.dialog = Some(Dialog::Message { title: "Error".into(), lines: vec!["Cannot open \"x\"".into()], error: true });
+        for (w, h) in [(30, 24), (37, 12), (20, 6), (1, 40)] {
+            render(&mut app, w, h);
+        }
+        assert!(render(&mut app, 18, 4).contains("rmc: the window"));
+    }
+
+    /// Scrolling help past its end doesn't build up a dead zone: Up moves at once.
+    #[test]
+    fn help_scrolls_no_further_than_its_end() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let tmp = TempDir::new("ui-help");
+        let mut app = app_for(&tmp);
+        app.on_key(KeyEvent::from(KeyCode::F(1)));
+        for _ in 0..30 {
+            app.on_key(KeyEvent::from(KeyCode::PageDown));
+            render(&mut app, 80, 24);
+        }
+        let bottom = render(&mut app, 80, 24);
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_ne!(render(&mut app, 80, 24), bottom, "one Up scrolls back");
     }
 }

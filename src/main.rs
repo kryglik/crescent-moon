@@ -175,11 +175,19 @@ fn main() -> ExitCode {
     app.mouse &= args.mouse;
 
     // A panic must not leave the terminal in raw mode, or reporting mouse movements as text.
+    // One on a background thread (a job, a search) ends only that work while the screen goes
+    // on: its message goes to a file instead of over the screen.
+    let main_thread = std::thread::current().id();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        Mouse(true).release();
-        ratatui::restore();
-        previous_hook(info);
+        if std::thread::current().id() == main_thread {
+            Mouse(true).release();
+            ratatui::restore();
+            previous_hook(info);
+        } else {
+            let log = std::env::temp_dir().join("rmc-panic.txt");
+            let _ = std::fs::write(log, format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
+        }
     }));
     let title = SavedTitle::save();
     let result = init_terminal().and_then(|mut terminal| run(&mut terminal, &mut app));

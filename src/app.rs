@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -59,8 +59,11 @@ impl Config {
     /// The settings file, the hotlist file, and from them the commands.
     pub fn load() -> Self {
         let settings_file = Settings::default_file();
-        let settings = Settings::load(settings_file.as_deref());
-        Config::new(settings, Hotlist::default_file(), settings_file)
+        match Settings::load(settings_file.as_deref()) {
+            Ok(settings) => Config::new(settings, Hotlist::default_file(), settings_file),
+            // There but unreadable: defaults, and the file is left alone (never saved over).
+            Err(_) => Config::new(Settings::default(), Hotlist::default_file(), None),
+        }
     }
 
     /// Commands come from the settings, or when those are empty from the environment
@@ -1020,7 +1023,18 @@ impl App {
         let Some(job) = self.job.as_mut() else { return false };
         let mut finished = None;
         let mut changed = false;
-        while let Ok(msg) = job.rx.try_recv() {
+        loop {
+            let msg = match job.rx.try_recv() {
+                Ok(msg) => msg,
+                Err(TryRecvError::Empty) => break,
+                // The worker is gone without a word (it panicked): don't wait for it forever.
+                Err(TryRecvError::Disconnected) => {
+                    let log = std::env::temp_dir().join("rmc-panic.txt");
+                    let error = format!("The job stopped unexpectedly (an internal error, see {}).", log.display());
+                    finished = Some((vec![error], true, None));
+                    break;
+                }
+            };
             changed = true;
             match msg {
                 Msg::Progress(progress) => job.progress = progress,
@@ -1836,7 +1850,7 @@ mod tests {
         // F10 now asks; and it was all saved.
         app.on_key(key(KeyCode::F(10)));
         assert!(!app.quit && matches!(app.dialog, Some(Dialog::Confirm { .. })));
-        let saved = Settings::load(Some(&file));
+        let saved = Settings::load(Some(&file)).unwrap();
         assert_eq!(saved, app.config.settings);
         assert_eq!((saved.big_file_mb, saved.editor.as_str(), saved.mouse), (25, "micro", false));
     }

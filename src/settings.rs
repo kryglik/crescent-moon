@@ -43,9 +43,15 @@ impl Settings {
         util::config_dir().map(|dir| dir.join("settings.ini"))
     }
 
-    /// The settings in `file`; defaults for anything missing (or no file at all).
-    pub fn load(file: Option<&Path>) -> Self {
-        file.and_then(|f| fs::read_to_string(f).ok()).map_or_else(Settings::default, |text| Settings::parse(&text))
+    /// The settings in `file` (in whatever encoding an editor saved it); defaults for anything
+    /// missing, or no file at all. Err when the file is there but can't be read: it mustn't be
+    /// saved over then.
+    pub fn load(file: Option<&Path>) -> io::Result<Self> {
+        match file.map(util::read_text) {
+            Some(Ok(text)) => Ok(Settings::parse(&text)),
+            Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(Settings::default()),
+        }
     }
 
     pub fn save(&self, file: &Path) -> io::Result<()> {
@@ -123,7 +129,7 @@ mod tests {
     fn saves_and_loads() {
         let tmp = TempDir::new("settings");
         let file = tmp.path().join("rmc").join("settings.ini");
-        assert_eq!(Settings::load(Some(&file)), Settings::default(), "no file: defaults");
+        assert_eq!(Settings::load(Some(&file)).unwrap(), Settings::default(), "no file: defaults");
         let settings = Settings {
             confirm_quit: true,
             mouse: false,
@@ -132,7 +138,10 @@ mod tests {
             ..Settings::default()
         };
         settings.save(&file).unwrap();
-        assert_eq!(Settings::load(Some(&file)), settings);
+        assert_eq!(Settings::load(Some(&file)).unwrap(), settings);
+        // Saved again by an editor that adds a BOM.
+        fs::write(&file, format!("\u{feff}{}", fs::read_to_string(&file).unwrap())).unwrap();
+        assert_eq!(Settings::load(Some(&file)).unwrap(), settings);
     }
 
     #[test]

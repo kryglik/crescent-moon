@@ -54,7 +54,7 @@ pub fn human_size(bytes: u64) -> String {
 
 /// mc-style modification time: `Nov  3 21:51` for the last six months, `Nov  3  2024` otherwise.
 pub fn format_time(time: SystemTime, now: SystemTime) -> String {
-    let local: DateTime<Local> = time.into();
+    let Some(local) = local_time(time) else { return "?".into() };
     let recent = match now.duration_since(time) {
         Ok(age) => age < Duration::from_secs(182 * 24 * 3600),
         Err(ahead) => ahead.duration() < Duration::from_secs(3600),
@@ -64,6 +64,23 @@ pub fn format_time(time: SystemTime, now: SystemTime) -> String {
     } else {
         local.format("%b %e  %Y").to_string()
     }
+}
+
+/// A point in time in the local time zone; None where chrono can't show it (a file dated
+/// in the year 3,000,000, which tmpfs and btrfs allow; chrono's own conversion panics).
+pub fn local_time(time: SystemTime) -> Option<DateTime<Local>> {
+    let (secs, nanos) = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => (i64::try_from(after.as_secs()).ok()?, after.subsec_nanos()),
+        Err(before) => {
+            let before = before.duration();
+            let secs = -i64::try_from(before.as_secs()).ok()?;
+            match before.subsec_nanos() {
+                0 => (secs, 0),
+                nanos => (secs - 1, 1_000_000_000 - nanos),
+            }
+        }
+    };
+    Some(DateTime::from_timestamp(secs, nanos)?.with_timezone(&Local))
 }
 
 /// Resolves `.` and `..` lexically. Unlike `fs::canonicalize` it never adds `\\?\` prefixes.
@@ -114,6 +131,47 @@ fn with_drive_root(s: &str) -> String {
         return format!("{letter}:\\{rest}");
     }
     s.to_string()
+}
+
+/// A text file, whatever wrote it: UTF-8 with or without a BOM, UTF-16 with a BOM (Windows
+/// PowerShell's `>`), or else the system's ANSI code page (its `Set-Content`) on Windows.
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    Ok(decode_text(&std::fs::read(path)?))
+}
+
+pub fn decode_text(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    };
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => ansi_text(bytes),
+    }
+}
+
+/// Text in the system's ANSI code page (Windows-1250 on a Czech Windows).
+#[cfg(windows)]
+pub fn ansi_text(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mut out = vec![0u16; bytes.len()];
+    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), bytes.len() as i32, out.as_mut_ptr(), out.len() as i32) };
+    String::from_utf16_lossy(&out[..n.max(0) as usize])
+}
+
+#[cfg(not(windows))]
+pub fn ansi_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -266,13 +324,14 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     let (mut pi, mut ni) = (0, 0);
     let (mut star, mut mark) = (None, 0);
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        // The wildcard first: a `*` in the name (allowed on Linux) is not the pattern's `*`.
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             mark = ni;
             pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
         } else if let Some(s) = star {
             pi = s + 1;
             mark += 1;
@@ -455,6 +514,28 @@ mod tests {
         assert!(glob_match("a?c*", "abcdef"));
         assert!(!glob_match("*.rs", "main.rsx"));
         assert!(glob_match("*ůň*", "Příliš žluťoučký kůň.txt"));
+        // A star in the name itself (Linux allows it) is just a character.
+        assert!(glob_match("*.txt", "*draft.txt"));
+        assert!(glob_match("a*", "a*b"));
+    }
+
+    /// chrono panics on times beyond a quarter of a million years; tmpfs and btrfs allow them.
+    #[test]
+    fn far_off_times_show_a_question_mark() {
+        if let Some(far) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(100_000_000_000_000)) {
+            assert_eq!(format_time(far, SystemTime::now()), "?");
+        }
+        let before_1970 = SystemTime::UNIX_EPOCH - Duration::from_millis(1500);
+        assert_eq!(local_time(before_1970).map(|t| t.timestamp_millis()), Some(-1500));
+    }
+
+    #[test]
+    fn text_in_any_encoding() {
+        assert_eq!(decode_text(b"\xEF\xBB\xBFabc"), "abc");
+        assert_eq!(decode_text(&[0xFF, 0xFE, b'a', 0, 0x0D, 0x01]), "ač");
+        assert_eq!(decode_text(&[0xFE, 0xFF, 0, b'a']), "a");
+        assert_eq!(decode_text("Účty".as_bytes()), "Účty");
+        assert!(!decode_text(&[0xDA, 0xE8, b't', b'y']).is_empty(), "ANSI text reads somehow");
     }
 
     #[test]

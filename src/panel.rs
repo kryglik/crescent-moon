@@ -191,9 +191,12 @@ impl Panel {
         }
         self.entries = entries;
         self.space = platform::disk_space(&self.cwd);
-        let entries = &self.entries;
-        self.marked.retain(|name| entries.iter().any(|e| !e.is_parent && &e.name == name));
-        self.dir_sizes.retain(|name, _| entries.iter().any(|e| e.is_dir && &e.name == name));
+        // Marks and sizes of entries that are gone go too (looked up by name: a folder of
+        // 50,000 photos with all of them marked must not take seconds).
+        let names: HashSet<&str> = self.entries.iter().filter(|e| !e.is_parent).map(|e| e.name.as_str()).collect();
+        let dirs: HashSet<&str> = self.entries.iter().filter(|e| e.is_dir && !e.is_parent).map(|e| e.name.as_str()).collect();
+        self.marked.retain(|name| names.contains(name.as_str()));
+        self.dir_sizes.retain(|name, _| dirs.contains(name.as_str()));
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
         Ok(())
     }
@@ -213,12 +216,19 @@ impl Panel {
     pub fn reload(&mut self) {
         let name = self.current().map(|e| e.name.clone());
         if self.load().is_err() {
-            // The directory vanished (deleted, drive removed): climb to something that exists.
+            // The directory vanished (deleted, drive removed): climb to something that exists,
+            // starting above it. When the whole drive is gone (a share offline), each step up
+            // would wait for it again, so go home at once.
             let cwd = self.cwd.clone();
+            let drive_root = if cfg!(windows) { cwd.ancestors().last().map(Path::to_path_buf) } else { platform::mount_point(&cwd) };
+            let start = match (cwd.parent(), drive_root) {
+                (Some(parent), Some(root)) if fs::metadata(&root).is_ok() => parent.to_path_buf(),
+                _ => util::home_dir().unwrap_or_else(system_root),
+            };
             let show_hidden = self.show_hidden;
             let (sort, reverse) = (self.sort, self.reverse);
             let drive_dirs = std::mem::take(&mut self.drive_dirs);
-            *self = Panel::new(cwd, show_hidden);
+            *self = Panel::new(start, show_hidden);
             (self.sort, self.reverse) = (sort, reverse);
             for (drive, dir) in drive_dirs {
                 self.drive_dirs.entry(drive).or_insert(dir);
