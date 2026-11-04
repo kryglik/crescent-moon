@@ -55,7 +55,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
 | F2 | rename |
-| F3 / F4 / Shift+F4 | view / edit / new file (in the editor) |
+| F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
 | F5 / F6 / F7 | copy / move / make directory |
 | F8, Delete | to the Recycle Bin (Shift: permanently) |
 | F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
@@ -114,6 +114,7 @@ While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Star
 | --- | --- |
 | `RMC_EDITOR` (then `VISUAL`, `EDITOR`) | `nvim` (if missing: vim, vi, nano) |
 | `RMC_VIEWER` | the editor, plus `-R` for vim/nvim or `-v` for nano |
+| `RMC_PAGER` (then `PAGER`) | `less`, for files over 10 MB; on Windows Git for Windows' `less.exe` is found too. Without a pager, F3 asks like F4 |
 | `RMC_SHELL` | `pwsh`, then `powershell`, then `cmd`; on Linux `$SHELL` |
 | `RMC_LOG` | file to log the shell's pseudo-console traffic to, for debugging (typed input is logged as a byte count only) |
 | `RMC_TRACE` | file to log a line per frame to: what woke rmc, how long until the frame was sent, drawing time and bytes; tells a slow rmc from a slow terminal |

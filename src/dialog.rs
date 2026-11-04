@@ -15,6 +15,9 @@ use crate::util;
 pub enum ConfirmAction {
     Quit,
     Delete { paths: Vec<PathBuf>, to_trash: bool },
+    /// A big file in the editor or viewer after all.
+    Edit(PathBuf),
+    View(PathBuf),
 }
 
 /// What happens with the text of an input dialog.
@@ -211,6 +214,7 @@ pub const HELP: &[&str] = &[
     "",
     "Files",
     "  F2 rename    F3 view    F4 edit    Shift+F4 new file",
+    "               over 10 MB: F3 shows it in less, F4 asks first",
     "  F5 copy      F6 move    F7 make directory",
     "  F8, Delete               move to the Recycle Bin",
     "  Shift+F8, Shift+Delete   delete permanently",
@@ -239,6 +243,7 @@ pub const HELP: &[&str] = &[
     "  F10          quit",
     "",
     "Editor and viewer: RMC_EDITOR, RMC_VIEWER (nvim, nvim -R)",
+    "Pager for big files: RMC_PAGER, then PAGER (less)",
     "Shell: RMC_SHELL (pwsh, then powershell, then cmd; on Linux $SHELL)",
 ];
 

@@ -625,6 +625,7 @@ mod tests {
         let config = Config {
             editor: vec!["nvim".into()],
             viewer: vec!["nvim".into()],
+            pager: None,
             shell: Shell::detect(),
             hotlist_file: None,
         };

@@ -313,6 +313,10 @@ fn run_external(
     let (mut command, name) = match &external {
         External::Edit(path) => (program(&config.editor, path), config.editor[0].as_str()),
         External::View(path) => (program(&config.viewer, path), config.viewer[0].as_str()),
+        External::Page(path) => {
+            let pager = config.pager.as_deref().unwrap_or(&config.viewer);
+            (program(pager, path), pager[0].as_str())
+        }
         External::Shell => (config.shell.interactive(&cwd_file), "the shell"),
         External::Command(line) => (config.shell.command(line), "the shell"),
     };
@@ -335,7 +339,7 @@ fn run_external(
     let result = match command.status() {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Err(format!("\"{name}\" was not found.\nInstall it, or set RMC_EDITOR / RMC_VIEWER / RMC_SHELL."))
+            Err(format!("\"{name}\" was not found.\nInstall it, or set RMC_EDITOR, RMC_VIEWER, RMC_PAGER or RMC_SHELL."))
         }
         Err(e) => Err(format!("Cannot run \"{name}\":\n{e}")),
     };

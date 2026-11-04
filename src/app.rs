@@ -23,13 +23,21 @@ use crate::util;
 pub enum External {
     Edit(PathBuf),
     View(PathBuf),
+    /// A big file, shown in the pager (`less`), which reads only what is on screen.
+    Page(PathBuf),
     Shell,
     Command(String),
 }
 
+/// Files bigger than this go to the pager instead of the viewer, and the editor asks first:
+/// an editor reads the whole file into memory before showing anything.
+pub const BIG_FILE: u64 = 10 * 1024 * 1024;
+
 pub struct Config {
     pub editor: Vec<String>,
     pub viewer: Vec<String>,
+    /// For big files; None when there is no pager.
+    pub pager: Option<Vec<String>>,
     pub shell: Shell,
     pub hotlist_file: Option<PathBuf>,
 }
@@ -46,8 +54,25 @@ impl Config {
             }
             viewer
         });
-        Config { editor, viewer, shell: Shell::detect(), hotlist_file: Hotlist::default_file() }
+        let pager = env_command(&["RMC_PAGER", "PAGER"]).or_else(default_pager);
+        Config { editor, viewer, pager, shell: Shell::detect(), hotlist_file: Hotlist::default_file() }
     }
+}
+
+/// `less`; on Windows also the one that comes with Git for Windows, which isn't on the PATH.
+fn default_pager() -> Option<Vec<String>> {
+    let found = if cfg!(windows) {
+        util::find_in_path("less.exe").or_else(|| {
+            ["ProgramFiles", "ProgramW6432"]
+                .iter()
+                .filter_map(std::env::var_os)
+                .map(|dir| PathBuf::from(dir).join(r"Git\usr\bin\less.exe"))
+                .find(|path| path.is_file())
+        })
+    } else {
+        util::find_in_path("less")
+    };
+    found.map(|path| vec![path.to_string_lossy().into_owned()])
 }
 
 fn env_command(names: &[&str]) -> Option<Vec<String>> {
@@ -613,6 +638,8 @@ impl App {
         match action {
             ConfirmAction::Quit => self.quit = true,
             ConfirmAction::Delete { paths, to_trash } => self.start_job(Job::Delete { paths, to_trash }),
+            ConfirmAction::Edit(path) => self.external = Some(External::Edit(path)),
+            ConfirmAction::View(path) => self.external = Some(External::View(path)),
         }
     }
 
@@ -793,26 +820,59 @@ impl App {
             match platform::open_default(&entry.path) {
                 Ok(()) => {}
                 // A server or WSL has nothing to open files with: show the file instead.
-                Err(OpenError::NoOpener) => self.external = Some(External::View(entry.path)),
+                Err(OpenError::NoOpener) => self.view(entry.path, entry.size),
                 Err(OpenError::Failed(e)) => self.error(e),
             }
         }
     }
 
     fn view_current(&mut self) {
-        match self.active_panel().current() {
+        match self.active_panel().current().cloned() {
             Some(entry) if entry.is_dir => self.open_current(),
-            Some(entry) => self.external = Some(External::View(entry.path.clone())),
+            Some(entry) => self.view(entry.path, entry.size),
             None => {}
         }
     }
 
-    fn edit_current(&mut self) {
-        if let Some(entry) = self.active_panel().current()
-            && !entry.is_dir
-        {
-            self.external = Some(External::Edit(entry.path.clone()));
+    /// F3: the viewer, or for a big file the pager (or, without one, the viewer after asking).
+    fn view(&mut self, path: PathBuf, size: u64) {
+        if size <= BIG_FILE {
+            self.external = Some(External::View(path));
+        } else if self.config.pager.is_some() {
+            self.external = Some(External::Page(path));
+        } else {
+            self.confirm_big_file(path, size, false);
         }
+    }
+
+    fn edit_current(&mut self) {
+        let Some(entry) = self.active_panel().current().cloned() else { return };
+        if entry.is_dir {
+            return;
+        }
+        if entry.size > BIG_FILE {
+            self.confirm_big_file(entry.path, entry.size, true);
+        } else {
+            self.external = Some(External::Edit(entry.path));
+        }
+    }
+
+    /// "x.log is 250M. Open it in nvim anyway?", with No as the default answer.
+    fn confirm_big_file(&mut self, path: PathBuf, size: u64, edit: bool) {
+        let program = if edit { &self.config.editor[0] } else { &self.config.viewer[0] };
+        let program = Path::new(program).file_stem().map_or_else(|| program.clone(), |s| s.to_string_lossy().into_owned());
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        self.dialog = Some(Dialog::Confirm {
+            title: "Big file".into(),
+            lines: vec![
+                format!("{name} is {}.", util::human_size(size)),
+                format!("{program} reads all of it before it shows anything."),
+                format!("Open it in {program} anyway?"),
+            ],
+            focus: 1,
+            danger: false,
+            action: if edit { ConfirmAction::Edit(path) } else { ConfirmAction::View(path) },
+        });
     }
 
     fn start_transfer(&mut self, is_move: bool) {
@@ -1077,6 +1137,7 @@ mod tests {
         Config {
             editor: vec!["nvim".into()],
             viewer: vec!["nvim".into(), "-R".into()],
+            pager: None,
             shell: Shell::detect(),
             hotlist_file,
         }
@@ -1328,6 +1389,36 @@ mod tests {
         assert_eq!(app.external.take(), Some(External::Edit(file.clone())));
         app.on_key(key(KeyCode::F(3)));
         assert_eq!(app.external.take(), Some(External::View(file)));
+    }
+
+    #[test]
+    fn big_files_go_to_the_pager_and_the_editor_asks_first() {
+        let tmp = TempDir::new("app-big");
+        let big = tmp.path().join("huge.log");
+        fs::File::create(&big).unwrap().set_len(BIG_FILE + 1).unwrap();
+        let mut app = test_app(tmp.path(), tmp.path());
+        assert!(app.active_panel_mut().select_name("huge.log"));
+
+        // F4 asks, and Enter on the default answer (No) leaves it alone.
+        app.on_key(key(KeyCode::F(4)));
+        assert!(matches!(app.dialog, Some(Dialog::Confirm { focus: 1, .. })));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.external, None);
+        // Y opens it after all.
+        app.on_key(key(KeyCode::F(4)));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.external.take(), Some(External::Edit(big.clone())));
+
+        // F3 shows it in the pager; without a pager it asks too.
+        app.config.pager = Some(vec!["less".into()]);
+        app.on_key(key(KeyCode::F(3)));
+        assert_eq!(app.external.take(), Some(External::Page(big.clone())));
+        app.config.pager = None;
+        app.on_key(key(KeyCode::F(3)));
+        assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.external.take(), Some(External::View(big)));
     }
 
     #[test]

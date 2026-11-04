@@ -233,7 +233,13 @@ mod tests {
     const H: u16 = 20;
 
     fn app(dir: &Path) -> App {
-        let config = Config { editor: vec!["nvim".into()], viewer: vec!["nvim".into()], shell: Shell::detect(), hotlist_file: None };
+        let config = Config {
+            editor: vec!["nvim".into()],
+            viewer: vec!["nvim".into()],
+            pager: None,
+            shell: Shell::detect(),
+            hotlist_file: None,
+        };
         let mut app = App::new(dir.to_path_buf(), dir.to_path_buf(), config);
         draw(&mut app);
         app
