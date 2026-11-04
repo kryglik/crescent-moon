@@ -273,12 +273,15 @@ fn draw_panel(
 ) -> (Option<Position>, PanelHit) {
     let base = panel_style();
     let inner_w = area.width.saturating_sub(2) as usize;
-    let path = util::fit_left(&panel.cwd.display().to_string(), inner_w.saturating_sub(4));
+    // The filter (Ctrl+F) after the path, so hidden files are never a mystery.
+    let filter = panel.filter.as_deref().map(|f| format!("[{f}] ")).unwrap_or_default();
+    let path = util::fit_left(&panel.cwd.display().to_string(), inner_w.saturating_sub(4 + util::width(&filter)));
     let title_style = if active { cursor_style() } else { base };
-    let mut block = Block::bordered()
-        .border_style(base)
-        .style(base)
-        .title(Line::from(Span::styled(format!(" {path} "), title_style)));
+    let mut title = vec![Span::styled(format!(" {path} "), title_style)];
+    if !filter.is_empty() {
+        title.push(Span::styled(filter, base.fg(Color::Yellow)));
+    }
+    let mut block = Block::bordered().border_style(base).style(base).title(Line::from(title));
     if let Some((free, total)) = panel.space {
         let percent = free.saturating_mul(100) / total.max(1);
         let text = format!(" {} / {} ({percent}%) ", util::human_size(free), util::human_size(total));

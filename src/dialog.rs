@@ -31,6 +31,8 @@ pub enum InputAction {
     NewFile,
     Select,
     Unselect,
+    /// Ctrl+F: the active panel's file filter.
+    Filter,
 }
 
 pub enum Dialog {
@@ -239,8 +241,12 @@ pub const HELP: &[&str] = &[
     "  Alt+Left/Right   back / forward through folders (or Alt+Y/U)",
     "  Alt+H, Alt+Down  folder history: type to narrow, Enter goes",
     "  Ctrl+Space   size of the directory (on '..': all of them)",
+    "  Left/Right   up / into a folder (with an empty command line)",
+    "  Ctrl+PgUp/PgDn   up / into a folder",
     "  Insert, Shift+Up/Down   mark files",
     "  + - *        mark by pattern, unmark by pattern, invert",
+    "  Ctrl+A       mark everything",
+    "  Ctrl+F       filter: only files matching *.jpg *.cr2, !*.tmp…",
     "  Ctrl+S, Alt+S   quick search by name (again: next match)",
     "  Alt+F7, Alt+?   find text in files below (regex, like ag)",
     "  F9           sort by name, extension, size or time;",

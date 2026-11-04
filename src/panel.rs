@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::find::NameFilter;
 use crate::{platform, util};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +125,9 @@ pub struct Panel {
     /// The other way round: Z to A, smallest or oldest first. Directories stay on top.
     pub reverse: bool,
     pub show_hidden: bool,
+    /// Ctrl+F: only files matching this are listed (`*.jpg *.cr2`, `!*.tmp`, or part of a
+    /// name; see `find::NameFilter`). Folders are always listed.
+    pub filter: Option<String>,
     /// Visible list rows, updated on every draw (used for PgUp/PgDn).
     pub page: usize,
     pub space: Option<(u64, u64)>,
@@ -150,6 +154,7 @@ impl Panel {
             sort: SortBy::Name,
             reverse: false,
             show_hidden,
+            filter: None,
             page: 20,
             space: None,
             drive_dirs: HashMap::new(),
@@ -191,7 +196,8 @@ impl Panel {
 
     /// Re-reads the directory. Marks of entries that still exist are kept.
     pub fn load(&mut self) -> io::Result<()> {
-        let mut entries = read_entries(&self.cwd, self.show_hidden)?;
+        let filter = self.filter.as_deref().map(NameFilter::parse);
+        let mut entries = read_entries(&self.cwd, self.show_hidden, filter.as_ref())?;
         sort_entries(&mut entries, self.sort, self.reverse, &self.dir_sizes);
         // On Windows a drive root gets ".." too: it opens the drive picker.
         if self.cwd.parent().is_some() || cfg!(windows) {
@@ -234,12 +240,12 @@ impl Panel {
                 _ => util::home_dir().unwrap_or_else(system_root),
             };
             let show_hidden = self.show_hidden;
-            let (sort, reverse) = (self.sort, self.reverse);
+            let (sort, reverse, filter) = (self.sort, self.reverse, self.filter.take());
             let drive_dirs = std::mem::take(&mut self.drive_dirs);
             let (mut back, forward) = (std::mem::take(&mut self.back), std::mem::take(&mut self.forward));
             back.push(cwd);
             *self = Panel::new(start, show_hidden);
-            (self.sort, self.reverse, self.back, self.forward) = (sort, reverse, back, forward);
+            (self.sort, self.reverse, self.back, self.forward, self.filter) = (sort, reverse, back, forward, filter);
             for (drive, dir) in drive_dirs {
                 self.drive_dirs.entry(drive).or_insert(dir);
             }
@@ -414,6 +420,12 @@ impl Panel {
         names.len()
     }
 
+    /// Ctrl+A: everything marked, files and folders.
+    pub fn mark_all(&mut self) {
+        let names: Vec<String> = self.entries.iter().filter(|e| !e.is_parent).map(|e| e.name.clone()).collect();
+        self.marked.extend(names);
+    }
+
     /// Inverts the marks on files, like mc's *.
     pub fn invert_marks(&mut self) {
         for entry in self.entries.iter().filter(|e| !e.is_parent && !e.is_dir) {
@@ -507,7 +519,7 @@ fn effective_size(entry: &Entry, sizes: &HashMap<String, DirSize>) -> u64 {
     sizes.get(&entry.name).filter(|s| s.done).map_or(0, |s| s.bytes)
 }
 
-fn read_entries(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     // On a Windows drive in WSL every file looks executable.
     let exec_bits = platform::exec_bits_mean_something(dir);
@@ -524,6 +536,9 @@ fn read_entries(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
         let target = if is_link { fs::metadata(&path).ok() } else { None };
         let meta = target.as_ref().or(own.as_ref());
         let is_dir = meta.is_some_and(|m| m.is_dir());
+        if !is_dir && filter.is_some_and(|f| !f.matches(&name)) {
+            continue;
+        }
         out.push(Entry {
             sort_name: name.to_lowercase(),
             is_exec: !is_dir && exec_bits && platform::is_executable(&name, meta),

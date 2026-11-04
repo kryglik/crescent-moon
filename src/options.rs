@@ -9,6 +9,7 @@ pub enum Row {
     ConfirmQuit,
     ShowHidden,
     Mouse,
+    Arrows,
     BigFile,
     Editor,
     Viewer,
@@ -16,8 +17,17 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 8] =
-    [Row::ConfirmQuit, Row::ShowHidden, Row::Mouse, Row::BigFile, Row::Editor, Row::Viewer, Row::Pager, Row::Shell];
+pub const ROWS: [Row; 9] = [
+    Row::ConfirmQuit,
+    Row::ShowHidden,
+    Row::Mouse,
+    Row::Arrows,
+    Row::BigFile,
+    Row::Editor,
+    Row::Viewer,
+    Row::Pager,
+    Row::Shell,
+];
 
 impl Row {
     pub fn label(self) -> &'static str {
@@ -25,6 +35,7 @@ impl Row {
             Row::ConfirmQuit => "Ask before quitting (F10)",
             Row::ShowHidden => "Show hidden files",
             Row::Mouse => "Mouse",
+            Row::Arrows => "Left/Right go up and into folders",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
             Row::Viewer => "Viewer (F3)",
@@ -35,7 +46,7 @@ impl Row {
 
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
-        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse)
+        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows)
     }
 
     pub fn flag(self, settings: &Settings) -> bool {
@@ -43,6 +54,7 @@ impl Row {
             Row::ConfirmQuit => settings.confirm_quit,
             Row::ShowHidden => settings.show_hidden,
             Row::Mouse => settings.mouse,
+            Row::Arrows => settings.arrows_navigate,
             _ => false,
         }
     }
@@ -52,6 +64,7 @@ impl Row {
             Row::ConfirmQuit => settings.confirm_quit = !settings.confirm_quit,
             Row::ShowHidden => settings.show_hidden = !settings.show_hidden,
             Row::Mouse => settings.mouse = !settings.mouse,
+            Row::Arrows => settings.arrows_navigate = !settings.arrows_navigate,
             _ => {}
         }
     }

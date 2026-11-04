@@ -58,7 +58,11 @@ Press **F1** inside rmc for the full list. The essentials:
 | Alt+Left / Alt+Right | back / forward through the folders the panel was in, as in a browser (mc's Alt+Y / Alt+U too); `cd -` goes back |
 | Alt+H or Alt+Down | folder history: the folders visited lately, newest first, kept between sessions; type part of a path to narrow it, Enter goes there, Del forgets one |
 | Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
+| Left / Right | with an empty command line: up to the parent folder / into the folder under the cursor, as mc's "Lynx-like motion" (an option, on by default) |
+| Ctrl+PgUp / Ctrl+PgDn | up / into a folder, as in Total Commander and Far |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
+| Ctrl+A | mark everything (with an empty command line) |
+| Ctrl+F | filter the panel: only files matching `*.jpg *.cr2`, or not `!*.tmp`, or containing a word; folders stay. The panel's title shows it until Ctrl+F empties it |
 | F2 | rename |
 | Shift+F2 | compare the two folders (as in Total Commander): marks on each side the files and folders the other side lacks or has an older copy of (same time but another size counts too), so F5 brings the other side up to date |
 | Ctrl+Q | quick view (as in Total Commander and Far): the other panel shows what is under the cursor, read in the background: the start of a text file (UTF-8 or UTF-16), a hex dump of a binary one, a picture's format and size (PNG, JPEG, GIF, BMP, WebP), a folder's contents. Tab goes into it to scroll (arrows, pages), the wheel scrolls it too |
@@ -164,6 +168,7 @@ text row (it counts when you move off it). Everything takes effect at once and i
 | Ask before quitting (F10) | off: F10 quits at once, unless the shell is still running a command |
 | Show hidden files | on (Ctrl+H or Alt+. toggles it for the session) |
 | Mouse | on (`--no-mouse` turns it off for one run) |
+| Left/Right go up and into folders | on: with an empty command line, Left is the parent folder and Right the folder under the cursor |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
 

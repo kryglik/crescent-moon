@@ -475,6 +475,12 @@ impl App {
             }
             KeyCode::Up => self.active_panel_mut().move_by(-1),
             KeyCode::Down => self.active_panel_mut().move_by(1),
+            // Up a folder and into one: Ctrl+PgUp/PgDn as in Total Commander and Far, and with
+            // an empty command line Left/Right as mc's "Lynx-like motion" (an option).
+            KeyCode::PageUp if ctrl => self.go_up(),
+            KeyCode::PageDown if ctrl => self.enter_current_dir(),
+            KeyCode::Left if cmd_empty && plain && self.config.settings.arrows_navigate => self.go_up(),
+            KeyCode::Right if cmd_empty && plain && self.config.settings.arrows_navigate => self.enter_current_dir(),
             KeyCode::PageUp => self.active_panel_mut().page_up(),
             KeyCode::PageDown => self.active_panel_mut().page_down(),
             KeyCode::Home => self.active_panel_mut().home(),
@@ -521,6 +527,11 @@ impl App {
                 self.start_input("Unselect", "Unmark files matching:", "*", InputAction::Unselect)
             }
             KeyCode::Char('*') if cmd_empty && plain => self.active_panel_mut().invert_marks(),
+            KeyCode::Char('a') if ctrl && !alt && cmd_empty => self.active_panel_mut().mark_all(),
+            KeyCode::Char('f') if ctrl && !alt => {
+                let current = self.active_panel().filter.clone().unwrap_or_default();
+                self.start_input("Filter", "Show only files matching (empty shows all):", &current, InputAction::Filter);
+            }
             _ => {
                 self.cmdline.handle_key(&key);
             }
@@ -1103,6 +1114,15 @@ impl App {
             InputAction::Unselect => {
                 self.active_panel_mut().mark_matching(&text, false);
             }
+            InputAction::Filter => {
+                let text = text.trim();
+                let panel = self.active_panel_mut();
+                panel.filter = (!text.is_empty() && text != "*").then(|| text.to_string());
+                panel.reload();
+                if let Some(filter) = &panel.filter {
+                    self.notice = Some(format!("Only files matching {filter} are shown (Ctrl+F changes it)"));
+                }
+            }
         }
     }
 
@@ -1418,6 +1438,18 @@ impl App {
             }
         }
         Some(Dialog::History { filter, cursor })
+    }
+
+    /// Into the folder under the cursor (on `..`, up); nothing on a file.
+    fn enter_current_dir(&mut self) {
+        match self.active_panel().current() {
+            Some(entry) if entry.is_parent => self.go_up(),
+            Some(entry) if entry.is_dir => {
+                let path = entry.path.clone();
+                self.change_dir(self.active, path);
+            }
+            _ => {}
+        }
     }
 
     fn go_up(&mut self) {
@@ -1981,6 +2013,50 @@ mod tests {
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("No files")));
     }
 
+    /// Ctrl+F shows only matching files (folders stay); Ctrl+A marks all; Left/Right go up and
+    /// into folders; Ctrl+PgUp/PgDn too.
+    #[test]
+    fn filter_mark_all_and_arrow_navigation() {
+        let tmp = TempDir::new("app-filter");
+        tmp.dir("sub");
+        tmp.file("a.jpg", "a");
+        tmp.file("b.cr2", "b");
+        tmp.file("c.jpg", "c");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(ctrl('f'));
+        typing(&mut app, "*.jpg");
+        app.on_key(key(KeyCode::Enter));
+        let names: Vec<String> = app.active_panel().entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["..", "sub", "a.jpg", "c.jpg"]);
+        app.on_key(ctrl('a'));
+        assert_eq!(app.active_panel().marked.len(), 3, "sub, a.jpg and c.jpg");
+        app.active_panel_mut().clear_marks();
+
+        app.active_panel_mut().select_name("sub");
+        app.on_key(key(KeyCode::Right));
+        assert!(app.active_panel().cwd.ends_with("sub"));
+        assert_eq!(app.active_panel().filter.as_deref(), Some("*.jpg"), "the filter stays");
+        app.on_key(key(KeyCode::Left));
+        assert!(util::same_path(&app.active_panel().cwd, tmp.path()));
+        assert_eq!(app.active_panel().current().unwrap().name, "sub", "back on the folder it came from");
+        app.on_key(with_mods(KeyCode::PageDown, KeyModifiers::CONTROL));
+        assert!(app.active_panel().cwd.ends_with("sub"));
+        app.on_key(with_mods(KeyCode::PageUp, KeyModifiers::CONTROL));
+        assert!(util::same_path(&app.active_panel().cwd, tmp.path()));
+
+        // An empty filter shows everything again; with text on the command line the arrows
+        // move in it.
+        app.on_key(ctrl('f'));
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.active_panel().entries.len(), 5);
+        typing(&mut app, "ls");
+        app.on_key(key(KeyCode::Left));
+        assert!(util::same_path(&app.active_panel().cwd, tmp.path()));
+        assert_eq!(app.cmdline.text(), "ls");
+    }
+
     /// Enter on a Windows shortcut to a folder opens the folder in the panel.
     #[test]
     fn a_shortcut_to_a_folder_opens_it() {
@@ -2334,6 +2410,9 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.mouse);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.arrows_navigate);
 
         // Text rows: type, and it counts when the cursor moves on.
         app.on_key(key(KeyCode::Down));
