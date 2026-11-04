@@ -19,6 +19,7 @@ mod survey;
 mod testutil;
 mod ui;
 mod util;
+mod watch;
 
 use std::fs;
 use std::io::{self, Write};
@@ -180,9 +181,11 @@ fn main() -> ExitCode {
         ratatui::restore();
         previous_hook(info);
     }));
+    let title = SavedTitle::save();
     let result = init_terminal().and_then(|mut terminal| run(&mut terminal, &mut app));
     Mouse(app.mouse).release();
     ratatui::restore();
+    title.restore();
 
     if let Some(file) = args.cwd_file {
         let _ = std::fs::write(file, app.active_panel().cwd.to_string_lossy().as_bytes());
@@ -192,6 +195,40 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("rmc: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// The window title from before rmc, put back on exit (rmc names the active folder in it).
+/// Windows has it as the console's title; other terminals keep a stack of titles.
+struct SavedTitle(#[cfg_attr(not(windows), allow(dead_code))] Option<String>);
+
+impl SavedTitle {
+    fn save() -> SavedTitle {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::GetConsoleTitleW;
+            let mut buf = vec![0u16; 2048];
+            let n = unsafe { GetConsoleTitleW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            SavedTitle((n > 0).then(|| String::from_utf16_lossy(&buf[..n.min(buf.len())])))
+        }
+        #[cfg(not(windows))]
+        {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[22;0t").and_then(|()| out.flush());
+            SavedTitle(None)
+        }
+    }
+
+    fn restore(self) {
+        #[cfg(windows)]
+        if let Some(title) = self.0 {
+            let _ = execute!(io::stdout(), terminal::SetTitle(title));
+        }
+        #[cfg(not(windows))]
+        {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[23;0t").and_then(|()| out.flush());
         }
     }
 }
@@ -253,7 +290,14 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
     let mut events = String::new();
     let mut woke = None;
     let mut dirty = true;
+    let mut title = String::new();
     while !app.quit {
+        // The window (or tab) title names the active panel's folder.
+        let wanted = window_title(app);
+        if wanted != title {
+            let _ = execute!(io::stdout(), terminal::SetTitle(&wanted));
+            title = wanted;
+        }
         // Draw only when something changed: every frame re-sends the cursor, which keeps it
         // from blinking (and makes the shell's screen flicker), and is work for the terminal.
         let shell_changed = app.subshell.as_ref().is_some_and(|s| s.take_changed() || s.starting_for().is_some());
@@ -268,6 +312,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         let timeout = Duration::from_millis(match () {
             _ if app.shell_shown => 10,
             _ if app.is_busy() => 50,
+            _ if app.wake_soon() => 100,
             _ => 500,
         });
         if event::poll(timeout)? {
@@ -309,9 +354,18 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             let (result, shell_cwd) = run_external(terminal, app, external, mouse)?;
             app.after_external(result, shell_cwd);
             dirty = true;
+            // The program may have set a title of its own.
+            title.clear();
         }
     }
     Ok(())
+}
+
+/// "photos - rmc": the active panel's folder (the whole path for a drive root).
+fn window_title(app: &App) -> String {
+    let cwd = &app.active_panel().cwd;
+    let name = cwd.file_name().map_or_else(|| cwd.display().to_string(), |n| n.to_string_lossy().into_owned());
+    format!("{name} - rmc")
 }
 
 /// Hands the terminal to an editor, viewer, shell or command, then takes it back.

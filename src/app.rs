@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -22,6 +22,7 @@ use crate::sizes::Sizer;
 use crate::subshell::Subshell;
 use crate::survey::{Survey, Tally};
 use crate::util;
+use crate::watch::Watch;
 
 /// Something to run outside the TUI; the main loop gives it the terminal.
 #[derive(Debug, PartialEq)]
@@ -189,6 +190,8 @@ pub struct App {
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
     history: Vec<String>,
     history_pos: Option<usize>,
+    /// Each panel's folder, watched for changes other programs make (see `watch`).
+    watches: [Option<Watch>; 2],
 }
 
 impl App {
@@ -218,7 +221,33 @@ impl App {
             drive_space: None,
             history: Vec::new(),
             history_pos: None,
+            watches: [None, None],
         }
+    }
+
+    /// Something will need a look soon (a folder changed and is settling), so the main loop
+    /// should wake up sooner than when idle.
+    pub fn wake_soon(&self) -> bool {
+        self.watches.iter().flatten().any(Watch::pending)
+    }
+
+    /// Reloads a panel whose folder another program changed. Not while a job runs or the
+    /// shell is shown: both reload the panels when they end.
+    fn follow_changes(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+        for side in 0..2 {
+            let cwd = &self.panels[side].cwd;
+            if self.watches[side].as_ref().is_none_or(|w| w.dir != *cwd) {
+                self.watches[side] = Some(Watch::new(cwd));
+            }
+            let due = self.watches[side].as_mut().is_some_and(|w| w.due(now));
+            if due && self.job.is_none() && !self.shell_shown {
+                self.panels[side].reload();
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Whether background work is running (the main loop then redraws more often).
@@ -976,6 +1005,7 @@ impl App {
         if let Some(finder) = &mut self.finder {
             changed |= finder.tick();
         }
+        changed |= self.follow_changes();
         self.tick_job() || changed
     }
 
@@ -1440,6 +1470,30 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         with_mods(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// A file another program creates shows up in the panel by itself, with the cursor and
+    /// the marks where they were.
+    #[test]
+    fn panels_follow_changes_made_by_other_programs() {
+        let tmp = TempDir::new("app-watch");
+        tmp.file("a.txt", "a");
+        tmp.file("b.txt", "b");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("b.txt");
+        app.active_panel_mut().toggle_mark();
+        app.tick();
+        let names = |app: &App| app.panels[0].entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        tmp.file("new.txt", "n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !names(&app).contains(&"new.txt".to_string()) {
+            assert!(Instant::now() < deadline, "the new file never showed up: {:?}", names(&app));
+            std::thread::sleep(Duration::from_millis(20));
+            app.tick();
+        }
+        assert!(names(&app).contains(&"new.txt".to_string()) && app.panels[1].entries.iter().any(|e| e.name == "new.txt"));
+        assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
+        assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
     }
 
     #[test]
