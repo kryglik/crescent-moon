@@ -71,6 +71,14 @@ impl App {
         if !wanted {
             return;
         }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some((at, place)) = self.closing_click.take()
+            && place == pos
+            && at.elapsed() < DOUBLE_CLICK
+            && self.dialog.is_none()
+        {
+            return;
+        }
         if self.shell_shown {
             // The wheel scrolls back through the shell's output.
             if let Some(shell) = &self.subshell {
@@ -186,6 +194,13 @@ impl App {
     }
 
     fn on_dialog_mouse(&mut self, kind: MouseEventKind, pos: Position) {
+        self.dialog_mouse_action(kind, pos);
+        if kind == MouseEventKind::Down(MouseButton::Left) && self.dialog.is_none() {
+            self.closing_click = Some((Instant::now(), pos));
+        }
+    }
+
+    fn dialog_mouse_action(&mut self, kind: MouseEventKind, pos: Position) {
         let Some(hit) = &self.hit.dialog else { return };
         let action = match kind {
             MouseEventKind::ScrollUp => DialogAction::Keys(KeyCode::Up, WHEEL_STEP as usize),
@@ -368,6 +383,26 @@ mod tests {
         assert!(matches!(app.dialog, Some(Dialog::Input { .. })));
         click(&mut app, 0, 0);
         assert!(app.dialog.is_some());
+    }
+
+    /// Double-clicking a menu row picks it with the first click; the second one must not
+    /// land on the panel that was under the menu.
+    #[test]
+    fn a_double_click_on_a_menu_row_stays_in_the_menu() {
+        let tmp = sample();
+        let mut app = app(tmp.path());
+        assert_eq!(app.active, 0);
+        app.on_key(KeyEvent::from(KeyCode::F(9)));
+        draw(&mut app);
+        let (rows, _) = app.hit.dialog.as_ref().unwrap().rows.unwrap();
+        // The right end of the "Size" row, over the right panel.
+        let (x, y) = (rows.right() - 2, rows.y + 2);
+        assert!(app.hit.panels[1].area.contains(Position::new(x, y)));
+        click(&mut app, x, y);
+        assert!(app.dialog.is_none());
+        click(&mut app, x, y);
+        assert_eq!(app.active, 0, "the second click was dropped");
+        assert_eq!(app.panels[0].sort, SortBy::Size);
     }
 
     #[test]

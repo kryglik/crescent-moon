@@ -494,7 +494,21 @@ mod win {
 }
 
 #[cfg(not(windows))]
-pub use unix::{delete_denied, delete_privileged, disk_space, drives, init, mount_point, open_default, same_device};
+pub use unix::{
+    delete_denied, delete_privileged, disk_space, drives, exec_bits_mean_something, init, mount_point, open_default,
+    runs_as_program, same_device,
+};
+
+/// On Windows a program is known by its extension (see `is_executable`).
+#[cfg(windows)]
+pub fn exec_bits_mean_something(_dir: &Path) -> bool {
+    true
+}
+
+#[cfg(windows)]
+pub fn runs_as_program(_path: &Path) -> bool {
+    true
+}
 
 #[cfg(not(windows))]
 mod unix {
@@ -578,11 +592,30 @@ mod unix {
 
     /// The mount point that holds `path`: the longest one it is inside.
     pub fn mount_point(path: &Path) -> Option<PathBuf> {
-        mounts()
-            .into_iter()
-            .map(|m| m.dir)
-            .filter(|dir| util::is_inside(path, dir))
-            .max_by_key(|dir| dir.components().count())
+        mount_of(path).map(|m| m.dir)
+    }
+
+    fn mount_of(path: &Path) -> Option<Mount> {
+        mounts().into_iter().filter(|m| util::is_inside(path, &m.dir)).max_by_key(|m| m.dir.components().count())
+    }
+
+    /// Whether execute bits mean anything on the file system holding `dir`. WSL's Windows
+    /// drives, FAT, exFAT and NTFS disks and SMB shares show every file as executable.
+    pub fn exec_bits_mean_something(dir: &Path) -> bool {
+        let Some(mount) = mount_of(dir) else { return true };
+        let windows_like = ["9p", "drvfs", "vfat", "msdos", "exfat", "ntfs", "ntfs3", "fuseblk", "cifs", "smb3", "smbfs"];
+        !windows_like.contains(&mount.fstype.as_str()) && !mount.fstype.starts_with("fuse.ntfs")
+    }
+
+    /// Whether the system can run the file as a program: a script (`#!`) or a binary (ELF;
+    /// in WSL a Windows .exe too). A text file or a document with execute bits isn't one:
+    /// bash would run its lines as commands.
+    pub fn runs_as_program(path: &Path) -> bool {
+        use std::io::Read;
+        let mut head = [0u8; 4];
+        let n = std::fs::File::open(path).and_then(|mut file| file.read(&mut head)).unwrap_or(0);
+        let head = &head[..n];
+        head.starts_with(b"#!") || head.starts_with(b"\x7fELF") || (is_wsl() && head.starts_with(b"MZ"))
     }
 
     /// Whether two paths live on one file system (so a move is a rename). A path that doesn't
@@ -694,6 +727,23 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Enter runs a file only if it is a program; on a Windows drive in WSL every file has
+        /// execute bits, and bash would run a text file's lines.
+        #[test]
+        fn only_real_programs_run() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = crate::testutil::TempDir::new("programs");
+            for (name, text, runs) in [("notes.txt", "echo hi\n", false), ("script", "#!/bin/sh\necho hi\n", true)] {
+                let path = tmp.file(name, text);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(runs_as_program(&path), runs, "{name}");
+            }
+            assert!(exec_bits_mean_something(tmp.path()), "the temp folder is a Linux file system");
+            if mount_of(Path::new("/mnt/c")).is_some_and(|m| m.fstype == "9p" || m.fstype == "drvfs") {
+                assert!(!exec_bits_mean_something(Path::new("/mnt/c/Windows")));
+            }
+        }
 
         #[test]
         fn mount_fields_are_unescaped() {
@@ -955,6 +1005,11 @@ impl Shell {
             return Self::from_program(custom.trim());
         }
         Self::default_shell()
+    }
+
+    /// bash, zsh, sh and the like: `\` escapes, `'…'` has no escapes inside.
+    pub fn is_posix(&self) -> bool {
+        matches!(self, Shell::Posix(_))
     }
 
     /// What the options editor shows for it.

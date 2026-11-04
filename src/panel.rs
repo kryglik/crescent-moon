@@ -460,6 +460,8 @@ fn effective_size(entry: &Entry, sizes: &HashMap<String, DirSize>) -> u64 {
 
 fn read_entries(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     let mut out = Vec::new();
+    // On a Windows drive in WSL every file looks executable.
+    let exec_bits = platform::exec_bits_mean_something(dir);
     for item in fs::read_dir(dir)? {
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
@@ -475,7 +477,7 @@ fn read_entries(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
         let is_dir = meta.is_some_and(|m| m.is_dir());
         out.push(Entry {
             sort_name: name.to_lowercase(),
-            is_exec: !is_dir && platform::is_executable(&name, meta),
+            is_exec: !is_dir && exec_bits && platform::is_executable(&name, meta),
             size: if is_dir { 0 } else { meta.map_or(0, |m| m.len()) },
             modified: meta.and_then(|m| m.modified().ok()),
             name,

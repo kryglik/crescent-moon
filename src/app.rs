@@ -72,7 +72,10 @@ impl Config {
         let auto = Automatic::detect();
         let chosen = |value: &str| (!value.trim().is_empty()).then(|| parse_command(value));
         let editor = chosen(&settings.editor).unwrap_or(auto.editor);
-        let viewer = chosen(&settings.viewer).unwrap_or_else(|| viewer_for(&editor));
+        // RMC_VIEWER counts when the option is empty; otherwise the editor, read-only.
+        let viewer = chosen(&settings.viewer)
+            .or_else(|| env_command(&["RMC_VIEWER"]))
+            .unwrap_or_else(|| viewer_for(&editor));
         let pager = chosen(&settings.pager).or(auto.pager);
         let shell = if settings.shell.trim().is_empty() { auto.shell } else { Shell::from_program(settings.shell.trim()) };
         Config { editor, viewer, pager, shell, big_file: settings.big_file_bytes(), hotlist_file, settings_file, settings }
@@ -175,6 +178,9 @@ pub struct App {
     /// Screen areas from the last frame, for the mouse.
     pub hit: HitAreas,
     pub(crate) last_click: Option<LastClick>,
+    /// When and where a click closed a dialog (picking a drive, say): the second click of a
+    /// double-click there mustn't land on the panel that was under it.
+    pub(crate) closing_click: Option<(Instant, ratatui::layout::Position)>,
     /// The "how to get back" line has been shown for the one-off Ctrl+O shell.
     pub shell_hint_shown: bool,
     /// The persistent shell, started by the first Ctrl+O (or command typed in rmc).
@@ -185,6 +191,8 @@ pub struct App {
     pub screen_size: (u16, u16),
     /// Mouse capture wanted (the options editor can change it; the main loop applies it).
     pub mouse: bool,
+    /// False with `--no-mouse`, which holds for the whole run, whatever the options say.
+    pub mouse_allowed: bool,
     /// Alt+F7, kept when closed so it comes back as it was.
     pub finder: Option<Finder>,
     pub find_shown: bool,
@@ -202,6 +210,7 @@ impl App {
         let show_hidden = config.settings.show_hidden;
         App {
             mouse: config.settings.mouse,
+            mouse_allowed: true,
             finder: None,
             find_shown: false,
             panels: [Panel::new(left, show_hidden), Panel::new(right, show_hidden)],
@@ -216,6 +225,7 @@ impl App {
             quit: false,
             hit: HitAreas::default(),
             last_click: None,
+            closing_click: None,
             shell_hint_shown: false,
             subshell: None,
             shell_shown: false,
@@ -839,7 +849,7 @@ impl App {
                 panel.reload();
             }
         }
-        self.mouse = settings.mouse;
+        self.mouse = settings.mouse && self.mouse_allowed;
         let (hotlist_file, settings_file) = (self.config.hotlist_file.take(), self.config.settings_file.take());
         self.config = Config::new(settings, hotlist_file, settings_file);
     }
@@ -1067,7 +1077,10 @@ impl App {
         }
         self.job = None;
         for panel in &mut self.panels {
-            panel.clear_marks();
+            // Done: the marks have served. Stopped or partly failed: they stay, to try again.
+            if errors.is_empty() && !cancelled {
+                panel.clear_marks();
+            }
             // Sizes may be out of date after copying, moving or deleting.
             panel.dir_sizes.clear();
             panel.reload();
@@ -1145,7 +1158,7 @@ impl App {
             self.go_up();
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
-        } else if entry.is_exec {
+        } else if entry.is_exec && platform::runs_as_program(&entry.path) {
             self.run_in_shell(self.shell().run_file_line(&entry.path));
         } else {
             match platform::open_default(&entry.path) {
@@ -1255,6 +1268,11 @@ impl App {
             return;
         }
         let target = util::resolve(cwd, input);
+        if target.exists() {
+            self.error(format!("\"{}\" already exists.", target.display()));
+            self.select_in_active(&target);
+            return;
+        }
         if let Err(e) = fs::create_dir_all(&target) {
             self.error(format!("Cannot create \"{}\":\n{e}", target.display()));
             return;
@@ -1333,20 +1351,25 @@ impl App {
         if self.history.last() != Some(&line) {
             self.history.push(line.clone());
         }
-        match cd_argument(&line) {
-            Some(arg) => {
+        // The folder as the shell would read it (quotes, variables): Ctrl+Enter inserts names
+        // quoted for the shell, so `cd 'Účty a faktury'` must work.
+        let posix = self.shell().is_posix();
+        match cd_argument(&line).map(|arg| util::shell_word(arg, posix)) {
+            Some(Some(arg)) => {
                 let panel = self.active_panel();
                 let cwd = panel.cwd.clone();
-                let target = match util::bare_drive(arg) {
+                let target = match util::bare_drive(&arg) {
                     // "cd e:" returns to where this panel was on E: (and stays put when already there).
                     Some(root) if util::same_volume(&root, &cwd) => return,
                     Some(root) => panel.dir_on_drive(&root),
                     None if arg.is_empty() => util::home_dir().unwrap_or(cwd),
-                    None => util::resolve(&cwd, arg),
+                    None => util::resolve(&cwd, &arg),
                 };
                 self.change_dir(self.active, target);
             }
-            None => self.run_in_shell(line),
+            // Any other command, and a cd only the shell can read (a variable set in it,
+            // `cd $(…)`): the shell runs it, and the panel follows when the panels come back.
+            _ => self.run_in_shell(line),
         }
     }
 
@@ -1533,6 +1556,25 @@ mod tests {
         assert!(names(&app).contains(&"new.txt".to_string()) && app.panels[1].entries.iter().any(|e| e.name == "new.txt"));
         assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
         assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
+    }
+
+    /// `cd` reads quotes as the shell does (Ctrl+Enter inserts names quoted that way), and
+    /// F7 on a name that exists says so.
+    #[test]
+    fn cd_with_quotes_and_mkdir_of_an_existing_folder() {
+        let tmp = TempDir::new("app-cd-quotes");
+        let target = tmp.dir("Účty a faktury");
+        let mut app = test_app(tmp.path(), tmp.path());
+        let quoted = app.shell().quote("Účty a faktury");
+        typing(&mut app, &format!("cd {quoted}"));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none(), "{:?}", app.dialog.as_ref().map(|_| "a dialog"));
+        assert!(util::same_path(&app.active_panel().cwd, &target));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::F(7)));
+        typing(&mut app, "Účty a faktury");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.dialog, Some(Dialog::Message { lines, .. }) if lines[0].contains("already exists")));
     }
 
     /// With Caps Lock on, Windows reports Ctrl+D as Ctrl with a capital D: it still works.

@@ -173,6 +173,7 @@ fn main() -> ExitCode {
     let right = dirs.get(1).cloned().unwrap_or_else(|| left.clone());
     let mut app = App::new(left, right, Config::load());
     app.mouse &= args.mouse;
+    app.mouse_allowed = args.mouse;
 
     // A panic must not leave the terminal in raw mode, or reporting mouse movements as text.
     // One on a background thread (a job, a search) ends only that work while the screen goes

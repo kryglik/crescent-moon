@@ -355,6 +355,88 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     pi == p.len()
 }
 
+/// One word of a command line as the shell would read it: quotes taken off (PowerShell's
+/// `''` inside single quotes is one quote; bash's `'\''` joins up), escapes (`\` in a POSIX
+/// shell, `` ` `` in PowerShell), and environment variables filled in: `$NAME`, `${NAME}`,
+/// `$env:NAME`, `%NAME%`. None when only the shell could read it: a variable that isn't in
+/// the environment (one set in the shell), a command substitution, an unclosed quote.
+pub fn shell_word(word: &str, posix: bool) -> Option<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let (c, next) = (chars[i], chars.get(i + 1).copied());
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('\''), '\'') if !posix && next == Some('\'') => {
+                out.push('\'');
+                i += 1;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), c) => out.push(c),
+            // Command substitution: only the shell knows.
+            (_, '$') if next == Some('(') => return None,
+            (_, '`') if posix => return None,
+            (_, '`') if !posix => {
+                out.push(next?);
+                i += 1;
+            }
+            (None, '\\') if posix => {
+                out.push(next?);
+                i += 1;
+            }
+            (Some('"'), '\\') if posix && matches!(next, Some('$' | '`' | '"' | '\\')) => {
+                out.push(next?);
+                i += 1;
+            }
+            (_, '$') => match variable_name(&chars[i + 1..]) {
+                Some((name, len)) => {
+                    out.push_str(&environment_value(&name)?);
+                    i += len;
+                }
+                None => out.push('$'),
+            },
+            (_, '%') if !posix => match chars[i + 1..].iter().position(|&c| c == '%') {
+                Some(len) if len > 0 => {
+                    let name: String = chars[i + 1..i + 1 + len].iter().collect();
+                    out.push_str(&environment_value(&name)?);
+                    i += len + 1;
+                }
+                _ => out.push('%'),
+            },
+            (_, c) => out.push(c),
+        }
+        i += 1;
+    }
+    quote.is_none().then_some(out)
+}
+
+/// The variable after a `$`: `NAME`, `{NAME}` or `env:NAME`, and how many characters it took.
+fn variable_name(rest: &[char]) -> Option<(String, usize)> {
+    if rest.first() == Some(&'{') {
+        let end = rest.iter().position(|&c| c == '}')?;
+        return Some((rest[1..end].iter().collect(), end + 1));
+    }
+    let prefix: String = rest.iter().take(4).collect();
+    let skip = if prefix.eq_ignore_ascii_case("env:") { 4 } else { 0 };
+    let len = rest[skip..].iter().take_while(|c| c.is_alphanumeric() || **c == '_').count();
+    (len > 0).then(|| (rest[..skip + len].iter().collect(), skip + len))
+}
+
+/// An environment variable's value (`env:NAME` as PowerShell writes it); HOME is the home
+/// folder on Windows too, as PowerShell's `$HOME` is.
+fn environment_value(name: &str) -> Option<String> {
+    let name = match name.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("env:") => &name[4..],
+        _ => name,
+    };
+    if let Ok(value) = std::env::var(name) {
+        return Some(value);
+    }
+    (name == "HOME").then(home_dir).flatten().map(|home| home.to_string_lossy().into_owned())
+}
+
 /// Splits a command such as `"C:\Program Files\x.exe" -R` into words, honouring double quotes.
 pub fn split_command(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
@@ -536,6 +618,30 @@ mod tests {
         }
         let before_1970 = SystemTime::UNIX_EPOCH - Duration::from_millis(1500);
         assert_eq!(local_time(before_1970).map(|t| t.timestamp_millis()), Some(-1500));
+    }
+
+    #[test]
+    fn words_as_the_shell_reads_them() {
+        // PowerShell: '' is a quote inside single quotes, ` escapes.
+        assert_eq!(shell_word("'Účty a faktury'", false).as_deref(), Some("Účty a faktury"));
+        assert_eq!(shell_word("'it''s'", false).as_deref(), Some("it's"));
+        assert_eq!(shell_word("\"C:\\Program Files\"", false).as_deref(), Some(r"C:\Program Files"));
+        // POSIX: '\'' joins up, \ escapes outside quotes.
+        assert_eq!(shell_word(r"'it'\''s'", true).as_deref(), Some("it's"));
+        assert_eq!(shell_word(r"My\ Folder", true).as_deref(), Some("My Folder"));
+        // Variables from the environment, in each shell's way of writing them.
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var("RMC_WORD_TEST", "/data") };
+        assert_eq!(shell_word("$RMC_WORD_TEST/x", true).as_deref(), Some("/data/x"));
+        assert_eq!(shell_word("\"${RMC_WORD_TEST}\"/x", true).as_deref(), Some("/data/x"));
+        assert_eq!(shell_word("$env:RMC_WORD_TEST\\x", false).as_deref(), Some(r"/data\x"));
+        assert_eq!(shell_word("%RMC_WORD_TEST%\\x", false).as_deref(), Some(r"/data\x"));
+        assert_eq!(shell_word("'$RMC_WORD_TEST'", true).as_deref(), Some("$RMC_WORD_TEST"), "single quotes keep it");
+        // Only the shell knows these.
+        assert_eq!(shell_word("$rmc_shell_only_variable", false), None);
+        assert_eq!(shell_word("$(pwd)", true), None);
+        assert_eq!(shell_word("'unclosed", true), None);
+        assert_eq!(shell_word("100%", false).as_deref(), Some("100%"));
     }
 
     #[test]
