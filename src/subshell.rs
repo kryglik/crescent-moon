@@ -148,6 +148,8 @@ pub struct Subshell {
     /// The prompt number when rmc last typed into the shell. A later prompt means it is idle.
     prompt_at_last_input: u64,
     typed_anything: bool,
+    /// Whether the shell's prompt writes `report_file` (only PowerShell's does, so far).
+    reports_prompts: bool,
     /// The shell's folder when it was last shown; if it has moved by the time the panels come
     /// back, the panel follows.
     pub cwd_when_shown: Option<PathBuf>,
@@ -204,6 +206,7 @@ impl Subshell {
             request_file,
             prompt_at_last_input: 0,
             typed_anything: false,
+            reports_prompts: matches!(shell, Shell::PowerShell(_)),
             cwd_when_shown: None,
         })
     }
@@ -290,10 +293,12 @@ impl Subshell {
 
     /// Waiting at an empty prompt: a prompt has appeared since rmc last typed anything.
     /// A shell that hasn't shown its first prompt yet counts as idle until something is typed.
+    /// A shell that never reports (cmd, bash) always counts as idle: rmc can't tell, and
+    /// refusing every command after the first would be worse than typing into a busy one.
     pub fn is_idle(&self) -> bool {
         match self.report() {
             Some(report) => report.prompt > self.prompt_at_last_input,
-            None => !self.typed_anything,
+            None => !self.typed_anything || !self.reports_prompts,
         }
     }
 
@@ -486,6 +491,24 @@ mod tests {
         wait_for("the variable", || screen_text(&shell).contains("still=42"));
         wait_for("the user's cd", || shell.moved_to().is_some_and(|dir| util::same_path(&dir, tmp.path())));
 
+        shell.send_text("exit\r");
+        wait_for("exit", || shell.has_exited());
+    }
+
+    /// cmd (and bash on Linux) don't report their prompts: rmc can't see when a command ends,
+    /// so it must not refuse the second command as "still busy".
+    #[test]
+    fn a_shell_without_prompt_reports_takes_one_command_after_another() {
+        let shell_kind = if cfg!(windows) { Shell::Cmd } else { Shell::Posix("/bin/sh".into()) };
+        let tmp = TempDir::new("subshell-plain");
+        let mut shell = Subshell::start(&shell_kind, tmp.path(), 30, 100).unwrap();
+        // Each word shows twice once the command has run: in the command line and as its output.
+        shell.send_text("echo first-one\r");
+        wait_for("the first command", || screen_text(&shell).matches("first-one").count() >= 2);
+        assert!(shell.is_idle(), "the second command is not refused");
+        shell.send_text("echo second-one\r");
+        wait_for("the second command", || screen_text(&shell).matches("second-one").count() >= 2);
+        assert_eq!(shell.moved_to(), None, "no reports, so no folder to follow");
         shell.send_text("exit\r");
         wait_for("exit", || shell.has_exited());
     }

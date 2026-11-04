@@ -118,6 +118,7 @@ pub fn config_dir() -> Option<PathBuf> {
     base.map(|dir| dir.join("rmc"))
 }
 
+#[cfg(windows)]
 pub fn find_in_path(program: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)

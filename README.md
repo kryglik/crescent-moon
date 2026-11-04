@@ -1,7 +1,9 @@
 # rmc
 
 A small Midnight Commander-style two-panel file manager for the terminal, written in Rust.
-It runs natively on Windows (Windows Terminal, PowerShell) and should build on Linux and macOS too.
+It runs natively on Windows (Windows Terminal, PowerShell). It also compiles for Linux
+(`cargo check --target x86_64-unknown-linux-gnu`), but there it is less complete: the drive
+picker shows only `/`, free space isn't shown, and the shell's folder doesn't follow the panel.
 
 What it does differently from the Windows port of mc:
 
@@ -70,8 +72,9 @@ screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
 - `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.
 
 This works with pwsh or Windows PowerShell: rmc starts it with a small script that wraps your
-prompt so each prompt reports its number and folder. With `RMC_SHELL=cmd` the shell still
-works, but the folders don't follow each other.
+prompt so each prompt reports its number and folder. With `RMC_SHELL=cmd` (or bash on Linux)
+the shell still works, but the folders don't follow each other, and rmc can't tell whether a
+command is still running, so it never refuses one.
 
 ### Mouse
 
