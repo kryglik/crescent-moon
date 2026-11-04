@@ -58,7 +58,6 @@ impl Watch {
 
 #[cfg(windows)]
 mod sys {
-    use std::os::windows::ffi::OsStrExt;
     use std::path::{Component, Path, Prefix};
 
     use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -83,7 +82,7 @@ mod sys {
                 | FILE_NOTIFY_CHANGE_SIZE
                 | FILE_NOTIFY_CHANGE_LAST_WRITE
                 | FILE_NOTIFY_CHANGE_ATTRIBUTES;
-            let path = wide_path(dir);
+            let path = crate::platform::long_wide(dir);
             let handle = unsafe { FindFirstChangeNotificationW(path.as_ptr(), 0, filter) };
             (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Handle(handle as isize))
         }
@@ -114,25 +113,6 @@ mod sys {
         };
         let root: Vec<u16> = format!("{}:\\", letter as char).encode_utf16().chain([0]).collect();
         !matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, DRIVE_REMOVABLE | DRIVE_CDROM)
-    }
-
-    /// The path as a wide string; long ones get the `\\?\` prefix the API needs for them.
-    fn wide_path(dir: &Path) -> Vec<u16> {
-        let text = dir.as_os_str();
-        let mut wide: Vec<u16> = Vec::new();
-        let plain = text.to_string_lossy();
-        if text.len() > 240 && !plain.starts_with(r"\\?\") {
-            if let Some(unc) = plain.strip_prefix(r"\\") {
-                wide.extend(r"\\?\UNC\".encode_utf16());
-                wide.extend(unc.encode_utf16());
-                wide.push(0);
-                return wide;
-            }
-            wide.extend(r"\\?\".encode_utf16());
-        }
-        wide.extend(text.encode_wide());
-        wide.push(0);
-        wide
     }
 }
 

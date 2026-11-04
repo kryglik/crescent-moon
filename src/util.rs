@@ -153,6 +153,58 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
+/// A file's identity, the same whichever path reaches it: the volume and file index on
+/// Windows, the device and inode elsewhere. Links are followed.
+#[cfg(windows)]
+pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return None;
+    }
+    Some((info.dwVolumeSerialNumber as u64, (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64))
+}
+
+#[cfg(not(windows))]
+pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Whether two existing paths lead to the same file or folder: another letter case on a
+/// drive that ignores case (WSL's /mnt/c, a USB stick on Linux), a link, a mapped drive and
+/// its share.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((file_id(a), file_id(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Like `is_inside`, but with links, junctions and mapped drives resolved, so a folder
+/// reached again through one counts. `path` need not exist yet.
+pub fn really_inside(path: &Path, dir: &Path) -> bool {
+    let Ok(dir) = std::fs::canonicalize(dir) else { return false };
+    let mut existing = path;
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else { return false };
+        rest.push(name);
+        existing = parent;
+    }
+    let Ok(mut real) = std::fs::canonicalize(existing) else { return false };
+    real.extend(rest.iter().rev());
+    is_inside(&real, &dir)
+}
+
 /// True when `path` is `dir` itself or somewhere below it.
 pub fn is_inside(path: &Path, dir: &Path) -> bool {
     let (path, dir) = (path_key(path), path_key(dir));

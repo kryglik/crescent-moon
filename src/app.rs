@@ -490,10 +490,16 @@ impl App {
                 match dialog::handle_buttons(buttons, &mut focus, &key) {
                     ButtonOutcome::Pressed(0) => {
                         drop(survey);
-                        self.start_job(Job::Delete { paths, to_trash });
+                        self.start_job(Job::Delete { paths, to_trash, admin_when_refused: false });
                         None
                     }
-                    // As admin: everything goes to the elevated helper, permanently.
+                    // As admin. To the Recycle Bin: whatever it refuses goes to the elevated
+                    // helper (permanently), the rest still to the bin. Permanently: all of it.
+                    ButtonOutcome::Pressed(2) if to_trash => {
+                        drop(survey);
+                        self.start_job(Job::Delete { paths, to_trash, admin_when_refused: true });
+                        None
+                    }
                     ButtonOutcome::Pressed(2) => {
                         self.job = Some(admin::start(paths, Vec::new()));
                         None
@@ -1373,12 +1379,16 @@ pub fn delete_question(paths: &[PathBuf], to_trash: bool, tally: &Tally) -> (&'s
     }
     if let Some((path, reason)) = &tally.denied {
         lines.push(String::new());
-        lines.push(format!("Needs administrator rights: {}", path.display()));
+        if dialog::admin_offered(tally) {
+            lines.push(format!("Needs administrator rights: {}", path.display()));
+        } else {
+            lines.push(format!("Cannot be deleted: {}", path.display()));
+        }
         // "it belongs to …" as a sentence of its own.
         let why = reason.lines().next().unwrap_or_default().trim_start_matches("Access is denied: ");
         let mut chars = why.chars();
         lines.push(chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default());
-        if cfg!(windows) {
+        if dialog::admin_offered(tally) {
             lines.push(if to_trash {
                 "As admin deletes it permanently, as administrator (Windows asks first).".into()
             } else {

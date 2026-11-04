@@ -89,14 +89,40 @@ pub fn start(paths: Vec<PathBuf>, earlier: Vec<String>) -> Running {
 /// Starts the helper, passes its progress on, asks it to stop when cancelled, and reads
 /// what it reported.
 fn supervise(paths: &[PathBuf], cancel: &AtomicBool, tx: &Sender<Msg>) -> io::Result<(Vec<String>, bool)> {
-    static STARTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = STARTED.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("rmc-{}-admin-{n}", std::process::id()));
-    fs::create_dir_all(&dir)?;
+    let dir = job_folder(paths)?;
     fs::write(dir.join("job.txt"), job_text(paths))?;
     let outcome = run_and_watch(&dir, cancel, tx);
     let _ = fs::remove_dir_all(&dir);
     outcome
+}
+
+/// A new folder for the job, with a name nobody can guess beforehand, outside everything
+/// being deleted (deleting the temp folder itself mustn't take the job's files along).
+fn job_folder(paths: &[PathBuf]) -> io::Result<PathBuf> {
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let base = [Some(std::env::temp_dir()), crate::util::config_dir(), exe_dir]
+        .into_iter()
+        .flatten()
+        .find(|base| !paths.iter().any(|path| crate::util::is_inside(base, path)))
+        .ok_or_else(|| io::Error::other("there is no folder outside what is being deleted to keep the job in"))?;
+    fs::create_dir_all(&base)?;
+    for _ in 0..100 {
+        let dir = base.join(format!("rmc-admin-{}-{:016x}", std::process::id(), random()));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other("no folder could be made for the job"))
+}
+
+/// A number nobody can predict (std seeds its hash keys from the system's randomness).
+fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    hasher.finish()
 }
 
 #[cfg(windows)]
@@ -118,7 +144,10 @@ fn run_and_watch(dir: &Path, cancel: &AtomicBool, tx: &Sender<Msg>) -> io::Resul
     }
     platform::close_elevated(&process);
     let report = fs::read_to_string(dir.join("result.txt")).unwrap_or_default();
-    parse_result(&report).ok_or_else(|| io::Error::other("the administrator helper ended without a report"))
+    // It ran but didn't say how it went: some of it may be gone.
+    Ok(parse_result(&report).unwrap_or_else(|| {
+        (vec!["The administrator's rmc ended without a report: what it deleted is unknown.".into()], true)
+    }))
 }
 
 #[cfg(not(windows))]
@@ -129,6 +158,10 @@ fn run_and_watch(_dir: &Path, _cancel: &AtomicBool, _tx: &Sender<Msg>) -> io::Re
 /// `rmc --admin-job FOLDER`: the elevated side. Deletes what the job file lists, answering
 /// questions itself (failures are skipped and reported), until done or told to stop.
 pub fn run_helper(dir: &Path) -> i32 {
+    // A plain folder of rmc's, not a junction or link leading somewhere else.
+    if fs::symlink_metadata(dir).map_or(true, |meta| !meta.is_dir()) {
+        return 2;
+    }
     #[cfg(windows)]
     let privileged = crate::platform::enable_admin_privileges();
     #[cfg(not(windows))]
@@ -137,7 +170,7 @@ pub fn run_helper(dir: &Path) -> i32 {
         let _ = fs::write(dir.join("result.txt"), result_text(&["The job file could not be read.".into()], true));
         return 2;
     };
-    let running = ops::start_privileged(Job::Delete { paths, to_trash: false });
+    let running = ops::start_privileged(Job::Delete { paths, to_trash: false, admin_when_refused: false });
     let (mut errors, stopped) = loop {
         match running.rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Msg::Progress(progress)) => {

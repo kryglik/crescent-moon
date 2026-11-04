@@ -39,9 +39,15 @@ pub fn query_space_later(roots: Vec<PathBuf>) -> Receiver<(PathBuf, Option<(u64,
 
 #[cfg(windows)]
 pub use win::{
-    close_elevated, delete_denied, delete_privileged, disk_space, drives, enable_admin_privileges, init, open_default,
-    run_elevated, wait_elevated,
+    admin_can_reach, close_elevated, delete_denied, delete_privileged, disk_space, drives, enable_admin_privileges, init,
+    long_wide, open_default, run_elevated, wait_elevated,
 };
+
+/// No "As admin" outside Windows.
+#[cfg(not(windows))]
+pub fn admin_can_reach(_path: &Path) -> bool {
+    false
+}
 
 /// A process started as administrator (its Windows handle).
 #[cfg(windows)]
@@ -91,6 +97,46 @@ mod win {
 
     fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
         s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// A path as a wide string for raw Windows calls. A long one gets the `\\?\` prefix,
+    /// without which those calls stop at 260 characters (std adds it for its own calls).
+    pub fn long_wide(path: &Path) -> Vec<u16> {
+        let text = path.as_os_str();
+        let plain = text.to_string_lossy();
+        if text.len() < 240 || plain.starts_with(r"\\?\") || !path.is_absolute() {
+            return wide(path);
+        }
+        let mut out: Vec<u16> = Vec::new();
+        if plain.starts_with(r"\\") {
+            out.extend(r"\\?\UNC\".encode_utf16());
+            out.extend(text.encode_wide().skip(2));
+        } else {
+            out.extend(r"\\?\".encode_utf16());
+            out.extend(text.encode_wide());
+        }
+        out.push(0);
+        out
+    }
+
+    /// Whether rmc running as administrator can get at `path`. Not on a network share or a
+    /// mapped drive (they belong to the user's own logon session, and an administrator's
+    /// privileges don't count on another machine), nor on a subst drive (also per session).
+    pub fn admin_can_reach(path: &Path) -> bool {
+        use std::path::{Component, Prefix};
+        use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+        let Some(Component::Prefix(prefix)) = path.components().next() else { return false };
+        let letter = match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter as char,
+            _ => return false,
+        };
+        if unsafe { GetDriveTypeW(wide(format!("{letter}:\\")).as_ptr()) } == DRIVE_REMOTE {
+            return false;
+        }
+        // A subst drive's device is a folder ("\??\C:\work") rather than a volume.
+        let mut buf = [0u16; 1024];
+        let n = unsafe { QueryDosDeviceW(wide(format!("{letter}:")).as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        !String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]).starts_with(r"\??\")
     }
 
     /// Stops Windows from popping up "There is no disk in the drive" boxes.
@@ -194,7 +240,7 @@ mod win {
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         };
         let open = |path: &Path, access: u32| {
-            let name = wide(path);
+            let name = long_wide(path);
             let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
             let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
             let handle = unsafe { CreateFileW(name.as_ptr(), access, share, null(), OPEN_EXISTING, flags, null_mut()) };
@@ -237,7 +283,7 @@ mod win {
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
             FILE_SHARE_WRITE, FileDispositionInfo, FileDispositionInfoEx, OPEN_EXISTING, SetFileInformationByHandle,
         };
-        let name = wide(path);
+        let name = long_wide(path);
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
         let handle = unsafe { CreateFileW(name.as_ptr(), DELETE, share, null(), OPEN_EXISTING, flags, null_mut()) };
@@ -352,7 +398,7 @@ mod win {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{LookupAccountSidW, OWNER_SECURITY_INFORMATION};
-        let name = wide(path);
+        let name = long_wide(path);
         let mut sid = null_mut();
         let mut descriptor = null_mut();
         let status = unsafe {
@@ -395,6 +441,20 @@ mod win {
 
     /// Opens a file in its associated Windows application.
     pub fn open_default(path: &Path) -> Result<(), super::OpenError> {
+        // Windows' file-opening API stops at 260 characters: a longer path goes by its short
+        // (8.3) name, where the drive keeps those.
+        let short;
+        let path = if path.as_os_str().len() >= 260 {
+            short = short_path(path).ok_or_else(|| {
+                super::OpenError::Failed(format!(
+                    "\"{}\" is too long a path for Windows to open (over 260 characters).",
+                    path.display()
+                ))
+            })?;
+            short.as_path()
+        } else {
+            path
+        };
         let file = wide(path);
         let verb = wide("open");
         let dir = path.parent().map(wide);
@@ -413,6 +473,23 @@ mod win {
             31 => Err(super::OpenError::Failed(format!("No app is associated with \"{}\".", path.display()))),
             r => Err(super::OpenError::Failed(format!("Windows could not open \"{}\" (error {r}).", path.display()))),
         }
+    }
+
+    /// The short (8.3) form of a long path, if it is short enough to pass on.
+    fn short_path(path: &Path) -> Option<PathBuf> {
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let long = long_wide(path);
+        let mut buf = vec![0u16; 1024];
+        let n = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 || n >= buf.len() {
+            return None;
+        }
+        let short = String::from_utf16_lossy(&buf[..n]);
+        let short = match short.strip_prefix(r"\\?\UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => short.strip_prefix(r"\\?\").unwrap_or(&short).to_string(),
+        };
+        (short.len() < 260).then(|| PathBuf::from(short))
     }
 }
 

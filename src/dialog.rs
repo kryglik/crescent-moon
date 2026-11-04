@@ -92,9 +92,14 @@ pub const FAILED_ADMIN_ANSWERS: &[Answer] =
     &[Answer::Retry, Answer::Skip, Answer::SkipAll, Answer::AsAdmin, Answer::Cancel];
 
 /// The delete question's buttons: As admin joins Yes and No (keeping their places) once
-/// the survey finds something only an administrator may delete, on Windows.
+/// the survey finds something only an administrator may delete, on Windows, where an
+/// administrator can reach it (not on a network drive).
 pub fn delete_buttons(tally: &crate::survey::Tally) -> &'static [Button] {
-    if cfg!(windows) && tally.denied.is_some() { YES_NO_ADMIN } else { YES_NO }
+    if admin_offered(tally) { YES_NO_ADMIN } else { YES_NO }
+}
+
+pub fn admin_offered(tally: &crate::survey::Tally) -> bool {
+    tally.denied.as_ref().is_some_and(|(path, _)| crate::platform::admin_can_reach(path))
 }
 
 pub enum ButtonOutcome {
