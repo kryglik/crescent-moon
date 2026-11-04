@@ -62,7 +62,8 @@ Press **F1** inside rmc for the full list. The essentials:
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
-| F10 | quit |
+| Ctrl+P | options (see Settings) |
+| F10 | quit (right away; it asks only if the option says so, or while the shell is busy) |
 
 Typing anywhere goes to the command line; Enter runs it in the shell (see below), in the
 active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder.
@@ -109,6 +110,21 @@ While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Star
 `rmc --no-mouse` to leave the mouse to the terminal.
 
 ## Settings
+
+Ctrl+P opens the options editor; arrows move, Space toggles a checkbox, and you type into a
+text row (it counts when you move off it). Everything takes effect at once and is saved in
+`settings.ini` next to the hotlist (`%APPDATA%\rmc`, or `~/.config/rmc` on Linux), a plain
+`name = value` file you can also edit by hand:
+
+| Option | Default |
+| --- | --- |
+| Ask before quitting (F10) | off: F10 quits at once, unless the shell is still running a command |
+| Show hidden files | on (Ctrl+H or Alt+. toggles it for the session) |
+| Mouse | on (`--no-mouse` turns it off for one run) |
+| Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
+| Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
+
+Environment variables, used when the matching option is empty:
 
 | Variable | Default |
 | --- | --- |

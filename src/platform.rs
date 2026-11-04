@@ -613,7 +613,15 @@ impl Shell {
         Self::default_shell()
     }
 
-    fn from_program(program: &str) -> Self {
+    /// What the options editor shows for it.
+    pub fn program(&self) -> String {
+        match self {
+            Shell::PowerShell(program) | Shell::Posix(program) => program.display().to_string(),
+            Shell::Cmd => "cmd".into(),
+        }
+    }
+
+    pub fn from_program(program: &str) -> Self {
         let stem = Path::new(program)
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())

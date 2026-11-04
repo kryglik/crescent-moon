@@ -12,8 +12,10 @@ use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, Lin
 use crate::hotlist::Hotlist;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
+use crate::options::{self, OptionsAutomatic};
 use crate::panel::{DirSize, Panel, SortBy};
 use crate::platform::{self, OpenError, Shell};
+use crate::settings::Settings;
 use crate::sizes::Sizer;
 use crate::subshell::Subshell;
 use crate::util;
@@ -29,8 +31,9 @@ pub enum External {
     Command(String),
 }
 
-/// Files bigger than this go to the pager instead of the viewer, and the editor asks first:
-/// an editor reads the whole file into memory before showing anything.
+/// The default big-file limit: files bigger than this go to the pager instead of the viewer,
+/// and the editor asks first, as an editor reads the whole file before showing anything.
+#[cfg(test)]
 pub const BIG_FILE: u64 = 10 * 1024 * 1024;
 
 pub struct Config {
@@ -39,24 +42,61 @@ pub struct Config {
     /// For big files; None when there is no pager.
     pub pager: Option<Vec<String>>,
     pub shell: Shell,
+    /// Bytes; see `Settings::big_file_mb`.
+    pub big_file: u64,
     pub hotlist_file: Option<PathBuf>,
+    /// The options editor saves here; None in tests.
+    pub settings_file: Option<PathBuf>,
+    pub settings: Settings,
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        let editor = env_command(&["RMC_EDITOR", "VISUAL", "EDITOR"]).unwrap_or_else(|| vec![default_editor()]);
-        let viewer = env_command(&["RMC_VIEWER"]).unwrap_or_else(|| {
-            let mut viewer = editor.clone();
-            if is_vim(&editor[0]) {
-                viewer.push("-R".into());
-            } else if is_nano(&editor[0]) {
-                viewer.push("-v".into());
-            }
-            viewer
-        });
-        let pager = env_command(&["RMC_PAGER", "PAGER"]).or_else(default_pager);
-        Config { editor, viewer, pager, shell: Shell::detect(), hotlist_file: Hotlist::default_file() }
+    /// The settings file, the hotlist file, and from them the commands.
+    pub fn load() -> Self {
+        let settings_file = Settings::default_file();
+        let settings = Settings::load(settings_file.as_deref());
+        Config::new(settings, Hotlist::default_file(), settings_file)
     }
+
+    /// Commands come from the settings, or when those are empty from the environment
+    /// (RMC_EDITOR…), or from what is installed.
+    pub fn new(settings: Settings, hotlist_file: Option<PathBuf>, settings_file: Option<PathBuf>) -> Self {
+        let auto = Automatic::detect();
+        let chosen = |value: &str| (!value.trim().is_empty()).then(|| parse_command(value));
+        let editor = chosen(&settings.editor).unwrap_or(auto.editor);
+        let viewer = chosen(&settings.viewer).unwrap_or_else(|| viewer_for(&editor));
+        let pager = chosen(&settings.pager).or(auto.pager);
+        let shell = if settings.shell.trim().is_empty() { auto.shell } else { Shell::from_program(settings.shell.trim()) };
+        Config { editor, viewer, pager, shell, big_file: settings.big_file_bytes(), hotlist_file, settings_file, settings }
+    }
+}
+
+/// What rmc uses when a setting is empty: the environment, or what is installed.
+pub struct Automatic {
+    pub editor: Vec<String>,
+    pub viewer: Vec<String>,
+    pub pager: Option<Vec<String>>,
+    pub shell: Shell,
+}
+
+impl Automatic {
+    pub fn detect() -> Self {
+        let editor = env_command(&["RMC_EDITOR", "VISUAL", "EDITOR"]).unwrap_or_else(|| vec![default_editor()]);
+        let viewer = env_command(&["RMC_VIEWER"]).unwrap_or_else(|| viewer_for(&editor));
+        let pager = env_command(&["RMC_PAGER", "PAGER"]).or_else(default_pager);
+        Automatic { editor, viewer, pager, shell: Shell::detect() }
+    }
+}
+
+/// The editor in read-only mode: `-R` for vim and nvim, `-v` for nano.
+fn viewer_for(editor: &[String]) -> Vec<String> {
+    let mut viewer = editor.to_vec();
+    if is_vim(&editor[0]) {
+        viewer.push("-R".into());
+    } else if is_nano(&editor[0]) {
+        viewer.push("-v".into());
+    }
+    viewer
 }
 
 /// `less`; on Windows also the one that comes with Git for Windows, which isn't on the PATH.
@@ -135,6 +175,8 @@ pub struct App {
     pub shell_shown: bool,
     /// Rows and columns of the whole screen at the last draw; the shell's screen matches it.
     pub screen_size: (u16, u16),
+    /// Mouse capture wanted (the options editor can change it; the main loop applies it).
+    pub mouse: bool,
     sizer: Option<Sizer>,
     /// Free space of network/optical drives, arriving while the drive picker is open.
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
@@ -144,8 +186,10 @@ pub struct App {
 
 impl App {
     pub fn new(left: PathBuf, right: PathBuf, config: Config) -> Self {
+        let show_hidden = config.settings.show_hidden;
         App {
-            panels: [Panel::new(left, true), Panel::new(right, true)],
+            mouse: config.settings.mouse,
+            panels: [Panel::new(left, show_hidden), Panel::new(right, show_hidden)],
             active: 0,
             cmdline: LineEdit::default(),
             dialog: None,
@@ -233,15 +277,8 @@ impl App {
             KeyCode::F(8) => self.confirm_delete(!shift),
             KeyCode::Delete if cmd_empty => self.confirm_delete(!shift),
             KeyCode::F(9) => self.open_sort_menu(),
-            KeyCode::F(10) => {
-                self.dialog = Some(Dialog::Confirm {
-                    title: "Quit".into(),
-                    lines: vec!["Quit rmc?".into()],
-                    focus: 0,
-                    danger: false,
-                    action: ConfirmAction::Quit,
-                })
-            }
+            KeyCode::F(10) => self.request_quit(),
+            KeyCode::Char('p') if ctrl && !alt => self.open_options(),
             KeyCode::Tab => self.active = 1 - self.active,
             KeyCode::Up | KeyCode::Down if shift => {
                 let panel = self.active_panel_mut();
@@ -403,6 +440,9 @@ impl App {
                 _ => Some(Dialog::Drives { side, drives, cursor }),
             },
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
+            Dialog::Options { cursor, edit, settings, automatic } => {
+                self.on_options_key(&key, cursor, edit, settings, automatic)
+            }
             Dialog::Sort { side, mut cursor, current, reverse } => {
                 let last = SortBy::ALL.len() - 1;
                 let chosen = match key.code {
@@ -531,6 +571,114 @@ impl App {
         shell.follow_panel(&cwd, &self.config.shell);
         shell.send_text(&format!("{line}\r"));
         self.shell_shown = true;
+    }
+
+    /// F10: quits right away, unless the settings say to ask, or quitting would kill a
+    /// command still running in the shell. (During a copy only Esc gets through.)
+    fn request_quit(&mut self) {
+        let shell_busy = self.subshell.as_ref().is_some_and(|s| !s.is_idle());
+        if !self.config.settings.confirm_quit && !shell_busy {
+            self.quit = true;
+            return;
+        }
+        let mut lines = Vec::new();
+        if shell_busy {
+            lines.push("The shell is still busy; quitting ends what runs in it.".to_string());
+        }
+        lines.push("Quit rmc?".into());
+        self.dialog = Some(Dialog::Confirm { title: "Quit".into(), lines, focus: 0, danger: shell_busy, action: ConfirmAction::Quit });
+    }
+
+    /// Ctrl+P: the options editor, starting on the first row.
+    fn open_options(&mut self) {
+        let settings = self.config.settings.clone();
+        let edit = LineEdit::default();
+        self.dialog = Some(Dialog::Options { cursor: 0, edit, settings, automatic: OptionsAutomatic::detect() });
+    }
+
+    /// Keys in the options editor: arrows (and Tab) move, Space or Enter toggles a checkbox,
+    /// typing changes a text row, which counts when the cursor leaves it; Esc closes.
+    /// Returns the dialog if it stays open.
+    fn on_options_key(
+        &mut self,
+        key: &KeyEvent,
+        cursor: usize,
+        mut edit: LineEdit,
+        mut settings: Settings,
+        automatic: OptionsAutomatic,
+    ) -> Option<Dialog> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let row = options::ROWS[cursor];
+        let last = options::ROWS.len() - 1;
+        let close = matches!(key.code, KeyCode::Esc | KeyCode::F(10)) || (ctrl && key.code == KeyCode::Char('p'));
+        let target = match key.code {
+            KeyCode::Up | KeyCode::BackTab => Some(cursor.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Tab => Some((cursor + 1).min(last)),
+            KeyCode::PageUp => Some(0),
+            KeyCode::PageDown => Some(last),
+            KeyCode::Enter if !row.is_flag() => Some((cursor + 1).min(last)),
+            _ => None,
+        };
+        if row.is_flag() && matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+            row.toggle(&mut settings);
+            self.apply_settings(settings.clone());
+        } else if !row.is_flag() && target.is_none() && !close {
+            edit.handle_key(key);
+        }
+        if (close || target.is_some()) && !row.is_flag() {
+            row.set_text(&mut settings, edit.text());
+            self.apply_settings(settings.clone());
+        }
+        if close {
+            return None;
+        }
+        let cursor = target.unwrap_or(cursor);
+        if target.is_some() {
+            edit = LineEdit::new(options::ROWS[cursor].text(&settings));
+        }
+        Some(Dialog::Options { cursor, edit, settings, automatic })
+    }
+
+    /// A click on row `i` of the options editor: the cursor goes there, and a checkbox toggles.
+    pub(crate) fn click_option(&mut self, i: usize) {
+        let Some(Dialog::Options { cursor, edit, mut settings, automatic }) = self.dialog.take() else { return };
+        let (Some(&from), Some(&to)) = (options::ROWS.get(cursor), options::ROWS.get(i)) else {
+            self.dialog = Some(Dialog::Options { cursor, edit, settings, automatic });
+            return;
+        };
+        if !from.is_flag() {
+            from.set_text(&mut settings, edit.text());
+        }
+        if to.is_flag() {
+            to.toggle(&mut settings);
+        }
+        self.apply_settings(settings.clone());
+        let edit = LineEdit::new(to.text(&settings));
+        if self.dialog.is_none() {
+            self.dialog = Some(Dialog::Options { cursor: i, edit, settings, automatic });
+        }
+    }
+
+    /// Takes changed settings: saves them, and applies what can change while running
+    /// (hidden files, the mouse, commands, the big-file limit).
+    fn apply_settings(&mut self, settings: Settings) {
+        if settings == self.config.settings {
+            return;
+        }
+        if let Some(file) = &self.config.settings_file
+            && let Err(e) = settings.save(file)
+        {
+            self.error(format!("Cannot save the settings:\n{e}"));
+        }
+        if settings.show_hidden != self.config.settings.show_hidden {
+            for panel in &mut self.panels {
+                panel.show_hidden = settings.show_hidden;
+                panel.reload();
+            }
+        }
+        self.mouse = settings.mouse;
+        let (hotlist_file, settings_file) = (self.config.hotlist_file.take(), self.config.settings_file.take());
+        self.config = Config::new(settings, hotlist_file, settings_file);
     }
 
     /// F9: a menu of sort orders, the cursor on the current one (so F9 F9 reverses it).
@@ -836,7 +984,7 @@ impl App {
 
     /// F3: the viewer, or for a big file the pager (or, without one, the viewer after asking).
     fn view(&mut self, path: PathBuf, size: u64) {
-        if size <= BIG_FILE {
+        if size <= self.config.big_file {
             self.external = Some(External::View(path));
         } else if self.config.pager.is_some() {
             self.external = Some(External::Page(path));
@@ -850,7 +998,7 @@ impl App {
         if entry.is_dir {
             return;
         }
-        if entry.size > BIG_FILE {
+        if entry.size > self.config.big_file {
             self.confirm_big_file(entry.path, entry.size, true);
         } else {
             self.external = Some(External::Edit(entry.path));
@@ -1134,13 +1282,7 @@ mod tests {
     }
 
     fn config(hotlist_file: Option<PathBuf>) -> Config {
-        Config {
-            editor: vec!["nvim".into()],
-            viewer: vec!["nvim".into(), "-R".into()],
-            pager: None,
-            shell: Shell::detect(),
-            hotlist_file,
-        }
+        Config { hotlist_file, ..crate::testutil::config() }
     }
 
     fn test_app(left: &Path, right: &Path) -> App {
@@ -1389,6 +1531,63 @@ mod tests {
         assert_eq!(app.external.take(), Some(External::Edit(file.clone())));
         app.on_key(key(KeyCode::F(3)));
         assert_eq!(app.external.take(), Some(External::View(file)));
+    }
+
+    #[test]
+    fn f10_quits_at_once_unless_the_settings_say_to_ask() {
+        let tmp = TempDir::new("app-quit");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(key(KeyCode::F(10)));
+        assert!(app.quit, "no question by default");
+
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.config.settings.confirm_quit = true;
+        app.on_key(key(KeyCode::F(10)));
+        assert!(!app.quit);
+        assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn options_editor_changes_applies_and_saves_settings() {
+        let tmp = TempDir::new("app-options");
+        let file = tmp.path().join("rmc").join("settings.ini");
+        let config = Config { settings_file: Some(file.clone()), ..crate::testutil::config() };
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+
+        app.on_key(ctrl('p'));
+        assert!(matches!(app.dialog, Some(Dialog::Options { cursor: 0, .. })));
+        // Checkboxes: Enter or Space toggles, and it counts at once.
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.config.settings.confirm_quit);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.panels[0].show_hidden && !app.panels[1].show_hidden);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.mouse);
+
+        // Text rows: type, and it counts when the cursor moves on.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        typing(&mut app, "25");
+        assert_eq!(app.config.big_file, BIG_FILE, "not yet");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.config.big_file, 25 * 1024 * 1024);
+        typing(&mut app, "micro");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.config.editor, ["micro"]);
+        assert_eq!(app.config.viewer, ["micro"], "an empty viewer follows the editor");
+
+        // F10 now asks; and it was all saved.
+        app.on_key(key(KeyCode::F(10)));
+        assert!(!app.quit && matches!(app.dialog, Some(Dialog::Confirm { .. })));
+        let saved = Settings::load(Some(&file));
+        assert_eq!(saved, app.config.settings);
+        assert_eq!((saved.big_file_mb, saved.editor.as_str(), saved.mouse), (25, "micro", false));
     }
 
     #[test]

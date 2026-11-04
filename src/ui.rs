@@ -15,7 +15,10 @@ use crate::dialog::{self, Button, Dialog};
 use crate::hotlist::Hotlist;
 use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
+use crate::dialog::LineEdit;
+use crate::options::{self, OptionsAutomatic};
 use crate::panel::{Entry, Panel, SortBy};
+use crate::settings::Settings;
 use crate::platform::DriveInfo;
 use crate::subshell::Subshell;
 use crate::util;
@@ -71,7 +74,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_progress(frame, area, job);
     }
     if let Some(dialog) = &app.dialog {
-        let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist);
+        let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist, app.config.settings_file.as_deref());
         if let Some(position) = cursor {
             frame.set_cursor_position(position);
         }
@@ -435,7 +438,13 @@ fn draw_message(
 
 /// Draws the open dialog; returns where the text cursor goes, if it has one, and where
 /// its buttons and rows are.
-fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist) -> (Option<Position>, DialogHit) {
+fn draw_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &Dialog,
+    hotlist: &Hotlist,
+    settings_file: Option<&std::path::Path>,
+) -> (Option<Position>, DialogHit) {
     match dialog {
         Dialog::Message { title, lines, error } => (None, draw_message(frame, area, title, lines, dialog::OK, 0, *error)),
         Dialog::Confirm { title, lines, focus, danger, .. } => {
@@ -462,6 +471,9 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
         }
         Dialog::Drives { drives, cursor, side, .. } => (None, draw_drives(frame, area, drives, *cursor, *side)),
         Dialog::Sort { cursor, current, reverse, .. } => (None, draw_sort(frame, area, *cursor, *current, *reverse)),
+        Dialog::Options { cursor, edit, settings, automatic } => {
+            draw_options(frame, area, *cursor, edit, settings, automatic, settings_file)
+        }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         Dialog::Help { scroll } => {
             let height = (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -482,6 +494,60 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
             (None, DialogHit { area: outer, ..DialogHit::default() })
         }
     }
+}
+
+/// The options editor: checkboxes and text rows; an empty command shows what it stands for
+/// in grey. Returns the cursor position when a text row is being edited.
+fn draw_options(
+    frame: &mut Frame,
+    area: Rect,
+    cursor: usize,
+    edit: &LineEdit,
+    settings: &Settings,
+    automatic: &OptionsAutomatic,
+    settings_file: Option<&std::path::Path>,
+) -> (Option<Position>, DialogHit) {
+    const LABEL_W: usize = 22;
+    let rows = options::ROWS.len() as u16;
+    let width = (area.width * 2 / 3).clamp(60, 90).min(area.width);
+    let (outer, inner) = dialog_frame(frame, area, width, rows + 5, "Options", false);
+    let style = dialog_style(false);
+    let grey = style.fg(Color::DarkGray);
+    let field_w = (inner.width as usize).saturating_sub(LABEL_W);
+    let mut text_cursor = None;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, &row) in options::ROWS.iter().enumerate() {
+        let focused = i == cursor;
+        let y = inner.y + i as u16;
+        if row.is_flag() {
+            let mark = if row.flag(settings) { "[x]" } else { "[ ]" };
+            let text = util::pad(&format!("{mark} {}", row.label()), inner.width as usize);
+            lines.push(Line::from(Span::styled(text, if focused { cursor_style() } else { style })));
+            continue;
+        }
+        let label = Span::styled(util::pad(row.label(), LABEL_W), style);
+        let value = if focused {
+            let (text, column) = edit.view(field_w.saturating_sub(1));
+            text_cursor = Some(Position::new(inner.x + (LABEL_W + column) as u16, y));
+            Span::styled(util::pad(&text, field_w), cursor_style())
+        } else {
+            let text = row.text(settings);
+            match automatic.for_row(row) {
+                Some(auto) if text.is_empty() => Span::styled(util::fit(&format!("{auto} (automatic)"), field_w), grey),
+                _ => Span::styled(util::fit(&text, field_w), style),
+            }
+        };
+        lines.push(Line::from(vec![label, value]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Space toggles · type to change (empty: automatic) · Esc", grey)));
+    if let Some(file) = settings_file {
+        let text = format!("Saved in {}", file.display());
+        lines.push(Line::from(Span::styled(util::fit_left(&text, inner.width as usize), grey)));
+    }
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let list = Rect::new(inner.x, inner.y, inner.width, rows.min(inner.height));
+    (text_cursor, DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) })
 }
 
 /// The F9 menu: the four orders with their keys; the current one says which way round it is.
@@ -604,7 +670,6 @@ fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Config;
     use crate::platform::Shell;
     use crate::testutil::TempDir;
     use ratatui::Terminal;
@@ -622,14 +687,7 @@ mod tests {
     }
 
     fn app_for(tmp: &TempDir) -> App {
-        let config = Config {
-            editor: vec!["nvim".into()],
-            viewer: vec!["nvim".into()],
-            pager: None,
-            shell: Shell::detect(),
-            hotlist_file: None,
-        };
-        App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config)
+        App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), crate::testutil::config())
     }
 
     #[test]
@@ -680,6 +738,25 @@ mod tests {
         assert!(screen.contains(r"2 E:\devel"));
         assert!(screen.contains("3072M"), "measured size shown");
         assert!(screen.contains("5.0M…"), "running total shown");
+    }
+
+    #[test]
+    fn renders_the_options_editor() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let tmp = TempDir::new("ui-options");
+        let mut app = app_for(&tmp);
+        app.config.settings_file = Some(PathBuf::from("settings.ini"));
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        let screen = render(&mut app, 100, 30);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Options"));
+        assert!(screen.contains("[ ] Ask before quitting (F10)"), "{screen}");
+        assert!(screen.contains("[x] Show hidden files"));
+        assert!(screen.contains("Big file limit, MB"));
+        assert!(screen.contains("(automatic)"), "empty commands say what they stand for");
+        assert!(screen.contains("Saved in settings.ini"));
     }
 
     #[test]

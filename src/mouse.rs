@@ -177,6 +177,10 @@ impl App {
                 self.on_key(KeyEvent::from(KeyCode::Enter));
             }
             DialogAction::Row(i) => {
+                if matches!(self.dialog, Some(Dialog::Options { .. })) {
+                    self.click_option(i);
+                    return;
+                }
                 match &mut self.dialog {
                     Some(Dialog::Drives { cursor, drives, .. }) if i < drives.len() => *cursor = i,
                     Some(Dialog::Hotlist { cursor }) if i < self.hotlist.dirs.len() => *cursor = i,
@@ -199,6 +203,7 @@ impl App {
                             | Dialog::Drives { .. }
                             | Dialog::Hotlist { .. }
                             | Dialog::Sort { .. }
+                            | Dialog::Options { .. }
                             | Dialog::Message { .. }
                     )
                 ) {
@@ -221,8 +226,6 @@ fn keybar_slot(bar: Rect, x: u16) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Config;
-    use crate::platform::Shell;
     use crate::testutil::TempDir;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -233,14 +236,7 @@ mod tests {
     const H: u16 = 20;
 
     fn app(dir: &Path) -> App {
-        let config = Config {
-            editor: vec!["nvim".into()],
-            viewer: vec!["nvim".into()],
-            pager: None,
-            shell: Shell::detect(),
-            hotlist_file: None,
-        };
-        let mut app = App::new(dir.to_path_buf(), dir.to_path_buf(), config);
+        let mut app = App::new(dir.to_path_buf(), dir.to_path_buf(), crate::testutil::config());
         draw(&mut app);
         app
     }

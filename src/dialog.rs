@@ -7,8 +7,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use crate::ops::Answer;
+use crate::options::OptionsAutomatic;
 use crate::panel::SortBy;
 use crate::platform::DriveInfo;
+use crate::settings::Settings;
 use crate::util;
 
 /// What happens when a yes/no confirmation is answered with Yes.
@@ -41,6 +43,9 @@ pub enum Dialog {
     Help { scroll: usize },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
+    /// Ctrl+P: `settings` being edited; `edit` holds the text of the row under the cursor
+    /// when that is a text row.
+    Options { cursor: usize, edit: LineEdit, settings: Settings, automatic: OptionsAutomatic },
     /// A question from a running job; the answer goes back over `reply`.
     Question {
         title: String,
@@ -240,10 +245,11 @@ pub const HELP: &[&str] = &[
     "               each other's cd",
     "  Shift+PgUp/PgDn, wheel   scroll back through its output",
     "",
+    "  Ctrl+P       options (saved in settings.ini)",
     "  F10          quit",
     "",
-    "Editor and viewer: RMC_EDITOR, RMC_VIEWER (nvim, nvim -R)",
-    "Pager for big files: RMC_PAGER, then PAGER (less)",
+    "Editor, viewer, pager, shell: Ctrl+P, or when empty there",
+    "  RMC_EDITOR, RMC_VIEWER, RMC_PAGER, RMC_SHELL (nvim, less, pwsh)",
     "Shell: RMC_SHELL (pwsh, then powershell, then cmd; on Linux $SHELL)",
 ];
 

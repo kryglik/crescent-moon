@@ -5,8 +5,10 @@ mod dialog;
 mod hotlist;
 mod mouse;
 mod ops;
+mod options;
 mod panel;
 mod platform;
+mod settings;
 mod sizes;
 mod subshell;
 #[cfg(test)]
@@ -159,21 +161,18 @@ fn main() -> ExitCode {
     let dirs: Vec<PathBuf> = args.dirs.iter().map(|d| util::resolve(&cwd, &d.to_string_lossy())).collect();
     let left = dirs.first().cloned().unwrap_or_else(|| cwd.clone());
     let right = dirs.get(1).cloned().unwrap_or_else(|| left.clone());
-    let mut app = App::new(left, right, Config::from_env());
+    let mut app = App::new(left, right, Config::load());
+    app.mouse &= args.mouse;
 
-    let mouse = Mouse(args.mouse);
     // A panic must not leave the terminal in raw mode, or reporting mouse movements as text.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        mouse.release();
+        Mouse(true).release();
         ratatui::restore();
         previous_hook(info);
     }));
-    let result = init_terminal().and_then(|mut terminal| {
-        mouse.capture()?;
-        run(&mut terminal, &mut app, mouse)
-    });
-    mouse.release();
+    let result = init_terminal().and_then(|mut terminal| run(&mut terminal, &mut app));
+    Mouse(app.mouse).release();
     ratatui::restore();
 
     if let Some(file) = args.cwd_file {
@@ -237,7 +236,10 @@ fn init_terminal() -> io::Result<Tui> {
     Terminal::new(CrosstermBackend::new(Output::default()))
 }
 
-fn run(terminal: &mut Tui, app: &mut App, mouse: Mouse) -> io::Result<()> {
+fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
+    // The options editor can turn the mouse on and off; this follows `app.mouse`.
+    let mut mouse = Mouse(app.mouse);
+    mouse.capture()?;
     let mut trace = Trace::from_env();
     let mut events = String::new();
     let mut woke = None;
@@ -289,6 +291,11 @@ fn run(terminal: &mut Tui, app: &mut App, mouse: Mouse) -> io::Result<()> {
         // shell exiting) change the screen by themselves; so does time while a job runs.
         let shown = app.shell_shown;
         dirty |= app.tick() || app.working() || app.shell_shown != shown;
+        if app.mouse != mouse.0 {
+            mouse.release();
+            mouse = Mouse(app.mouse);
+            mouse.capture()?;
+        }
         if let Some(external) = app.external.take() {
             let (result, shell_cwd) = run_external(terminal, app, external, mouse)?;
             app.after_external(result, shell_cwd);

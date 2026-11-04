@@ -1,8 +1,27 @@
-//! Temporary directories for tests.
+//! Temporary directories and a settings-free configuration for tests.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use crate::app::{BIG_FILE, Config};
+use crate::platform::Shell;
+use crate::settings::Settings;
+
+/// nvim as editor and viewer, no pager, default settings, and no files on disk (so tests
+/// never touch the real hotlist or settings).
+pub fn config() -> Config {
+    Config {
+        editor: vec!["nvim".into()],
+        viewer: vec!["nvim".into(), "-R".into()],
+        pager: None,
+        shell: Shell::detect(),
+        big_file: BIG_FILE,
+        hotlist_file: None,
+        settings_file: None,
+        settings: Settings::default(),
+    }
+}
 
 pub struct TempDir(PathBuf);
 
