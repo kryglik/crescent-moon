@@ -38,7 +38,7 @@ pub fn query_space_later(roots: Vec<PathBuf>) -> Receiver<(PathBuf, Option<(u64,
 }
 
 #[cfg(windows)]
-pub use win::{disk_space, drives, init, open_default};
+pub use win::{delete_denied, disk_space, drives, init, open_default};
 
 /// The mount point holding `path`; on Windows the drive is in the path itself (`util::volume_key`).
 #[cfg(windows)]
@@ -168,6 +168,93 @@ mod win {
             .collect()
     }
 
+    /// Why `path` can't be deleted, if Windows says so: in use by another program, or no
+    /// permission (neither DELETE on it nor "delete child" on its folder), naming the owner.
+    /// None when nothing stands in the way, or it can't tell.
+    pub fn delete_denied(path: &Path) -> Option<String> {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GetLastError, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let open = |path: &Path, access: u32| {
+            let name = wide(path);
+            let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+            let handle = unsafe { CreateFileW(name.as_ptr(), access, share, null(), OPEN_EXISTING, flags, null_mut()) };
+            if handle == INVALID_HANDLE_VALUE {
+                Err(unsafe { GetLastError() })
+            } else {
+                unsafe { CloseHandle(handle) };
+                Ok(())
+            }
+        };
+        match open(path, DELETE) {
+            Err(ERROR_SHARING_VIOLATION) => return Some("It is in use by another program.".into()),
+            Err(ERROR_ACCESS_DENIED) => {}
+            _ => return None,
+        }
+        if path.parent().is_some_and(|parent| open(parent, FILE_DELETE_CHILD).is_ok()) {
+            return None;
+        }
+        Some(match owner(path) {
+            Some(owner) if owner.ends_with("\\TrustedInstaller") => format!(
+                "Access is denied: it belongs to {owner} (protected Windows files).\n\
+                 An administrator has to take ownership of it before it can be deleted."
+            ),
+            Some(owner) => format!("Access is denied: you may not delete it (it belongs to {owner})."),
+            None => "Access is denied: you may not delete it.".into(),
+        })
+    }
+
+    /// The owner of a file or folder, as `DOMAIN\name`.
+    fn owner(path: &Path) -> Option<String> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{LookupAccountSidW, OWNER_SECURITY_INFORMATION};
+        let name = wide(path);
+        let mut sid = null_mut();
+        let mut descriptor = null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut sid,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let (mut account, mut account_len) = ([0u16; 256], 256u32);
+        let (mut domain, mut domain_len) = ([0u16; 256], 256u32);
+        let mut kind = 0;
+        let ok = unsafe {
+            LookupAccountSidW(
+                null(),
+                sid,
+                account.as_mut_ptr(),
+                &mut account_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut kind,
+            )
+        };
+        unsafe { LocalFree(descriptor) };
+        if ok == 0 {
+            return None;
+        }
+        let account = String::from_utf16_lossy(&account[..account_len as usize]);
+        let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+        Some(if domain.is_empty() { account } else { format!("{domain}\\{account}") })
+    }
+
     /// Opens a file in its associated Windows application.
     pub fn open_default(path: &Path) -> Result<(), super::OpenError> {
         let file = wide(path);
@@ -192,7 +279,7 @@ mod win {
 }
 
 #[cfg(not(windows))]
-pub use unix::{disk_space, drives, init, mount_point, open_default, same_device};
+pub use unix::{delete_denied, disk_space, drives, init, mount_point, open_default, same_device};
 
 #[cfg(not(windows))]
 mod unix {
@@ -206,6 +293,14 @@ mod unix {
     use crate::util;
 
     pub fn init() {}
+
+    /// Why `path` can't be deleted: deleting needs write access to the folder it is in.
+    pub fn delete_denied(path: &Path) -> Option<String> {
+        let parent = path.parent()?;
+        let parent = CString::new(parent.as_os_str().as_bytes()).ok()?;
+        let writable = unsafe { libc::access(parent.as_ptr(), libc::W_OK | libc::X_OK) } == 0;
+        (!writable).then(|| "Access is denied: you may not change the folder it is in.".to_string())
+    }
 
     /// Free and total bytes of the file system holding `path`.
     pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
@@ -802,6 +897,22 @@ mod tests {
         let report = parse_cwd_report(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(report.prompt, 2, "one report per prompt");
         assert!(util::same_path(&report.dir, &target), "{}", report.dir.display());
+    }
+
+    /// Only opens handles; nothing is deleted. RMC_PROBE=PATH also prints the reason for PATH.
+    #[test]
+    fn says_why_something_cannot_be_deleted() {
+        let tmp = TempDir::new("denied");
+        let own = tmp.file("mine.txt", "x");
+        assert_eq!(delete_denied(&own), None, "your own file can go");
+        // Windows' own files belong to TrustedInstaller: without elevation they can't go.
+        #[cfg(windows)]
+        if let Some(reason) = delete_denied(Path::new(r"C:\Windows\System32\drivers")) {
+            assert!(reason.contains("TrustedInstaller"), "{reason}");
+        }
+        if let Some(path) = std::env::var_os("RMC_PROBE") {
+            println!("{}: {:?}", Path::new(&path).display(), delete_denied(Path::new(&path)));
+        }
     }
 
     #[test]

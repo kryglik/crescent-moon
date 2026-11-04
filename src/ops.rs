@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::util;
+use crate::{platform, util};
 
 /// Guards against link loops when copying through directory links.
 const MAX_DEPTH: usize = 64;
@@ -483,7 +483,7 @@ impl Worker {
     fn trash(&mut self, path: &Path) -> Flow<()> {
         self.progress.current = path.display().to_string();
         self.send_progress(true);
-        self.attempt(path, |_| trash::delete(path).map_err(|e| io::Error::other(e.to_string())))?;
+        self.attempt(path, |_| trash::delete(path).map_err(|e| io::Error::other(trash_message(path, &e))))?;
         self.advance((1, 0));
         Ok(())
     }
@@ -491,6 +491,24 @@ impl Worker {
 
 fn child_names(dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     fs::read_dir(dir)?.map(|entry| entry.map(|e| e.file_name())).collect()
+}
+
+/// The trash crate's error in words. On Windows a refusal arrives as "Some operations were
+/// aborted" with no reason (the Recycle Bin is asked not to show any UI, such as the
+/// administrator prompt): usually a lack of permission, so rmc checks that itself.
+fn trash_message(path: &Path, error: &trash::Error) -> String {
+    if let Some(reason) = platform::delete_denied(path) {
+        return reason;
+    }
+    let detail = match error {
+        trash::Error::Unknown { description } | trash::Error::Os { description, .. } => description.clone(),
+        other => other.to_string(),
+    };
+    format!(
+        "It could not be moved to {}: {}.\nShift+F8 deletes it permanently instead.",
+        platform::TRASH_NAME,
+        detail.trim_end_matches('.').to_lowercase()
+    )
 }
 
 fn is_cross_device(error: &io::Error) -> bool {

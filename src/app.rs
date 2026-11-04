@@ -988,7 +988,8 @@ impl App {
         // the stop are still worth knowing about.
         if !errors.is_empty() {
             let mut lines = vec![format!("{} item(s) were not processed:", errors.len())];
-            lines.extend(errors.iter().take(8).cloned());
+            // One line each: the reason, without the advice that may follow it.
+            lines.extend(errors.iter().take(8).map(|e| e.lines().next().unwrap_or_default().to_string()));
             if errors.len() > 8 {
                 lines.push(format!("… and {} more", errors.len() - 8));
             }
@@ -1341,7 +1342,7 @@ fn question_dialog(question: Question, reply: Sender<Answer>) -> Dialog {
         },
         Question::Failed { path, error } => Dialog::Question {
             title: "Error".into(),
-            lines: vec![path.display().to_string(), error],
+            lines: std::iter::once(path.display().to_string()).chain(error.lines().map(String::from)).collect(),
             buttons: dialog::FAILED,
             answers: dialog::FAILED_ANSWERS,
             focus: 1,
