@@ -1177,7 +1177,7 @@ mod tests {
     }
 
     fn shell_dir(app: &App) -> Option<PathBuf> {
-        app.subshell.as_ref().and_then(Subshell::report).map(|(_, dir)| dir)
+        app.subshell.as_ref().and_then(Subshell::report).map(|report| report.dir)
     }
 
     #[test]

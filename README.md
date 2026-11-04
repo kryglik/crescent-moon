@@ -60,8 +60,10 @@ background. Ctrl+O switches between the panels and the shell's screen, which rmc
 screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
 
 - If you `cd` in the shell, the active panel follows when you come back to the panels.
-- If you move the panel and the shell is idle at its prompt, rmc types the `cd` for you when you
-  switch to it (as `__rmc_cd`, kept out of your history).
+- If you move the panel and the shell is idle at its prompt, the shell follows when you switch
+  to it. That's silent: rmc presses a key the shell's start-up script binds (Ctrl+Alt+Shift+F12),
+  which changes folder and redraws the prompt in place, so nothing shows up as a command or in
+  your history.
 - A command typed in rmc while the shell is busy is refused rather than typed into the running
   program.
 - `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.

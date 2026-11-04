@@ -227,7 +227,7 @@ fn run_external(
     let shell_cwd = std::fs::read_to_string(&cwd_file)
         .ok()
         .and_then(|text| platform::parse_cwd_report(&text))
-        .map(|(_, dir)| dir);
+        .map(|report| report.dir);
     let _ = std::fs::remove_file(&cwd_file);
     Ok((result, shell_cwd))
 }

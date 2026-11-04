@@ -16,7 +16,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::dialog;
-use crate::platform::{self, Shell};
+use crate::platform::{self, Shell, ShellReport};
 use crate::util;
 
 /// Lines of output kept for scrolling back (Shift+PgUp, the wheel).
@@ -141,8 +141,10 @@ pub struct Subshell {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     size: (u16, u16),
-    /// Where the shell's prompt reports `<number>|<folder>` (see `PWSH_SHELL_INIT`).
+    /// Where the shell's prompt reports `<number>|<folder>[|f]` (see `PWSH_SHELL_INIT`).
     report_file: PathBuf,
+    /// Where rmc puts the folder for the shell's follow key.
+    request_file: PathBuf,
     /// The prompt number when rmc last typed into the shell. A later prompt means it is idle.
     prompt_at_last_input: u64,
     typed_anything: bool,
@@ -164,11 +166,13 @@ impl Subshell {
         // Unique per shell: a new one may start while the old one's file is still being removed.
         static STARTED: AtomicU32 = AtomicU32::new(0);
         let n = STARTED.fetch_add(1, Ordering::Relaxed);
-        let report_file = std::env::temp_dir().join(format!("rmc-{}-shell-{n}.txt", std::process::id()));
+        let file = |what: &str| std::env::temp_dir().join(format!("rmc-{}-shell-{n}{what}.txt", std::process::id()));
+        let (report_file, request_file) = (file(""), file("-cd"));
         let _ = fs::remove_file(&report_file);
         let mut command = CommandBuilder::from_argv(shell.interactive_argv());
         command.cwd(cwd);
         command.env("RMC_CWD_FILE", &report_file);
+        command.env("RMC_REQUEST_FILE", &request_file);
         let child = pair.slave.spawn_command(command).map_err(|e| error(&e))?;
         log.write(&format!("spawned pid {:?}, report file {}", child.process_id(), report_file.display()));
         drop(pair.slave);
@@ -197,6 +201,7 @@ impl Subshell {
             child,
             size: (rows, cols),
             report_file,
+            request_file,
             prompt_at_last_input: 0,
             typed_anything: false,
             cwd_when_shown: None,
@@ -249,7 +254,7 @@ impl Subshell {
         let _ = self.input.send(bytes.to_vec());
         self.typed_anything = true;
         // Text typed before the first prompt is read at that prompt, so it counts as prompt 1's.
-        self.prompt_at_last_input = self.report().map_or(1, |(number, _)| number.max(1));
+        self.prompt_at_last_input = self.report().map_or(1, |report| report.prompt.max(1));
     }
 
     /// Scrolls the view back (positive) or forward through the output.
@@ -278,8 +283,8 @@ impl Subshell {
         exited
     }
 
-    /// The number and folder of the shell's last prompt (PowerShell only).
-    pub fn report(&self) -> Option<(u64, PathBuf)> {
+    /// What the shell's last prompt reported (PowerShell only).
+    pub fn report(&self) -> Option<ShellReport> {
         platform::parse_cwd_report(&fs::read_to_string(&self.report_file).ok()?)
     }
 
@@ -287,28 +292,37 @@ impl Subshell {
     /// A shell that hasn't shown its first prompt yet counts as idle until something is typed.
     pub fn is_idle(&self) -> bool {
         match self.report() {
-            Some((number, _)) => number > self.prompt_at_last_input,
+            Some(report) => report.prompt > self.prompt_at_last_input,
             None => !self.typed_anything,
         }
     }
 
-    /// Before the shell is shown: if it sits idle in another folder than the panel's, `cd` it
-    /// there, as mc does with its subshell. Remembers where the shell is for `moved_from`.
+    /// Before the shell is shown: if it sits idle in another folder than the panel's, move it
+    /// there, as mc does with its subshell. That is silent: rmc writes the folder to the request
+    /// file and presses the follow key, and the shell changes folder and redraws its prompt in
+    /// place. (Without PSReadLine a visible `Set-Location` is typed instead.)
+    /// Remembers where the shell is, for `moved_to`.
     pub fn follow_panel(&mut self, dir: &Path, shell: &Shell) {
-        let here = self.report().map(|(_, folder)| folder);
-        let elsewhere = here.as_deref().is_some_and(|folder| !util::same_path(folder, dir));
+        let report = self.report();
+        let elsewhere = report.as_ref().is_some_and(|r| !util::same_path(&r.dir, dir));
         if elsewhere && self.is_idle() && matches!(shell, Shell::PowerShell(_)) {
-            self.send_text(&format!("__rmc_cd {}\r", shell.quote(&dir.display().to_string())));
+            let silent = report.as_ref().is_some_and(|r| r.can_follow)
+                && fs::write(&self.request_file, dir.to_string_lossy().as_bytes()).is_ok();
+            if silent {
+                self.send_text(platform::FOLLOW_KEY);
+            } else {
+                self.send_text(&format!("Set-Location -LiteralPath {}\r", shell.quote(&dir.display().to_string())));
+            }
             self.cwd_when_shown = Some(dir.to_path_buf());
         } else {
             // A brand-new shell has no report yet; it started in the panel's folder.
-            self.cwd_when_shown = here.or_else(|| Some(dir.to_path_buf()));
+            self.cwd_when_shown = report.map(|r| r.dir).or_else(|| Some(dir.to_path_buf()));
         }
     }
 
     /// Where the shell went since it was shown, if it changed folder.
     pub fn moved_to(&self) -> Option<PathBuf> {
-        let (_, here) = self.report()?;
+        let here = self.report()?.dir;
         let moved = !self.cwd_when_shown.as_deref().is_some_and(|before| util::same_path(before, &here));
         moved.then_some(here)
     }
@@ -318,6 +332,7 @@ impl Drop for Subshell {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = fs::remove_file(&self.report_file);
+        let _ = fs::remove_file(&self.request_file);
     }
 }
 
@@ -457,9 +472,15 @@ mod tests {
         wait_for("the command's output", || screen_text(&shell).contains("answer=42"));
         wait_for("the next prompt", || shell.is_idle());
 
-        // rmc moves it to the panel's folder; the variable survives.
+        // rmc moves it to the panel's folder silently (no command line); the variable survives.
+        assert!(shell.report().is_some_and(|r| r.can_follow), "PSReadLine's follow key is there");
         shell.follow_panel(&other, &shell_kind);
-        wait_for("the cd", || shell.report().is_some_and(|(_, dir)| util::same_path(&dir, &other)));
+        wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
+        wait_for("the redrawn prompt", || screen_text(&shell).contains("Účty>"));
+        let screen = screen_text(&shell);
+        assert!(!screen.contains("Set-Location") && !screen.contains("__rmc"), "no visible cd:\n{screen}");
+        assert_eq!(screen.matches("PS ").count(), 2, "the prompt is redrawn in place:\n{screen}");
+        assert!(shell.is_idle(), "still idle after the silent cd");
         assert_eq!(shell.moved_to(), None, "rmc's own cd doesn't count as the user moving");
         shell.send_text("\"still=$rmcTest\"; cd ..\r");
         wait_for("the variable", || screen_text(&shell).contains("still=42"));

@@ -219,44 +219,71 @@ pub fn is_executable(_name: &str, meta: Option<&Metadata>) -> bool {
     meta.is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// The key rmc presses to make the shell go to the folder in `$env:RMC_REQUEST_FILE`:
+/// Ctrl+Alt+Shift+F12, as a terminal sends it.
+pub const FOLLOW_KEY: &str = "\x1b[24;8~";
+
 /// Start-up script of the PowerShell behind Ctrl+O.
 ///
-/// - Every prompt writes `<prompt number>|<current folder>` to `$env:RMC_CWD_FILE`. The folder
-///   lets rmc's panel follow `cd`; the number tells rmc whether the shell is idle (a prompt has
-///   appeared since it last typed anything) or busy with a command.
-/// - `__rmc_cd` is how rmc moves the shell to the panel's folder; it stays out of the history.
+/// - Every prompt writes `<prompt number>|<current folder>[|f]` to `$env:RMC_CWD_FILE`. The
+///   folder lets rmc's panel follow `cd`; the number tells rmc whether the shell is idle (a
+///   prompt has appeared since it last typed anything) or busy with a command; `f` says the
+///   follow key below works.
+/// - Ctrl+Alt+Shift+F12 (`FOLLOW_KEY`) moves the shell to the folder in
+///   `$env:RMC_REQUEST_FILE` and redraws the prompt in place: no command line, no history entry.
 /// - Ctrl+O at the prompt exits, for the one-off shell used when the persistent one can't start.
 ///   (In the persistent shell rmc keeps Ctrl+O to itself.)
 const PWSH_SHELL_INIT: &str = r#"
 $global:__rmc_seq = 0
+$global:__rmc_follow = ''
 function global:__rmc_save_cwd {
     $global:__rmc_seq++
     $here = (Get-Location -PSProvider FileSystem).ProviderPath
-    [IO.File]::WriteAllText($env:RMC_CWD_FILE, "$($global:__rmc_seq)|$here")
+    [IO.File]::WriteAllText($env:RMC_CWD_FILE, "$($global:__rmc_seq)|$here$($global:__rmc_follow)")
 }
 $global:__rmc_prompt = $function:prompt
 function global:prompt { __rmc_save_cwd; & $global:__rmc_prompt }
-function global:__rmc_cd([string] $Path) { Set-Location -LiteralPath $Path }
 if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
     Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to rmc' -ScriptBlock {
         __rmc_save_cwd
         [Environment]::Exit(0)
     }
-    $global:__rmc_history = (Get-PSReadLineOption).AddToHistoryHandler
-    Set-PSReadLineOption -AddToHistoryHandler {
-        param([string] $line)
-        if ($line -like '__rmc_cd *') { return $false }
-        if ($global:__rmc_history) { return & $global:__rmc_history $line }
-        return $true
+    Set-PSReadLineKeyHandler -Chord Ctrl+Alt+Shift+F12 -BriefDescription 'Go to the rmc panel folder' -ScriptBlock {
+        try {
+            $target = [IO.File]::ReadAllText($env:RMC_REQUEST_FILE)
+            if (Test-Path -LiteralPath $target -PathType Container) { Set-Location -LiteralPath $target }
+        } catch {}
+        # InvokePrompt writes through [Console]::OutputEncoding, an old code page by default,
+        # which would turn "Účty" into "Úcty"; UTF-8 just for the redraw.
+        $encoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [Text.Encoding]::UTF8
+            [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+        } finally {
+            [Console]::OutputEncoding = $encoding
+        }
     }
+    $global:__rmc_follow = '|f'
 }
 "#;
 
-/// Reads what the shell's prompt wrote: the prompt number and the folder.
-pub fn parse_cwd_report(text: &str) -> Option<(u64, PathBuf)> {
-    let (number, dir) = text.trim_start_matches('\u{feff}').split_once('|')?;
-    let dir = dir.trim();
-    (!dir.is_empty()).then(|| (number.trim().parse().unwrap_or(0), PathBuf::from(dir)))
+/// What the shell's prompt reported.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShellReport {
+    /// Counts prompts: a new one means the shell finished what it was doing.
+    pub prompt: u64,
+    pub dir: PathBuf,
+    /// The shell has the silent "go to this folder" key (`FOLLOW_KEY`).
+    pub can_follow: bool,
+}
+
+/// Reads what the shell's prompt wrote: `<number>|<folder>[|f]`.
+pub fn parse_cwd_report(text: &str) -> Option<ShellReport> {
+    let mut parts = text.trim_start_matches('\u{feff}').trim().split('|');
+    let prompt = parts.next()?.trim().parse().unwrap_or(0);
+    let dir = parts.next()?.trim();
+    let can_follow = parts.next() == Some("f");
+    (!dir.is_empty()).then(|| ShellReport { prompt, dir: PathBuf::from(dir), can_follow })
 }
 
 /// PowerShell's -EncodedCommand form of a script: base64 of UTF-16LE. It sidesteps quoting.
@@ -396,9 +423,9 @@ mod tests {
         let tmp = TempDir::new("shell-init");
         let target = tmp.dir("Účty a faktury");
         let file = tmp.path().join("cwd.txt");
-        // What an interactive session does: the start-up script, prompts, rmc's `cd`, then exit.
+        // What an interactive session does: the start-up script, prompts, a `cd`, then exit.
         let script = format!(
-            "{PWSH_SHELL_INIT}\n$null = prompt\n__rmc_cd '{}'\n$null = prompt\nexit",
+            "{PWSH_SHELL_INIT}\n$null = prompt\nSet-Location -LiteralPath '{}'\n$null = prompt\nexit",
             target.display()
         );
         let status = Command::new(program)
@@ -407,15 +434,16 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let (number, reported) = parse_cwd_report(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(number, 2, "one report per prompt");
-        assert!(util::same_path(&reported, &target), "{}", reported.display());
+        let report = parse_cwd_report(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(report.prompt, 2, "one report per prompt");
+        assert!(util::same_path(&report.dir, &target), "{}", report.dir.display());
     }
 
     #[test]
     fn parsing_reports() {
-        assert_eq!(parse_cwd_report("7|E:\\devel\r\n"), Some((7, PathBuf::from(r"E:\devel"))));
-        assert_eq!(parse_cwd_report("\u{feff}1|C:\\"), Some((1, PathBuf::from(r"C:\"))));
+        let report = |prompt, dir: &str, can_follow| Some(ShellReport { prompt, dir: PathBuf::from(dir), can_follow });
+        assert_eq!(parse_cwd_report("7|E:\\devel\r\n"), report(7, r"E:\devel", false));
+        assert_eq!(parse_cwd_report("\u{feff}1|C:\\|f"), report(1, r"C:\", true));
         assert_eq!(parse_cwd_report("no separator"), None);
     }
 }
