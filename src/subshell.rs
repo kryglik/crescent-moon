@@ -6,9 +6,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -40,15 +42,64 @@ impl vt100::Callbacks for Queries {
 }
 
 type Screen = vt100::Parser<Queries>;
-type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// The shell's debug log, written when `RMC_LOG` names a file: what goes in and out of the
+/// pseudo-console, so a shell that gets stuck can be diagnosed.
+#[derive(Clone, Default)]
+pub struct Log(Option<Arc<Mutex<fs::File>>>);
+
+impl Log {
+    fn from_env() -> Self {
+        let file = std::env::var_os("RMC_LOG")
+            .and_then(|path| fs::OpenOptions::new().create(true).append(true).open(path).ok());
+        Log(file.map(|f| Arc::new(Mutex::new(f))))
+    }
+
+    fn write(&self, what: &str) {
+        if let Some(file) = &self.0
+            && let Ok(mut file) = file.lock()
+        {
+            let now = chrono::Local::now().format("%H:%M:%S%.3f");
+            let _ = writeln!(file, "{now} {what}");
+        }
+    }
+
+    /// Bytes as readable text: control characters escaped, long chunks shortened.
+    fn bytes(&self, what: &str, bytes: &[u8]) {
+        if self.0.is_none() {
+            return;
+        }
+        let shown: String = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]).escape_debug().collect();
+        let more = if bytes.len() > 400 { "…" } else { "" };
+        self.write(&format!("{what} {} bytes: {shown}{more}", bytes.len()));
+    }
+}
+
+/// What the reader thread tells the UI.
+#[derive(Default)]
+struct Activity {
+    /// The shell has written something (its start-up is over).
+    output_seen: AtomicBool,
+    /// The screen changed since the UI last drew it.
+    changed: AtomicBool,
+}
 
 /// Feeds the shell's output into the screen copy and answers the terminal queries in it.
-fn pump_output(mut reader: Box<dyn Read + Send>, screen: Arc<Mutex<Screen>>, writer: Writer) {
+fn pump_output(
+    mut reader: Box<dyn Read + Send>,
+    screen: Arc<Mutex<Screen>>,
+    input: Sender<Vec<u8>>,
+    activity: Arc<Activity>,
+    log: Log,
+) {
     let mut buf = vec![0u8; 16 * 1024];
-    while let Ok(n) = reader.read(&mut buf) {
-        if n == 0 {
-            break;
-        }
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break log.write("output: end"),
+            Ok(n) => n,
+            Err(e) => break log.write(&format!("output: read error {e}")),
+        };
+        log.bytes("output", &buf[..n]);
         let Ok(mut parser) = screen.lock() else { break };
         parser.process(&buf[..n]);
         let mut replies = String::new();
@@ -61,17 +112,32 @@ fn pump_output(mut reader: Box<dyn Read + Send>, screen: Arc<Mutex<Screen>>, wri
             replies += "\x1b[?1;0c";
         }
         drop(parser);
-        if !replies.is_empty()
-            && let Ok(mut writer) = writer.lock()
-        {
-            let _ = writer.write_all(replies.as_bytes()).and_then(|()| writer.flush());
+        activity.output_seen.store(true, Ordering::Relaxed);
+        activity.changed.store(true, Ordering::Relaxed);
+        if !replies.is_empty() {
+            log.bytes("reply", replies.as_bytes());
+            let _ = input.send(replies.into_bytes());
+        }
+    }
+}
+
+/// Writes keys and replies to the shell on a thread of its own, so a shell that stops
+/// reading its input can never freeze rmc.
+fn pump_input(mut writer: Box<dyn Write + Send>, chunks: mpsc::Receiver<Vec<u8>>, log: Log) {
+    for chunk in chunks {
+        if let Err(e) = writer.write_all(&chunk).and_then(|()| writer.flush()) {
+            log.write(&format!("input: write error {e}"));
+            break;
         }
     }
 }
 
 pub struct Subshell {
     screen: Arc<Mutex<Screen>>,
-    writer: Writer,
+    input: Sender<Vec<u8>>,
+    activity: Arc<Activity>,
+    started: Instant,
+    log: Log,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     size: (u16, u16),
@@ -88,7 +154,12 @@ pub struct Subshell {
 impl Subshell {
     /// Starts the shell in `cwd` with a `rows` x `cols` screen.
     pub fn start(shell: &Shell, cwd: &Path, rows: u16, cols: u16) -> Result<Self, String> {
-        let error = |e: &dyn std::fmt::Display| e.to_string();
+        let log = Log::from_env();
+        log.write(&format!("start {shell:?} in {} at {rows}x{cols}", cwd.display()));
+        let error = |e: &dyn std::fmt::Display| {
+            log.write(&format!("start failed: {e}"));
+            e.to_string()
+        };
         let pair = native_pty_system().openpty(pty_size(rows, cols)).map_err(|e| error(&e))?;
         // Unique per shell: a new one may start while the old one's file is still being removed.
         static STARTED: AtomicU32 = AtomicU32::new(0);
@@ -99,21 +170,29 @@ impl Subshell {
         command.cwd(cwd);
         command.env("RMC_CWD_FILE", &report_file);
         let child = pair.slave.spawn_command(command).map_err(|e| error(&e))?;
+        log.write(&format!("spawned pid {:?}, report file {}", child.process_id(), report_file.display()));
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| error(&e))?;
-        let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| error(&e))?));
+        let writer = pair.master.take_writer().map_err(|e| error(&e))?;
         let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             non_zero(rows),
             non_zero(cols),
             SCROLLBACK,
             Queries::default(),
         )));
-        let (feed, replies) = (screen.clone(), writer.clone());
-        thread::spawn(move || pump_output(reader, feed, replies));
+        let activity = Arc::new(Activity::default());
+        let (input, chunks) = mpsc::channel();
+        let (feed, replies, seen, out_log) = (screen.clone(), input.clone(), activity.clone(), log.clone());
+        thread::spawn(move || pump_output(reader, feed, replies, seen, out_log));
+        let in_log = log.clone();
+        thread::spawn(move || pump_input(writer, chunks, in_log));
 
         Ok(Subshell {
             screen,
-            writer,
+            input,
+            activity,
+            started: Instant::now(),
+            log,
             master: pair.master,
             child,
             size: (rows, cols),
@@ -129,10 +208,22 @@ impl Subshell {
             return;
         }
         self.size = (rows, cols);
+        self.log.write(&format!("resize to {rows}x{cols}"));
         let _ = self.master.resize(pty_size(rows, cols));
         if let Ok(mut parser) = self.screen.lock() {
             parser.screen_mut().set_size(non_zero(rows), non_zero(cols));
         }
+        self.activity.changed.store(true, Ordering::Relaxed);
+    }
+
+    /// How long the shell has been starting without writing anything; None once it has.
+    pub fn starting_for(&self) -> Option<Duration> {
+        (!self.activity.output_seen.load(Ordering::Relaxed)).then(|| self.started.elapsed())
+    }
+
+    /// Whether the screen changed since the last call (so it needs drawing).
+    pub fn take_changed(&self) -> bool {
+        self.activity.changed.swap(false, Ordering::Relaxed)
     }
 
     /// Runs `f` on the shell's current screen.
@@ -153,9 +244,9 @@ impl Subshell {
 
     fn send(&mut self, bytes: &[u8]) {
         self.scroll_to_bottom();
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(bytes).and_then(|()| writer.flush());
-        }
+        // Only the size: what is typed into a shell can include passwords.
+        self.log.write(&format!("input {} bytes", bytes.len()));
+        let _ = self.input.send(bytes.to_vec());
         self.typed_anything = true;
         // Text typed before the first prompt is read at that prompt, so it counts as prompt 1's.
         self.prompt_at_last_input = self.report().map_or(1, |(number, _)| number.max(1));
@@ -167,16 +258,24 @@ impl Subshell {
             let position = parser.screen().scrollback() as isize + lines;
             parser.screen_mut().set_scrollback(position.max(0) as usize);
         }
+        self.activity.changed.store(true, Ordering::Relaxed);
     }
 
     pub fn scroll_to_bottom(&self) {
-        if let Ok(mut parser) = self.screen.lock() {
+        if let Ok(mut parser) = self.screen.lock()
+            && parser.screen().scrollback() > 0
+        {
             parser.screen_mut().set_scrollback(0);
+            self.activity.changed.store(true, Ordering::Relaxed);
         }
     }
 
     pub fn has_exited(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+        let exited = !matches!(self.child.try_wait(), Ok(None));
+        if exited {
+            self.log.write("shell exited");
+        }
+        exited
     }
 
     /// The number and folder of the shell's last prompt (PowerShell only).

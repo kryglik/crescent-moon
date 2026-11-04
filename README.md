@@ -86,6 +86,7 @@ While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Star
 | `RMC_EDITOR` (then `VISUAL`, `EDITOR`) | `nvim` |
 | `RMC_VIEWER` | the editor, plus `-R` for vim/nvim |
 | `RMC_SHELL` | `pwsh`, then `powershell`, then `cmd` |
+| `RMC_LOG` | file to log the shell's pseudo-console traffic to, for debugging (typed input is logged as a byte count only) |
 
 Favourite folders are saved in `%APPDATA%\rmc\hotlist.txt` (one path per line; you can edit it).
 

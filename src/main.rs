@@ -133,8 +133,15 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
         previous_hook(info);
     }));
 
+    let mut dirty = true;
     while !app.quit {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        // The panels are cheap to redraw every time. The shell's screen is drawn only when it
+        // changed: redrawing it 100 times a second re-sends the cursor and makes it flicker.
+        let shell_changed = app.subshell.as_ref().is_some_and(|s| s.take_changed() || s.starting_for().is_some());
+        if dirty || !app.shell_shown || shell_changed {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
+        dirty = false;
         // The shell's output arrives on its own thread; check often while it's on screen.
         let timeout = Duration::from_millis(match () {
             _ if app.shell_shown => 10,
@@ -142,6 +149,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
             _ => 500,
         });
         if event::poll(timeout)? {
+            dirty = true;
             // Handle everything already queued (fast typing, pastes, mouse moves) before drawing again.
             loop {
                 match event::read()? {
@@ -155,10 +163,13 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
                 }
             }
         }
+        let shown = app.shell_shown;
         app.tick();
+        dirty |= app.shell_shown != shown;
         if let Some(external) = app.external.take() {
             let (result, shell_cwd) = run_external(terminal, app, external, mouse)?;
             app.after_external(result, shell_cwd);
+            dirty = true;
         }
     }
     Ok(())

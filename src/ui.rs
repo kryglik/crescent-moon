@@ -203,6 +203,28 @@ fn draw_panel(
 
 /// The persistent shell, full screen. Returns its cursor (none while scrolled back).
 fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell) -> Option<Position> {
+    // Until the shell writes anything, say what's happening instead of showing a blank screen.
+    if let Some(waiting) = shell.starting_for() {
+        let seconds = waiting.as_secs();
+        let lines = if seconds < 3 {
+            vec!["Starting the shell…".to_string(), "Ctrl+O goes back to the panels.".to_string()]
+        } else {
+            vec![
+                format!("The shell hasn't answered for {seconds} s."),
+                "Ctrl+O goes back to the panels.".to_string(),
+                "To find out why, start rmc with RMC_LOG set to a file name (e.g. %TEMP%\\rmc.log).".to_string(),
+            ]
+        };
+        let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
+        for (i, line) in lines.iter().enumerate() {
+            let y = top + i as u16;
+            if y < area.bottom() {
+                let text = util::center(line, area.width as usize);
+                buf.set_string(area.x, y, text, Style::new().fg(if i == 0 { Color::Yellow } else { Color::Gray }));
+            }
+        }
+        return None;
+    }
     shell
         .with_screen(|screen| {
             let (rows, cols) = screen.size();
