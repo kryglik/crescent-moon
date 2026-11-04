@@ -18,6 +18,7 @@ use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
 use crate::panel::{DirSize, Panel, SortBy};
+use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
 use crate::settings::Settings;
 use crate::sizes::Sizer;
@@ -223,6 +224,13 @@ pub struct App {
     /// A short message on the command line ("3 items copied to the clipboard"), gone at the
     /// next key.
     pub notice: Option<String>,
+    /// Ctrl+Q: the other panel shows what is under the cursor (see `preview`).
+    pub quick_view: bool,
+    /// Tab moved into the quick view: the arrows scroll it.
+    pub preview_focus: bool,
+    pub previewer: Option<Previewer>,
+    /// Rows of the quick view at the last draw, for paging through it.
+    pub preview_rows: usize,
     /// Each panel's folder, watched for changes other programs make (see `watch`).
     watches: [Option<Watch>; 2],
 }
@@ -263,6 +271,10 @@ impl App {
             history_saved: Instant::now(),
             history_pos: None,
             notice: None,
+            quick_view: false,
+            preview_focus: false,
+            previewer: None,
+            preview_rows: 20,
             watches: [None, None],
         }
     }
@@ -276,10 +288,46 @@ impl App {
         }
     }
 
-    /// Something will need a look soon (a folder changed and is settling), so the main loop
-    /// should wake up sooner than when idle.
+    /// Something will need a look soon (a folder changed and is settling, the quick view is
+    /// reading a file), so the main loop should wake up sooner than when idle.
     pub fn wake_soon(&self) -> bool {
-        self.watches.iter().flatten().any(Watch::pending)
+        self.watches.iter().flatten().any(Watch::pending) || self.previewer.as_ref().is_some_and(Previewer::loading)
+    }
+
+    /// Ctrl+Q: the quick view on or off.
+    fn toggle_quick_view(&mut self) {
+        self.quick_view = !self.quick_view;
+        self.preview_focus = false;
+        if self.quick_view {
+            self.previewer.get_or_insert_with(Previewer::new);
+        } else if let Some(previewer) = &mut self.previewer {
+            previewer.show(None);
+        }
+    }
+
+    /// What the quick view should show: the entry under the active panel's cursor.
+    fn preview_key(&self) -> Option<PreviewKey> {
+        let entry = self.active_panel().current().filter(|e| !e.is_parent)?;
+        Some(PreviewKey { path: entry.path.clone(), size: entry.size, modified: entry.modified })
+    }
+
+    /// Keys while the quick view has the focus: the arrows and pages scroll it, Tab and Esc go
+    /// back to the panel. Returns false for keys it leaves to the panels.
+    fn on_preview_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(previewer) = self.previewer.as_mut() else { return false };
+        let page = self.preview_rows.saturating_sub(1).max(1) as isize;
+        let rows = self.preview_rows;
+        match key.code {
+            KeyCode::Up => previewer.scroll(-1, rows),
+            KeyCode::Down => previewer.scroll(1, rows),
+            KeyCode::PageUp => previewer.scroll(-page, rows),
+            KeyCode::PageDown => previewer.scroll(page, rows),
+            KeyCode::Home => previewer.scroll(isize::MIN / 2, rows),
+            KeyCode::End => previewer.scroll(isize::MAX / 2, rows),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => self.preview_focus = false,
+            _ => return false,
+        }
+        true
     }
 
     /// Reloads a panel whose folder another program changed. Not while a job runs or the
@@ -323,6 +371,11 @@ impl App {
         &mut self.panels[self.active]
     }
 
+    #[cfg(test)]
+    pub fn active_panel_mut_for_tests(&mut self) -> &mut Panel {
+        self.active_panel_mut()
+    }
+
     fn error(&mut self, message: impl Into<String>) {
         let lines = message.into().lines().map(String::from).collect();
         self.dialog = Some(Dialog::Message { title: "Error".into(), lines, error: true });
@@ -360,6 +413,7 @@ impl App {
             if key.code == KeyCode::Esc {
                 job.cancel.store(true, Ordering::Relaxed);
             }
+        } else if self.quick_view && self.preview_focus && self.on_preview_key(&key) {
         } else if !self.on_quicksearch_key(&key) {
             self.on_panel_key(key);
         }
@@ -391,6 +445,9 @@ impl App {
             KeyCode::F(9) => self.open_sort_menu(),
             KeyCode::F(10) => self.request_quit(),
             KeyCode::Char('p') if ctrl && !alt => self.open_options(),
+            KeyCode::Char('q') if ctrl && !alt => self.toggle_quick_view(),
+            // With the quick view on, Tab goes into it (to scroll) rather than to the other panel.
+            KeyCode::Tab if self.quick_view => self.preview_focus = true,
             KeyCode::Tab => self.active = 1 - self.active,
             // Back and forward as in a browser or Explorer, and mc's Alt+Y / Alt+U.
             KeyCode::Left | KeyCode::Char('y') if alt && !ctrl => self.step_back(true),
@@ -1086,6 +1143,13 @@ impl App {
             changed |= finder.tick();
         }
         changed |= self.follow_changes();
+        if self.quick_view {
+            let key = self.preview_key();
+            if let Some(previewer) = &mut self.previewer {
+                previewer.show(key);
+                changed |= previewer.tick();
+            }
+        }
         // Now and then rather than only on exit: closing the window ends rmc without one.
         if self.history_changed && self.history_saved.elapsed() > std::time::Duration::from_secs(5) {
             self.save_history();

@@ -13,6 +13,7 @@ mod ops;
 mod options;
 mod panel;
 mod platform;
+mod preview;
 mod settings;
 mod sizes;
 mod subshell;

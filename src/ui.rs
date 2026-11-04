@@ -20,6 +20,7 @@ use crate::finder::{Field as FindField, Finder, Row};
 use unicode_width::UnicodeWidthChar;
 use crate::options::{self, OptionsAutomatic};
 use crate::panel::{Entry, Panel, SortBy};
+use crate::preview::{Content, Preview};
 use crate::settings::Settings;
 use crate::platform::DriveInfo;
 use crate::subshell::Subshell;
@@ -76,6 +77,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let search = app.quicksearch.clone();
     let mut search_cursor = None;
     for (side, rect) in [left, right].into_iter().enumerate() {
+        if app.quick_view && side != active {
+            let preview = app.previewer.as_ref().and_then(|p| p.current.as_ref());
+            let inner = draw_quick_view(frame.buffer_mut(), rect, preview, app.preview_focus);
+            app.preview_rows = inner.height as usize;
+            hit.preview = Some(rect);
+            continue;
+        }
         let query = if side == active { search.as_deref() } else { None };
         let (cursor, panel_hit) = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query);
         hit.panels[side] = panel_hit;
@@ -375,6 +383,83 @@ fn draw_panel(
     };
     buf.set_string(inner.x, status_y, util::fit(&status, inner_w), base);
     (None, hit)
+}
+
+/// Ctrl+Q: the other panel shows what is under the cursor. Returns the area of its text.
+fn draw_quick_view(buf: &mut Buffer, area: Rect, preview: Option<&Preview>, focused: bool) -> Rect {
+    let base = panel_style();
+    let grey = base.fg(Color::DarkGray);
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let name = preview.and_then(|p| p.key.path.file_name()).map(|n| n.to_string_lossy().into_owned());
+    let title = format!(" Quick view{} ", name.map(|n| format!(": {n}")).unwrap_or_default());
+    let title = util::take_width(&title, inner_w.saturating_sub(2)).to_string();
+    let mut block = Block::bordered()
+        .border_style(base)
+        .style(base)
+        .title(Line::from(Span::styled(title, if focused { cursor_style() } else { base })));
+    let info = preview.map(|p| preview_info(p)).unwrap_or_default();
+    if !info.is_empty() && util::width(&info) + 4 < inner_w {
+        block = block.title_bottom(Line::from(format!(" {info} ")).right_aligned());
+    }
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let Some(preview) = preview else {
+        buf.set_string(inner.x, inner.y, util::take_width("Nothing to show here.", inner.width as usize), grey);
+        return inner;
+    };
+    let width = inner.width as usize;
+    let mut row = 0u16;
+    let mut put = |text: &str, style: Style| {
+        if row < inner.height {
+            buf.set_string(inner.x, inner.y + row, util::take_width(text, width), style);
+            row += 1;
+        }
+    };
+    let rows = inner.height as usize;
+    match &preview.content {
+        Content::Loading => put("Reading…", grey),
+        Content::Message(text) => put(text, grey),
+        Content::Text { lines, .. } | Content::Binary { lines, .. } => {
+            for line in lines.iter().skip(preview.scroll).take(rows) {
+                put(line, base);
+            }
+        }
+        Content::Picture { format, width: w, height: h } => {
+            put(&format!("{format} picture"), base.fg(Color::White));
+            let megapixels = f64::from(*w) * f64::from(*h) / 1_000_000.0;
+            put(&format!("{w} × {h} pixels ({megapixels:.1} megapixels)"), base);
+        }
+        Content::Folder { folders, files, bytes, names, partial } => {
+            let more = if *partial { "+" } else { "" };
+            put(
+                &format!(
+                    "{}{more} folders, {}{more} files ({} in the files)",
+                    util::thousands(*folders as u64),
+                    util::thousands(*files as u64),
+                    util::human_size(*bytes)
+                ),
+                base.fg(Color::White),
+            );
+            for (name, is_dir) in names.iter().skip(preview.scroll).take(rows.saturating_sub(1)) {
+                let style = if *is_dir { base.fg(Color::White) } else { base };
+                put(&format!("{}{name}", if *is_dir { "/" } else { " " }), style);
+            }
+        }
+    }
+    inner
+}
+
+/// The quick view's bottom line: what the file is.
+fn preview_info(preview: &Preview) -> String {
+    let size = util::human_size(preview.key.size);
+    match &preview.content {
+        Content::Text { encoding, partial, .. } => {
+            format!("{encoding} · {size}{}", if *partial { " · the start" } else { "" })
+        }
+        Content::Binary { partial, .. } => format!("binary · {size}{}", if *partial { " · the start" } else { "" }),
+        Content::Picture { .. } => size,
+        _ => String::new(),
+    }
 }
 
 /// The persistent shell, full screen. Returns its cursor (none while scrolled back).
@@ -1163,6 +1248,48 @@ mod tests {
             render(&mut app, w, h);
         }
         assert!(render(&mut app, 18, 4).contains("rmc: the window"));
+    }
+
+    /// Ctrl+Q shows the file under the cursor where the other panel was, and follows the cursor.
+    #[test]
+    fn quick_view_shows_the_file_under_the_cursor() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let tmp = TempDir::new("ui-quick");
+        tmp.file("a.txt", "první řádek\ndruhý řádek\n");
+        tmp.dir("photos");
+        tmp.file("photos/x.jpg", "x");
+        let mut app = app_for(&tmp);
+        let settle = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.tick();
+                if !app.previewer.as_ref().is_some_and(crate::preview::Previewer::loading) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "the preview never came");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        app.active_panel_mut_for_tests().select_name("a.txt");
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        settle(&mut app);
+        let screen = render(&mut app, 100, 16);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Quick view: a.txt") && screen.contains("druhý řádek"), "{screen}");
+        assert!(screen.contains("UTF-8"));
+        app.active_panel_mut_for_tests().select_name("photos");
+        settle(&mut app);
+        let screen = render(&mut app, 100, 16);
+        assert!(screen.contains("0 folders, 1 files") && screen.contains(" x.jpg"), "{screen}");
+        // Tab goes into it; Esc back; Ctrl+Q again brings the other panel back.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(app.preview_focus && app.active == 0);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.preview_focus);
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!render(&mut app, 100, 16).contains("Quick view"));
     }
 
     #[test]

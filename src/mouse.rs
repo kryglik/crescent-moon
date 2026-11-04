@@ -23,6 +23,8 @@ pub struct HitAreas {
     pub dialog: Option<DialogHit>,
     /// The Find window's result rows, and the row shown first.
     pub find: Option<(Rect, usize)>,
+    /// The quick view, where the other panel was.
+    pub preview: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -111,9 +113,23 @@ impl App {
             }
             return;
         }
+        // The quick view: the wheel scrolls it, a click gives it the focus (for the arrows).
+        if let Some(area) = self.hit.preview
+            && area.contains(pos)
+        {
+            let rows = self.preview_rows;
+            match (event.kind, self.previewer.as_mut()) {
+                (MouseEventKind::ScrollUp, Some(previewer)) => previewer.scroll(-WHEEL_STEP, rows),
+                (MouseEventKind::ScrollDown, Some(previewer)) => previewer.scroll(WHEEL_STEP, rows),
+                (MouseEventKind::Down(MouseButton::Left), _) => self.preview_focus = true,
+                _ => {}
+            }
+            return;
+        }
         for side in 0..2 {
             let hit = self.hit.panels[side];
             if hit.area.contains(pos) {
+                self.preview_focus = false;
                 self.on_panel_mouse(side, hit, event.kind, pos);
                 return;
             }
