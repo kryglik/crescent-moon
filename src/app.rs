@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::admin;
+use crate::compare;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
 use crate::finder::{Field as FindField, Finder};
 use crate::history::History;
@@ -374,6 +375,7 @@ impl App {
             KeyCode::F(1) if alt => self.open_drives(0),
             KeyCode::F(2) if alt => self.open_drives(1),
             KeyCode::F(1) => self.dialog = Some(Dialog::Help { scroll: 0 }),
+            KeyCode::F(2) if shift => self.compare_dirs(),
             KeyCode::F(2) => self.start_rename(),
             KeyCode::F(3) => self.view_current(),
             KeyCode::F(4) if shift => self.start_input("New file", "Create and edit file:", "", InputAction::NewFile),
@@ -1192,6 +1194,25 @@ impl App {
         }
     }
 
+    /// Shift+F2 (Total Commander's key): marks in each panel what the other one lacks or has
+    /// an older copy of, so F5 then brings the other side up to date.
+    fn compare_dirs(&mut self) {
+        if util::same_path(&self.panels[0].cwd, &self.panels[1].cwd) {
+            self.notice = Some("Both panels show the same folder".into());
+            return;
+        }
+        let (left, right) = compare::compare(&self.panels[0].entries, &self.panels[1].entries);
+        let counts = (left.len(), right.len());
+        for (panel, names) in self.panels.iter_mut().zip([left, right]) {
+            panel.clear_marks();
+            panel.marked.extend(names);
+        }
+        self.notice = Some(match counts {
+            (0, 0) => "The folders hold the same files".into(),
+            (l, r) => format!("Marked what the other side lacks or has older: {l} left, {r} right"),
+        });
+    }
+
     /// Alt+H (or Alt+Down, as in Total Commander): the folders visited lately, newest first,
     /// with the current one left out; typing narrows the list.
     fn open_dir_history(&mut self) {
@@ -1759,6 +1780,25 @@ mod tests {
         let next = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
         assert!(next.history.dirs.iter().any(|d| util::same_path(d, &docs)), "{:?}", next.history.dirs);
         assert_eq!(next.history.commands, ["echo remembered"]);
+    }
+
+    /// Shift+F2 marks on each side what the other lacks or has older; F5 then copies it over.
+    #[test]
+    fn comparing_folders_marks_what_to_copy() {
+        let (left, right) = (TempDir::new("app-cmp-left"), TempDir::new("app-cmp-right"));
+        left.file("both.txt", "same");
+        right.file("both.txt", "same");
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        for dir in [&left, &right] {
+            fs::File::options().write(true).open(dir.path().join("both.txt")).unwrap().set_modified(old).unwrap();
+        }
+        left.file("only-left.jpg", "l");
+        right.file("only-right.jpg", "r");
+        let mut app = test_app(left.path(), right.path());
+        app.on_key(with_mods(KeyCode::F(2), KeyModifiers::SHIFT));
+        let marked = |side: usize| app.panels[side].marked.iter().cloned().collect::<Vec<_>>();
+        assert_eq!((marked(0), marked(1)), (vec!["only-left.jpg".to_string()], vec!["only-right.jpg".to_string()]));
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("1 left, 1 right")), "{:?}", app.notice);
     }
 
     /// With Caps Lock on, Windows reports Ctrl+D as Ctrl with a capital D: it still works.

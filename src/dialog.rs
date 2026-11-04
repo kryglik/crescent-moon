@@ -245,6 +245,7 @@ pub const HELP: &[&str] = &[
     "               F9 F9 (or the same one again) flips A-Z / Z-A",
     "  Ctrl+R       reload       Alt+. or Ctrl+H  hidden files",
     "  Ctrl+U       swap panels",
+    "  Shift+F2     compare: mark what the other side lacks or has older",
     "  Alt+I/Alt+O  other panel: same dir / dir under cursor",
     "",
     "Files",

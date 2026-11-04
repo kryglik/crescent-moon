@@ -2,6 +2,7 @@
 
 mod admin;
 mod app;
+mod compare;
 mod dialog;
 mod find;
 mod finder;

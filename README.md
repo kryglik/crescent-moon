@@ -59,6 +59,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
 | F2 | rename |
+| Shift+F2 | compare the two folders (as in Total Commander): marks on each side the files and folders the other side lacks or has an older copy of (same time but another size counts too), so F5 brings the other side up to date |
 | F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
 | F5 / F6 / F7 | copy / move / make directory |
 | F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
