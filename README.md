@@ -64,6 +64,9 @@ Press **F1** inside rmc for the full list. The essentials:
 | F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
 | F5 / F6 / F7 | copy / move / make directory |
 | F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
+| Ctrl+C / Ctrl+X | the marked files (or the one under the cursor) to the clipboard, copied or cut, the way Explorer puts them there: paste them in Explorer, a mail or a chat |
+| Ctrl+Shift+C | their full paths to the clipboard as text |
+| Alt+V | paste files copied or cut in Explorer or in rmc into the panel's folder (cut ones are moved, and the clipboard is emptied afterwards, as Explorer does). Windows Terminal keeps Ctrl+V for its own paste; where a terminal lets Ctrl+V through, it works too. On Linux rmc keeps its own clipboard for files, and the paths go to the terminal's clipboard (OSC 52, over ssh too) |
 | F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |

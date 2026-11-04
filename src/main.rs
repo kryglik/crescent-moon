@@ -2,6 +2,7 @@
 
 mod admin;
 mod app;
+mod clipboard;
 mod compare;
 mod dialog;
 mod find;
@@ -353,6 +354,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                     break;
                 }
             }
+        }
+        // Paths for the terminal's clipboard (OSC 52; works over ssh too).
+        if let Some(text) = app.terminal_clipboard.take() {
+            let mut out = io::stdout();
+            let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
         }
         // Results of background work (directory sizes, drive space, a copy's progress, the
         // shell exiting) change the screen by themselves; so does time while a job runs.

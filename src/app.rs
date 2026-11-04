@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::admin;
+use crate::clipboard::{self, Clipboard, Effect};
 use crate::compare;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
 use crate::finder::{Field as FindField, Finder};
@@ -231,6 +232,11 @@ pub struct App {
     pub previewer: Option<Previewer>,
     /// Rows of the quick view at the last draw, for paging through it.
     pub preview_rows: usize,
+    pub clipboard: Clipboard,
+    /// Text for the terminal to put on its clipboard (OSC 52); the main loop sends it.
+    pub terminal_clipboard: Option<String>,
+    /// The running job pastes files that were cut: when it is done, the clipboard is emptied.
+    pasting_cut: bool,
     /// Each panel's folder, watched for changes other programs make (see `watch`).
     watches: [Option<Watch>; 2],
 }
@@ -275,6 +281,9 @@ impl App {
             preview_focus: false,
             previewer: None,
             preview_rows: 20,
+            clipboard: Clipboard::default(),
+            terminal_clipboard: None,
+            pasting_cut: false,
             watches: [None, None],
         }
     }
@@ -446,6 +455,11 @@ impl App {
             KeyCode::F(10) => self.request_quit(),
             KeyCode::Char('p') if ctrl && !alt => self.open_options(),
             KeyCode::Char('q') if ctrl && !alt => self.toggle_quick_view(),
+            KeyCode::Char('c') if ctrl && !alt => self.copy_to_clipboard(Effect::Copy),
+            KeyCode::Char('C') if ctrl && !alt => self.copy_paths(),
+            KeyCode::Char('x') if ctrl && !alt => self.copy_to_clipboard(Effect::Move),
+            // Windows Terminal keeps Ctrl+V for its own paste, hence Alt+V.
+            KeyCode::Char('v') if ctrl != alt => self.paste(),
             // With the quick view on, Tab goes into it (to scroll) rather than to the other panel.
             KeyCode::Tab if self.quick_view => self.preview_focus = true,
             KeyCode::Tab => self.active = 1 - self.active,
@@ -1191,6 +1205,10 @@ impl App {
             return true;
         }
         self.job = None;
+        // Cut files pasted: the clipboard no longer says where they are (Explorer empties it too).
+        if std::mem::take(&mut self.pasting_cut) && errors.is_empty() && !cancelled {
+            self.clipboard.moved();
+        }
         for panel in &mut self.panels {
             // Done: the marks have served. Stopped or partly failed: they stay, to try again.
             if errors.is_empty() && !cancelled {
@@ -1255,6 +1273,78 @@ impl App {
                 self.notice = Some(if back { "No folder to go back to" } else { "No folder to go forward to" }.into());
             }
             Err(e) => self.error(e),
+        }
+    }
+
+    /// Ctrl+C / Ctrl+X: the marked files (or the one under the cursor) to the clipboard, as
+    /// Explorer puts them there, so Explorer or a mail can paste them; their paths go along as
+    /// text. Elsewhere than Windows the paths go to the terminal's clipboard (OSC 52).
+    fn copy_to_clipboard(&mut self, effect: Effect) {
+        let paths = self.active_panel().selection();
+        if paths.is_empty() {
+            return;
+        }
+        match self.clipboard.put(&paths, effect) {
+            Ok(text) => {
+                self.terminal_clipboard = text;
+                let what = describe(&paths);
+                self.notice = Some(match effect {
+                    Effect::Copy => format!("{what} copied to the clipboard (Alt+V pastes here)"),
+                    Effect::Move => format!("{what} cut to the clipboard (Alt+V moves it here)"),
+                });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Ctrl+Shift+C: the full paths of the marked files (or the one under the cursor) to the
+    /// clipboard as text.
+    fn copy_paths(&mut self) {
+        let paths = self.active_panel().selection();
+        if paths.is_empty() {
+            return;
+        }
+        match self.clipboard.put_text(&paths) {
+            Ok(text) => {
+                self.terminal_clipboard = text;
+                self.notice = Some(match paths.as_slice() {
+                    [one] => format!("{} copied to the clipboard as text", one.display()),
+                    many => format!("{} paths copied to the clipboard as text", many.len()),
+                });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Alt+V (or Ctrl+V where the terminal lets it through): the files on the clipboard into
+    /// the active panel's folder, copied, or moved if they were cut. A copy into the folder it
+    /// came from gets Explorer's "name - Copy" name.
+    fn paste(&mut self) {
+        let Some(files) = self.clipboard.files() else {
+            self.notice = Some("No files on the clipboard (Ctrl+C copies some, here or in Explorer)".into());
+            return;
+        };
+        let dir = self.active_panel().cwd.clone();
+        let mut pairs = Vec::new();
+        for source in &files.paths {
+            let here = source.parent().is_some_and(|parent| util::same_path(parent, &dir));
+            if here && files.effect == Effect::Move {
+                continue;
+            }
+            let Some(target) = clipboard::paste_target(source, &dir) else { continue };
+            if source.is_dir() && util::is_inside(&target, source) {
+                return self.error(format!("\"{}\" cannot be put inside itself.", source.display()));
+            }
+            pairs.push((source.clone(), target));
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        if files.effect == Effect::Move {
+            self.pasting_cut = true;
+            self.start_job(Job::Move(pairs));
+        } else {
+            self.start_job(Job::Copy(pairs));
         }
     }
 
@@ -1844,6 +1934,38 @@ mod tests {
         let next = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
         assert!(next.history.dirs.iter().any(|d| util::same_path(d, &docs)), "{:?}", next.history.dirs);
         assert_eq!(next.history.commands, ["echo remembered"]);
+    }
+
+    /// Ctrl+C and Alt+V copy files across (and into the same folder as "name - Copy"); Ctrl+X
+    /// and Alt+V move them, and then the clipboard is empty. (Tests use rmc's own clipboard,
+    /// not the system's.)
+    #[test]
+    fn files_go_through_the_clipboard() {
+        let (left, right) = (TempDir::new("app-clip-left"), TempDir::new("app-clip-right"));
+        left.file("report.txt", "r");
+        right.file("cut-me.txt", "c");
+        let mut app = test_app(left.path(), right.path());
+        let alt_v = with_mods(KeyCode::Char('v'), KeyModifiers::ALT);
+        app.active_panel_mut().select_name("report.txt");
+        app.on_key(ctrl('c'));
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("copied")), "{:?}", app.notice);
+        app.on_key(alt_v);
+        wait_for_job(&mut app);
+        assert!(left.path().join("report - Copy.txt").exists(), "pasted where it came from: a copy beside it");
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(alt_v);
+        wait_for_job(&mut app);
+        assert!(right.path().join("report.txt").exists() && left.path().join("report.txt").exists());
+
+        app.active_panel_mut().select_name("cut-me.txt");
+        app.on_key(ctrl('x'));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(alt_v);
+        wait_for_job(&mut app);
+        assert!(left.path().join("cut-me.txt").exists() && !right.path().join("cut-me.txt").exists());
+        assert_eq!(app.clipboard.files(), None, "cut and pasted: nothing left to paste");
+        app.on_key(alt_v);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("No files")));
     }
 
     /// Shift+F2 marks on each side what the other lacks or has older; F5 then copies it over.
