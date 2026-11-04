@@ -151,26 +151,29 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, mouse: Mouse) -> io::Resul
         }
         app.tick();
         if let Some(external) = app.external.take() {
-            let result = run_external(terminal, app, external, mouse)?;
-            app.after_external(result);
+            let (result, shell_cwd) = run_external(terminal, app, external, mouse)?;
+            app.after_external(result, shell_cwd);
         }
     }
     Ok(())
 }
 
 /// Hands the terminal to an editor, viewer, shell or command, then takes it back.
+/// After a Ctrl+O shell it also returns the folder the shell was last in.
 fn run_external(
     terminal: &mut DefaultTerminal,
-    app: &App,
+    app: &mut App,
     external: External,
     mouse: Mouse,
-) -> io::Result<Result<(), String>> {
+) -> io::Result<(Result<(), String>, Option<PathBuf>)> {
     let cwd = app.active_panel().cwd.clone();
+    let cwd_file = std::env::temp_dir().join(format!("rmc-{}-cwd.txt", std::process::id()));
+    let _ = std::fs::remove_file(&cwd_file);
     let config = &app.config;
     let (mut command, name) = match &external {
         External::Edit(path) => (program(&config.editor, path), config.editor[0].as_str()),
         External::View(path) => (program(&config.viewer, path), config.viewer[0].as_str()),
-        External::Shell => (config.shell.interactive(), "the shell"),
+        External::Shell => (config.shell.interactive(&cwd_file), "the shell"),
         External::Command(line) => (config.shell.command(line), "the shell"),
     };
     let wait = matches!(external, External::Command(_));
@@ -181,7 +184,12 @@ fn run_external(
     execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
     match &external {
         External::Command(line) => println!("{}> {line}", cwd.display()),
-        External::Shell => println!("rmc: type 'exit' to return to the panels."),
+        // The hint only the first time; later the shell's old output is enough of a clue.
+        External::Shell if !app.shell_hint_shown => {
+            app.shell_hint_shown = true;
+            let way_back = if config.shell.ctrl_o_returns() { "Ctrl+O (or exit)" } else { "exit" };
+            println!("rmc: {way_back} returns to the panels.");
+        }
         _ => {}
     }
     let result = match command.status() {
@@ -198,7 +206,13 @@ fn run_external(
     execute!(io::stdout(), terminal::EnterAlternateScreen)?;
     mouse.capture()?;
     terminal.clear()?;
-    Ok(result)
+
+    let shell_cwd = std::fs::read_to_string(&cwd_file)
+        .ok()
+        .map(|text| PathBuf::from(text.trim_start_matches('\u{feff}').trim()))
+        .filter(|dir| !dir.as_os_str().is_empty());
+    let _ = std::fs::remove_file(&cwd_file);
+    Ok((result, shell_cwd))
 }
 
 fn program(parts: &[String], path: &std::path::Path) -> Command {

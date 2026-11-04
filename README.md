@@ -40,7 +40,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | F8, Delete | to the Recycle Bin (Shift: permanently) |
 | F9 | sort by name, extension, size, time |
 | Ctrl+S | quick search |
-| Ctrl+O | shell (type `exit` to come back) |
+| Ctrl+O | shell; Ctrl+O at its prompt (or `exit`) comes back, and the panel follows the shell's `cd` |
 | F10 | quit |
 
 Typing anywhere goes to the command line; Enter runs it in the active panel's directory.
@@ -50,6 +50,11 @@ Each panel remembers where it was on every drive: picking E: in the drive picker
 returns to that folder, and picking the drive the panel is already on goes to its root.
 Network drives show the share they are mapped to and their free space, which is fetched in
 the background so an unreachable share can't freeze the screen.
+
+The Ctrl+O shell is a fresh pwsh each time (it starts in about 0.2 s): your PSReadLine history
+carries over, variables don't. rmc wraps your prompt so it notes the current folder, and binds
+Ctrl+O at the prompt to go back. With `RMC_SHELL=cmd` you leave with `exit` and the panel
+stays where it was.
 
 ### Mouse
 

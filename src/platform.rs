@@ -218,6 +218,29 @@ pub fn is_executable(_name: &str, meta: Option<&Metadata>) -> bool {
     meta.is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Start-up script of the PowerShell behind Ctrl+O. Every prompt notes the current folder in
+/// `$env:RMC_CWD_FILE` (so rmc's panel can follow `cd`, however the shell ends), and Ctrl+O at
+/// the prompt ends the shell at once, back to the panels.
+const PWSH_SHELL_INIT: &str = r#"
+function global:__rmc_save_cwd {
+    [IO.File]::WriteAllText($env:RMC_CWD_FILE, (Get-Location -PSProvider FileSystem).ProviderPath)
+}
+$global:__rmc_prompt = $function:prompt
+function global:prompt { __rmc_save_cwd; & $global:__rmc_prompt }
+if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
+    Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to rmc' -ScriptBlock {
+        __rmc_save_cwd
+        [Environment]::Exit(0)
+    }
+}
+"#;
+
+/// PowerShell's -EncodedCommand form of a script: base64 of UTF-16LE. It sidesteps quoting.
+fn encode_ps(script: &str) -> String {
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    util::base64(&utf16)
+}
+
 /// The shell that runs command-line input and Ctrl+O sessions.
 #[derive(Clone, Debug)]
 pub enum Shell {
@@ -265,10 +288,8 @@ impl Shell {
     pub fn command(&self, line: &str) -> Command {
         match self {
             Shell::PowerShell(program) => {
-                // -EncodedCommand sidesteps all quoting problems: it takes base64 UTF-16LE.
-                let utf16: Vec<u8> = line.encode_utf16().flat_map(u16::to_le_bytes).collect();
                 let mut command = Command::new(program);
-                command.args(["-NoLogo", "-EncodedCommand", &util::base64(&utf16)]);
+                command.args(["-NoLogo", "-EncodedCommand", &encode_ps(line)]);
                 command
             }
             Shell::Cmd => {
@@ -290,17 +311,25 @@ impl Shell {
         }
     }
 
-    /// An interactive shell session (Ctrl+O).
-    pub fn interactive(&self) -> Command {
-        match self {
+    /// An interactive shell session (Ctrl+O). A PowerShell one reports its folder in
+    /// `cwd_file` and goes back to rmc on Ctrl+O; others are left with `exit`.
+    pub fn interactive(&self, cwd_file: &Path) -> Command {
+        let mut command = match self {
             Shell::PowerShell(program) => {
                 let mut command = Command::new(program);
-                command.arg("-NoLogo");
+                command.args(["-NoLogo", "-NoExit", "-EncodedCommand", &encode_ps(PWSH_SHELL_INIT)]);
                 command
             }
             Shell::Cmd => Command::new("cmd.exe"),
             Shell::Posix(program) => Command::new(program),
-        }
+        };
+        command.env("RMC_CWD_FILE", cwd_file);
+        command
+    }
+
+    /// Whether Ctrl+O in the interactive shell returns to rmc (otherwise it takes `exit`).
+    pub fn ctrl_o_returns(&self) -> bool {
+        matches!(self, Shell::PowerShell(_))
     }
 
     pub fn quote(&self, s: &str) -> String {
@@ -318,5 +347,32 @@ impl Shell {
             Shell::PowerShell(_) => format!("& {quoted}"),
             _ => quoted,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    #[test]
+    fn ctrl_o_shell_reports_its_folder_at_each_prompt() {
+        let Shell::PowerShell(program) = Shell::detect() else {
+            eprintln!("no PowerShell here; skipped");
+            return;
+        };
+        let tmp = TempDir::new("shell-init");
+        let target = tmp.dir("Účty a faktury");
+        let file = tmp.path().join("cwd.txt");
+        // What an interactive session does: the start-up script, a `cd`, a prompt, then exit.
+        let script = format!("{PWSH_SHELL_INIT}\nSet-Location -LiteralPath '{}'\n$null = prompt\nexit", target.display());
+        let status = Command::new(program)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encode_ps(&script)])
+            .env("RMC_CWD_FILE", &file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let reported = std::fs::read_to_string(&file).unwrap();
+        assert!(util::same_path(Path::new(&reported), &target), "{reported}");
     }
 }

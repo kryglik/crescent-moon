@@ -84,6 +84,8 @@ pub struct App {
     /// Screen areas from the last frame, for the mouse.
     pub hit: HitAreas,
     pub(crate) last_click: Option<LastClick>,
+    /// The "how to get back" line has been shown for the Ctrl+O shell.
+    pub shell_hint_shown: bool,
     sizer: Option<Sizer>,
     /// Free space of network/optical drives, arriving while the drive picker is open.
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
@@ -106,6 +108,7 @@ impl App {
             quit: false,
             hit: HitAreas::default(),
             last_click: None,
+            shell_hint_shown: false,
             sizer: None,
             drive_space: None,
             history: Vec::new(),
@@ -546,9 +549,16 @@ impl App {
         }
     }
 
-    /// Called after an editor, viewer, shell or command has run.
-    pub fn after_external(&mut self, result: Result<(), String>) {
+    /// Called after an editor, viewer, shell or command has run. `shell_cwd` is where a Ctrl+O
+    /// shell was last; the active panel follows it, as mc's panels follow its subshell.
+    pub fn after_external(&mut self, result: Result<(), String>, shell_cwd: Option<PathBuf>) {
         self.reload_panels();
+        if let Some(dir) = shell_cwd
+            && dir.is_dir()
+            && !util::same_path(&dir, &self.active_panel().cwd)
+        {
+            self.change_dir(self.active, dir);
+        }
         if let Err(e) = result {
             self.error(e);
         }
@@ -1047,6 +1057,20 @@ mod tests {
         // Alt+P brings it back.
         app.on_key(with_mods(KeyCode::Char('p'), KeyModifiers::ALT));
         assert_eq!(app.cmdline.text(), "git status");
+    }
+
+    #[test]
+    fn panel_follows_the_ctrl_o_shell() {
+        let tmp = TempDir::new("app-shell");
+        let sub = tmp.dir("sub");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(ctrl('o'));
+        assert_eq!(app.external.take(), Some(External::Shell));
+        app.after_external(Ok(()), Some(sub.clone()));
+        assert!(util::same_path(&app.active_panel().cwd, &sub));
+        // A folder that no longer exists is ignored.
+        app.after_external(Ok(()), Some(tmp.path().join("gone")));
+        assert!(util::same_path(&app.active_panel().cwd, &sub));
     }
 
     #[test]
