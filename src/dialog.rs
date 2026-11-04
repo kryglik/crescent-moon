@@ -18,8 +18,8 @@ pub enum ConfirmAction {
     Quit,
     Delete { paths: Vec<PathBuf>, to_trash: bool },
     /// A big file in the editor or viewer after all.
-    Edit(PathBuf),
-    View(PathBuf),
+    Edit(PathBuf, Option<u64>),
+    View(PathBuf, Option<u64>),
 }
 
 /// What happens with the text of an input dialog.
@@ -211,6 +211,7 @@ pub const HELP: &[&str] = &[
     "  Insert, Shift+Up/Down   mark files",
     "  + - *        mark by pattern, unmark by pattern, invert",
     "  Ctrl+S, Alt+S   quick search by name (again: next match)",
+    "  Alt+F7, Alt+?   find text in files below (regex, like ag)",
     "  F9           sort by name, extension, size or time;",
     "               F9 F9 (or the same one again) flips A-Z / Z-A",
     "  Ctrl+R       reload       Alt+. or Ctrl+H  hidden files",
@@ -246,6 +247,12 @@ pub const HELP: &[&str] = &[
     "  Shift+PgUp/PgDn, wheel   scroll back through its output",
     "",
     "  Ctrl+P       options (saved in settings.ini)",
+    "",
+    "Find (Alt+F7)",
+    "  Text: a regex; lowercase ignores case, a capital makes it count",
+    "  Files: *.rs *.toml, !*test* to leave out, or part of a name",
+    "  Tab switches field   Up/Down, PgUp/PgDn move   Alt+U all files",
+    "  Enter goes there   F3/F4 view/edit at the line   Esc closes",
     "  F10          quit",
     "",
     "Editor, viewer, pager, shell: Ctrl+P, or when empty there",

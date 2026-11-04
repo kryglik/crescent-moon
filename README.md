@@ -61,6 +61,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
+| Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | Ctrl+P | options (see Settings) |
 | F10 | quit (right away; it asks only if the option says so, or while the shell is busy) |
@@ -72,6 +73,24 @@ Each panel remembers where it was on every drive: picking E: in the drive picker
 returns to that folder, and picking the drive the panel is already on goes to its root.
 Network drives show the share they are mapped to and their free space, which is fetched in
 the background so an unreachable share can't freeze the screen.
+
+### Find
+
+Alt+F7 (or mc's Alt+?) searches below the active panel's folder the way
+[ag](https://github.com/ggreer/the_silver_searcher) and ripgrep do, using ripgrep's own
+crates: in parallel, skipping files that `.gitignore` (or `.ignore`) ignores, hidden files
+and binary files. Results appear while you type, grouped by file, with the matches marked.
+
+- **Text** is a regular expression with smart case: all lowercase ignores case, a capital
+  letter makes it count. Something that isn't a valid regex (`main(`) is searched as typed.
+- **Files** (Tab) narrows the search by name: `*.rs *.toml`, `!*test*` to leave names out,
+  or a plain word for names containing it. With Text empty, it finds files and folders by
+  name alone.
+- Up/Down and PgUp/PgDn move through the results; **Enter** takes the panel there; **F3/F4**
+  open the file at the matching line (`nvim +42`, `less +42`) and come back to the results.
+- **Alt+U** searches everything, hidden and ignored files too (like `ag -u`).
+- Esc closes it; Alt+F7 brings it back as it was, or runs the same search again if the
+  panel has moved. It stops at 10,000 results.
 
 ### The shell
 
@@ -168,6 +187,10 @@ function rmc {
 | `src/mouse.rs` | mouse handling, using the screen areas `ui.rs` records each frame |
 | `src/subshell.rs` | the persistent shell: ConPTY via portable-pty, screen copy via vt100, key encoding |
 | `src/hotlist.rs` | favourite folders and their file |
+| `src/find.rs` | the Find search: ignore + grep crates on a background thread, cancellable |
+| `src/finder.rs` | the Find window's state: fields, results sorted by path, cursor |
+| `src/settings.rs` | `settings.ini`: loading, saving |
+| `src/options.rs` | the options editor's rows |
 | `src/dialog.rs` | dialogs, buttons, line editor, help text |
 | `src/ui.rs` | drawing with ratatui |
 | `src/platform.rs` | OS bits: drives and mounts, free space, hidden files, opening files, shells and their start-up scripts |

@@ -2,6 +2,8 @@
 
 mod app;
 mod dialog;
+mod find;
+mod finder;
 mod hotlist;
 mod mouse;
 mod ops;
@@ -318,11 +320,11 @@ fn run_external(
     let _ = std::fs::remove_file(&cwd_file);
     let config = &app.config;
     let (mut command, name) = match &external {
-        External::Edit(path) => (program(&config.editor, path), config.editor[0].as_str()),
-        External::View(path) => (program(&config.viewer, path), config.viewer[0].as_str()),
-        External::Page(path) => {
+        External::Edit(path, line) => (program(&config.editor, path, *line), config.editor[0].as_str()),
+        External::View(path, line) => (program(&config.viewer, path, *line), config.viewer[0].as_str()),
+        External::Page(path, line) => {
             let pager = config.pager.as_deref().unwrap_or(&config.viewer);
-            (program(pager, path), pager[0].as_str())
+            (program(pager, path, *line), pager[0].as_str())
         }
         External::Shell => (config.shell.interactive(&cwd_file), "the shell"),
         External::Command(line) => (config.shell.command(line), "the shell"),
@@ -366,10 +368,26 @@ fn run_external(
     Ok((result, shell_cwd))
 }
 
-fn program(parts: &[String], path: &std::path::Path) -> Command {
+/// The editor, viewer or pager command for `path`, at `line` (`+42`) for the programs that
+/// take one that way; others just open the file.
+fn program(parts: &[String], path: &std::path::Path, line: Option<u64>) -> Command {
     let mut command = Command::new(&parts[0]);
-    command.args(&parts[1..]).arg(path);
+    command.args(&parts[1..]);
+    if let Some(line) = line
+        && takes_plus_line(&parts[0])
+    {
+        command.arg(format!("+{line}"));
+    }
+    command.arg(path);
     command
+}
+
+fn takes_plus_line(program: &str) -> bool {
+    let stem = std::path::Path::new(program).file_stem().map(|s| s.to_string_lossy().to_lowercase());
+    matches!(
+        stem.as_deref(),
+        Some("nvim" | "vim" | "vi" | "gvim" | "view" | "nano" | "less" | "emacs" | "emacsclient" | "kak" | "joe" | "mcedit" | "ne")
+    )
 }
 
 /// Lets the user read a command's output before the panels come back.

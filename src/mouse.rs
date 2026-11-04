@@ -21,6 +21,8 @@ pub struct HitAreas {
     pub panels: [PanelHit; 2],
     pub keybar: Rect,
     pub dialog: Option<DialogHit>,
+    /// The Find window's result rows, and the row shown first.
+    pub find: Option<(Rect, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,6 +84,10 @@ impl App {
         }
         if self.dialog.is_some() {
             self.on_dialog_mouse(event.kind, pos);
+            return;
+        }
+        if self.find_shown {
+            self.on_find_mouse(event.kind, pos);
             return;
         }
         if self.job.is_some() {
@@ -146,6 +152,36 @@ impl App {
             self.open_current();
         } else {
             self.last_click = Some(LastClick { at: Instant::now(), side, index });
+        }
+    }
+
+    /// In the Find window: the wheel scrolls the results, a click selects one, a double-click
+    /// goes there (like Enter).
+    fn on_find_mouse(&mut self, kind: MouseEventKind, pos: Position) {
+        let Some(finder) = self.finder.as_mut() else { return };
+        match kind {
+            MouseEventKind::ScrollUp => finder.move_by(-WHEEL_STEP),
+            MouseEventKind::ScrollDown => finder.move_by(WHEEL_STEP),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some((rows, first)) = self.hit.find else { return };
+                if !rows.contains(pos) {
+                    return;
+                }
+                let index = first + (pos.y - rows.y) as usize;
+                if index >= finder.rows() {
+                    return;
+                }
+                finder.move_to(index);
+                // Side 2: the Find window, so a panel click never counts as its second click.
+                let double = self.last_click.as_ref().is_some_and(|c| c.side == 2 && c.index == index && c.at.elapsed() < DOUBLE_CLICK);
+                if double {
+                    self.last_click = None;
+                    self.find_go_to();
+                } else {
+                    self.last_click = Some(LastClick { at: Instant::now(), side: 2, index });
+                }
+            }
+            _ => {}
         }
     }
 

@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
+use crate::finder::{Field as FindField, Finder};
 use crate::hotlist::Hotlist;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
@@ -23,10 +24,11 @@ use crate::util;
 /// Something to run outside the TUI; the main loop gives it the terminal.
 #[derive(Debug, PartialEq)]
 pub enum External {
-    Edit(PathBuf),
-    View(PathBuf),
+    /// A file in the editor, at a line if given (from Find).
+    Edit(PathBuf, Option<u64>),
+    View(PathBuf, Option<u64>),
     /// A big file, shown in the pager (`less`), which reads only what is on screen.
-    Page(PathBuf),
+    Page(PathBuf, Option<u64>),
     Shell,
     Command(String),
 }
@@ -177,6 +179,9 @@ pub struct App {
     pub screen_size: (u16, u16),
     /// Mouse capture wanted (the options editor can change it; the main loop applies it).
     pub mouse: bool,
+    /// Alt+F7, kept when closed so it comes back as it was.
+    pub finder: Option<Finder>,
+    pub find_shown: bool,
     sizer: Option<Sizer>,
     /// Free space of network/optical drives, arriving while the drive picker is open.
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
@@ -189,6 +194,8 @@ impl App {
         let show_hidden = config.settings.show_hidden;
         App {
             mouse: config.settings.mouse,
+            finder: None,
+            find_shown: false,
             panels: [Panel::new(left, show_hidden), Panel::new(right, show_hidden)],
             active: 0,
             cmdline: LineEdit::default(),
@@ -221,7 +228,8 @@ impl App {
     /// directory sizes, or drive space still to arrive.
     pub fn working(&self) -> bool {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
-        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending
+        let finding = self.finder.as_ref().is_some_and(Finder::working);
+        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending || finding
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -248,6 +256,8 @@ impl App {
             self.on_shell_key(key);
         } else if self.dialog.is_some() {
             self.on_dialog_key(key);
+        } else if self.find_shown {
+            self.on_find_key(key);
         } else if let Some(job) = &self.job {
             if key.code == KeyCode::Esc {
                 job.cancel.store(true, Ordering::Relaxed);
@@ -273,6 +283,9 @@ impl App {
             KeyCode::F(4) => self.edit_current(),
             KeyCode::F(5) => self.start_transfer(false),
             KeyCode::F(6) => self.start_transfer(true),
+            // Alt+F7 as in Total Commander, Alt+? as in mc.
+            KeyCode::F(7) if alt => self.open_find(),
+            KeyCode::Char('?') if alt && !ctrl => self.open_find(),
             KeyCode::F(7) => self.start_input("Make directory", "New directory name:", "", InputAction::Mkdir),
             KeyCode::F(8) => self.confirm_delete(!shift),
             KeyCode::Delete if cmd_empty => self.confirm_delete(!shift),
@@ -573,6 +586,84 @@ impl App {
         self.shell_shown = true;
     }
 
+    /// Alt+F7: the Find window for the active panel's folder. It comes back as it was left;
+    /// if the panel has moved since, the same query runs in the new folder.
+    fn open_find(&mut self) {
+        let cwd = self.active_panel().cwd.clone();
+        self.finder = Some(match self.finder.take() {
+            Some(finder) if util::same_path(&finder.root, &cwd) => finder,
+            Some(finder) => finder.moved_to(cwd),
+            None => Finder::new(cwd),
+        });
+        self.find_shown = true;
+    }
+
+    /// Keys in the Find window: typing goes to the field (Tab switches), arrows and pages
+    /// move through the results, Enter goes there, F3/F4 open the file at the line,
+    /// Alt+U searches everything, Esc closes.
+    fn on_find_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let Some(finder) = self.finder.as_mut() else {
+            self.find_shown = false;
+            return;
+        };
+        let page = finder.page as isize;
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => self.find_shown = false,
+            KeyCode::F(7) | KeyCode::Char('?') if alt => self.find_shown = false,
+            KeyCode::Tab | KeyCode::BackTab => {
+                finder.field = if finder.field == FindField::Text { FindField::Names } else { FindField::Text };
+            }
+            KeyCode::Up => finder.move_by(-1),
+            KeyCode::Down => finder.move_by(1),
+            KeyCode::PageUp => finder.move_by(-page),
+            KeyCode::PageDown => finder.move_by(page),
+            KeyCode::Home if ctrl => finder.move_to(0),
+            KeyCode::End if ctrl => finder.move_to(usize::MAX),
+            KeyCode::Char('u') if alt && !ctrl => {
+                finder.everything = !finder.everything;
+                finder.changed();
+            }
+            KeyCode::Enter => self.find_go_to(),
+            KeyCode::F(3) => self.find_open(false),
+            KeyCode::F(4) => self.find_open(true),
+            _ => {
+                let field = finder.field_mut();
+                let before = field.text().to_string();
+                field.handle_key(&key);
+                if field.text() != before {
+                    finder.changed();
+                }
+            }
+        }
+    }
+
+    /// Enter in Find: the panel goes to the folder of the result, the cursor on it.
+    pub(crate) fn find_go_to(&mut self) {
+        let Some(path) = self.finder.as_ref().and_then(Finder::selected).map(|(path, ..)| path.to_path_buf()) else {
+            return;
+        };
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return };
+        self.change_dir(self.active, dir.to_path_buf());
+        self.active_panel_mut().select_name(&name.to_string_lossy());
+        self.find_shown = false;
+    }
+
+    /// F3/F4 in Find: the file at the matching line (the big-file rules apply). The Find
+    /// window is still there afterwards.
+    fn find_open(&mut self, edit: bool) {
+        let Some((path, line, is_dir)) = self.finder.as_ref().and_then(Finder::selected).map(|(p, l, d)| (p.to_path_buf(), l, d))
+        else {
+            return;
+        };
+        if is_dir {
+            return self.find_go_to();
+        }
+        let size = fs::metadata(&path).map_or(0, |m| m.len());
+        if edit { self.edit(path, size, line) } else { self.view(path, size, line) }
+    }
+
     /// F10: quits right away, unless the settings say to ask, or quitting would kill a
     /// command still running in the shell. (During a copy only Esc gets through.)
     fn request_quit(&mut self) {
@@ -786,8 +877,8 @@ impl App {
         match action {
             ConfirmAction::Quit => self.quit = true,
             ConfirmAction::Delete { paths, to_trash } => self.start_job(Job::Delete { paths, to_trash }),
-            ConfirmAction::Edit(path) => self.external = Some(External::Edit(path)),
-            ConfirmAction::View(path) => self.external = Some(External::View(path)),
+            ConfirmAction::Edit(path, line) => self.external = Some(External::Edit(path, line)),
+            ConfirmAction::View(path, line) => self.external = Some(External::View(path, line)),
         }
     }
 
@@ -862,6 +953,9 @@ impl App {
             if sizer.is_busy() && !self.panels.iter().any(Panel::has_pending_sizes) {
                 sizer.cancel();
             }
+        }
+        if let Some(finder) = &mut self.finder {
+            changed |= finder.tick();
         }
         self.tick_job() || changed
     }
@@ -968,7 +1062,7 @@ impl App {
             match platform::open_default(&entry.path) {
                 Ok(()) => {}
                 // A server or WSL has nothing to open files with: show the file instead.
-                Err(OpenError::NoOpener) => self.view(entry.path, entry.size),
+                Err(OpenError::NoOpener) => self.view(entry.path, entry.size, None),
                 Err(OpenError::Failed(e)) => self.error(e),
             }
         }
@@ -977,36 +1071,41 @@ impl App {
     fn view_current(&mut self) {
         match self.active_panel().current().cloned() {
             Some(entry) if entry.is_dir => self.open_current(),
-            Some(entry) => self.view(entry.path, entry.size),
+            Some(entry) => self.view(entry.path, entry.size, None),
             None => {}
         }
     }
 
-    /// F3: the viewer, or for a big file the pager (or, without one, the viewer after asking).
-    fn view(&mut self, path: PathBuf, size: u64) {
+    /// F3: the viewer, or for a big file the pager (or, without one, the viewer after asking);
+    /// at `line` if given.
+    fn view(&mut self, path: PathBuf, size: u64, line: Option<u64>) {
         if size <= self.config.big_file {
-            self.external = Some(External::View(path));
+            self.external = Some(External::View(path, line));
         } else if self.config.pager.is_some() {
-            self.external = Some(External::Page(path));
+            self.external = Some(External::Page(path, line));
         } else {
-            self.confirm_big_file(path, size, false);
+            self.confirm_big_file(path, size, false, line);
         }
     }
 
     fn edit_current(&mut self) {
         let Some(entry) = self.active_panel().current().cloned() else { return };
-        if entry.is_dir {
-            return;
+        if !entry.is_dir {
+            self.edit(entry.path, entry.size, None);
         }
-        if entry.size > self.config.big_file {
-            self.confirm_big_file(entry.path, entry.size, true);
+    }
+
+    /// F4: the editor, after asking for a big file; at `line` if given.
+    fn edit(&mut self, path: PathBuf, size: u64, line: Option<u64>) {
+        if size > self.config.big_file {
+            self.confirm_big_file(path, size, true, line);
         } else {
-            self.external = Some(External::Edit(entry.path));
+            self.external = Some(External::Edit(path, line));
         }
     }
 
     /// "x.log is 250M. Open it in nvim anyway?", with No as the default answer.
-    fn confirm_big_file(&mut self, path: PathBuf, size: u64, edit: bool) {
+    fn confirm_big_file(&mut self, path: PathBuf, size: u64, edit: bool, line: Option<u64>) {
         let program = if edit { &self.config.editor[0] } else { &self.config.viewer[0] };
         let program = Path::new(program).file_stem().map_or_else(|| program.clone(), |s| s.to_string_lossy().into_owned());
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -1019,7 +1118,7 @@ impl App {
             ],
             focus: 1,
             danger: false,
-            action: if edit { ConfirmAction::Edit(path) } else { ConfirmAction::View(path) },
+            action: if edit { ConfirmAction::Edit(path, line) } else { ConfirmAction::View(path, line) },
         });
     }
 
@@ -1092,7 +1191,7 @@ impl App {
         }
         self.reload_panels();
         self.select_in_active(&target);
-        self.external = Some(External::Edit(target));
+        self.external = Some(External::Edit(target, None));
     }
 
     /// Puts the cursor on `path` (or the directory leading to it) in the active panel.
@@ -1528,9 +1627,9 @@ mod tests {
         let mut app = test_app(tmp.path(), tmp.path());
         app.on_key(key(KeyCode::End));
         app.on_key(key(KeyCode::F(4)));
-        assert_eq!(app.external.take(), Some(External::Edit(file.clone())));
+        assert_eq!(app.external.take(), Some(External::Edit(file.clone(), None)));
         app.on_key(key(KeyCode::F(3)));
-        assert_eq!(app.external.take(), Some(External::View(file)));
+        assert_eq!(app.external.take(), Some(External::View(file, None)));
     }
 
     #[test]
@@ -1547,6 +1646,44 @@ mod tests {
         assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })));
         app.on_key(key(KeyCode::Char('y')));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn alt_f7_finds_text_and_goes_to_it() {
+        let tmp = TempDir::new("app-find");
+        tmp.file("src/lib.rs", "pub fn alpha() {}\n\npub fn beta() {}\n");
+        tmp.file("notes.txt", "nothing here\n");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(with_mods(KeyCode::F(7), KeyModifiers::ALT));
+        assert!(app.find_shown);
+        typing(&mut app, "fn beta");
+        wait_until("the results", &mut app, |app| {
+            app.finder.as_ref().is_some_and(|f| !f.working() && f.rows() == 2)
+        });
+        let finder = app.finder.as_ref().unwrap();
+        assert_eq!(finder.files[0].hits[0].number, 3);
+
+        // F4 opens it at the line; the Find window stays.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::F(4)));
+        let lib = tmp.path().join("src").join("lib.rs");
+        assert_eq!(app.external.take(), Some(External::Edit(lib.clone(), Some(3))));
+        assert!(app.find_shown);
+
+        // Enter: the panel goes there, Find closes; Alt+F7 brings it back as it was.
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.find_shown);
+        assert!(app.active_panel().cwd.ends_with("src"));
+        assert_eq!(app.active_panel().current().unwrap().name, "lib.rs");
+        app.on_key(with_mods(KeyCode::F(7), KeyModifiers::ALT));
+        let finder = app.finder.as_ref().unwrap();
+        assert_eq!(finder.text.text(), "fn beta", "the query is kept");
+        assert!(util::same_path(&finder.root, &tmp.path().join("src")), "and runs in the panel's new folder");
+
+        // Tab to Files: names alone.
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.find_shown);
     }
 
     #[test]
@@ -1607,17 +1744,17 @@ mod tests {
         // Y opens it after all.
         app.on_key(key(KeyCode::F(4)));
         app.on_key(key(KeyCode::Char('y')));
-        assert_eq!(app.external.take(), Some(External::Edit(big.clone())));
+        assert_eq!(app.external.take(), Some(External::Edit(big.clone(), None)));
 
         // F3 shows it in the pager; without a pager it asks too.
         app.config.pager = Some(vec!["less".into()]);
         app.on_key(key(KeyCode::F(3)));
-        assert_eq!(app.external.take(), Some(External::Page(big.clone())));
+        assert_eq!(app.external.take(), Some(External::Page(big.clone(), None)));
         app.config.pager = None;
         app.on_key(key(KeyCode::F(3)));
         assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })));
         app.on_key(key(KeyCode::Char('y')));
-        assert_eq!(app.external.take(), Some(External::View(big)));
+        assert_eq!(app.external.take(), Some(External::View(big, None)));
     }
 
     #[test]

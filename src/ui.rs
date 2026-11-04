@@ -16,6 +16,8 @@ use crate::hotlist::Hotlist;
 use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
 use crate::dialog::LineEdit;
+use crate::finder::{Field as FindField, Finder, Row};
+use unicode_width::UnicodeWidthChar;
 use crate::options::{self, OptionsAutomatic};
 use crate::panel::{Entry, Panel, SortBy};
 use crate::settings::Settings;
@@ -70,6 +72,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let cmd_cursor = draw_cmdline(frame, cmd_area, app);
     draw_keybar(frame.buffer_mut(), keys_area);
 
+    let mut find_cursor = None;
+    if app.find_shown
+        && let Some(finder) = app.finder.as_mut()
+    {
+        let (cursor, rows) = draw_find(frame.buffer_mut(), panels_area, finder);
+        find_cursor = Some(cursor);
+        hit.find = Some(rows);
+    }
     if let Some(job) = &app.job {
         draw_progress(frame, area, job);
     }
@@ -79,10 +89,147 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.set_cursor_position(position);
         }
         hit.dialog = Some(dialog_hit);
+    } else if let Some(cursor) = find_cursor {
+        frame.set_cursor_position(cursor);
     } else if app.job.is_none() {
         frame.set_cursor_position(search_cursor.unwrap_or(cmd_cursor));
     }
     app.hit = hit;
+}
+
+/// The Find window over both panels: the Text and Files fields, a hint, the results (each
+/// file, then its lines with the matches marked) and a status line. Returns the text cursor
+/// and the result rows' area with the first row shown, for the mouse.
+fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (Rect, usize)) {
+    let base = panel_style();
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let title = format!(" Find in {} ", util::fit_left(&finder.root.display().to_string(), inner_w.saturating_sub(12)));
+    let block = Block::bordered().border_style(base).style(base).title(Line::from(Span::styled(title, cursor_style())));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let fallback = (Position::new(inner.x, inner.y), (Rect::default(), 0));
+    if inner.height < 6 || inner.width < 20 {
+        return fallback;
+    }
+    let width = inner.width as usize;
+    let grey = base.fg(Color::Gray).add_modifier(Modifier::DIM);
+    let field_style = Style::new().fg(Color::Black).bg(Color::Gray);
+
+    // The two fields.
+    let mut cursor = Position::new(inner.x, inner.y);
+    for (i, (label, edit, field)) in
+        [("Text  ", &finder.text, FindField::Text), ("Files ", &finder.names, FindField::Names)].into_iter().enumerate()
+    {
+        let y = inner.y + i as u16;
+        let field_w = width.saturating_sub(label.len());
+        let (text, column) = edit.view(field_w.saturating_sub(1));
+        let focused = finder.field == field;
+        buf.set_string(inner.x, y, label, base.fg(Color::Yellow));
+        let style = if focused { cursor_style() } else { field_style };
+        buf.set_string(inner.x + label.len() as u16, y, util::pad(&text, field_w), style);
+        if focused {
+            cursor = Position::new(inner.x + (label.len() + column) as u16, y);
+        }
+    }
+    let hint = if finder.everything {
+        "regex, smart case · searching everything, hidden and ignored files too (Alt+U)"
+    } else {
+        "regex, smart case · skips ignored, hidden and binary files (Alt+U: all) · Tab: Files"
+    };
+    buf.set_string(inner.x, inner.y + 2, util::fit(hint, width), grey);
+    buf.set_string(area.x, inner.y + 3, "├", base);
+    buf.set_string(inner.x, inner.y + 3, "─".repeat(width), base);
+    buf.set_string(area.right() - 1, inner.y + 3, "┤", base);
+
+    // The results.
+    let list = Rect::new(inner.x, inner.y + 4, inner.width, inner.height - 5);
+    finder.ensure_visible(list.height as usize);
+    let mark = Style::new().fg(Color::Black).bg(Color::Yellow);
+    for i in 0..list.height as usize {
+        let y = list.y + i as u16;
+        let index = finder.offset + i;
+        let on_cursor = index == finder.cursor;
+        let line = match finder.row(index) {
+            Some(Row::File(f)) => {
+                let file = &finder.files[f];
+                let name = format!("{}{}", finder.shown_path(f), if file.is_dir { "/" } else { "" });
+                let count = if file.hits.is_empty() { String::new() } else { format!(" {}", file.hits.len()) };
+                let style = if on_cursor { cursor_style() } else { base.fg(Color::LightCyan).add_modifier(Modifier::BOLD) };
+                let name_w = width.saturating_sub(util::width(&count));
+                Line::from(vec![Span::styled(util::fit_left(&name, name_w), style), Span::styled(count, style)])
+            }
+            Some(Row::Hit(f, h)) => {
+                let hit = &finder.files[f].hits[h];
+                let style = if on_cursor { cursor_style() } else { base };
+                let number = format!("{:>6}: ", hit.number);
+                let mut spans = vec![Span::styled(number.clone(), if on_cursor { style } else { grey })];
+                spans.extend(marked_spans(&hit.text, &hit.ranges, width.saturating_sub(number.len()), style, mark));
+                Line::from(spans)
+            }
+            None => Line::default(),
+        };
+        // The cursor bar spans the whole row; the spans (and their marks) go on top of it.
+        let row_style = if on_cursor && line.width() > 0 { cursor_style() } else { base };
+        buf.set_string(list.x, y, " ".repeat(width), row_style);
+        buf.set_line(list.x, y, &line, list.width);
+    }
+
+    // The status line.
+    let status = find_status(finder);
+    buf.set_string(inner.x, inner.bottom() - 1, util::pad(&util::fit(&status, width), width), base.fg(Color::Yellow));
+    (cursor, (list, finder.offset))
+}
+
+/// "42 matches in 7 files · 1,203 files searched · 0.21 s", and what is unusual about it.
+fn find_status(finder: &Finder) -> String {
+    let query = finder.query();
+    if query.text.is_empty() && query.names.trim().is_empty() {
+        return "Type text to find in files, or names in Files (*.rs, !*test*, or part of a name).".into();
+    }
+    let files = finder.files.len();
+    let mut status = if query.text.is_empty() {
+        format!("{files} found · {} names looked at", finder.searched)
+    } else {
+        let hits = finder.total_hits();
+        format!("{hits} match{} in {files} file{} · {} files searched", if hits == 1 { "" } else { "es" }, if files == 1 { "" } else { "s" }, finder.searched)
+    };
+    match finder.took {
+        Some(took) => status.push_str(&format!(" · {:.2} s", took.as_secs_f64())),
+        None if finder.working() => status.push_str(" · searching…"),
+        None => {}
+    }
+    if finder.limited {
+        status.push_str(&format!(" · stopped at {}", crate::find::MAX_RESULTS));
+    }
+    if finder.literal {
+        status.push_str(" · not a valid regex, searched as typed");
+    }
+    status
+}
+
+/// `text` cut to `width` columns, as spans with the byte `ranges` in the `mark` style.
+fn marked_spans(text: &str, ranges: &[(usize, usize)], width: usize, style: Style, mark: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0;
+    let mut current = String::new();
+    let mut current_marked = false;
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        let marked = ranges.iter().any(|&(start, end)| i >= start && i < end);
+        if marked != current_marked && !current.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut current), if current_marked { mark } else { style }));
+        }
+        current_marked = marked;
+        current.push(c);
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(current, if current_marked { mark } else { style }));
+    }
+    spans
 }
 
 /// Draws one panel. Returns the cursor position while quick search is typing into it,
@@ -738,6 +885,36 @@ mod tests {
         assert!(screen.contains(r"2 E:\devel"));
         assert!(screen.contains("3072M"), "measured size shown");
         assert!(screen.contains("5.0M…"), "running total shown");
+    }
+
+    #[test]
+    fn renders_the_find_window() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new("ui-find");
+        tmp.file("src/main.rs", "fn main() {\n    let total = 40 + 2;\n    println!(\"{total}\");\n}\n");
+        tmp.file("README.md", "The total is shown.\n");
+        let mut app = app_for(&tmp);
+        app.on_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::ALT));
+        for c in "total".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.finder.as_ref().unwrap().working() {
+            assert!(Instant::now() < deadline, "search did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+            app.tick();
+        }
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        let screen = render(&mut app, 100, 20);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Find in"));
+        assert!(screen.contains("Text  total"));
+        assert!(screen.contains("README.md 1"), "{screen}");
+        assert!(screen.contains("     2:     let total = 40 + 2;"), "{screen}");
+        assert!(screen.contains("3 matches in 2 files"), "{screen}");
     }
 
     #[test]
