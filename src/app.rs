@@ -15,6 +15,7 @@ use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, Lin
 use crate::finder::{Field as FindField, Finder};
 use crate::history::History;
 use crate::hotlist::Hotlist;
+use crate::lnk;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
@@ -484,6 +485,7 @@ impl App {
                 panel.move_by(1);
             }
             KeyCode::Enter if ctrl || alt => self.insert_current_name(),
+            KeyCode::Enter if shift && cmd_empty => self.open_with(),
             KeyCode::Enter if !cmd_empty => self.run_cmdline(),
             KeyCode::Enter => self.open_current(),
             KeyCode::Backspace if cmd_empty => self.go_up(),
@@ -1455,6 +1457,9 @@ impl App {
             self.go_up();
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
+        } else if let Some(folder) = lnk::is_shortcut(&entry.path).then(|| lnk::target(&entry.path)).flatten().filter(|t| t.is_dir()) {
+            // A Windows shortcut to a folder: the panel goes there (not an Explorer window).
+            self.change_dir(self.active, folder);
         } else if entry.is_exec && platform::runs_as_program(&entry.path) {
             self.run_in_shell(self.shell().run_file_line(&entry.path));
         } else {
@@ -1464,6 +1469,14 @@ impl App {
                 Err(OpenError::NoOpener) => self.view(entry.path, entry.size, None),
                 Err(OpenError::Failed(e)) => self.error(e),
             }
+        }
+    }
+
+    /// Shift+Enter: Windows' "How do you want to open this file?" for the file under the cursor.
+    fn open_with(&mut self) {
+        let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent && !e.is_dir).cloned() else { return };
+        if let Err(e) = platform::open_with(&entry.path) {
+            self.error(e);
         }
     }
 
@@ -1966,6 +1979,19 @@ mod tests {
         assert_eq!(app.clipboard.files(), None, "cut and pasted: nothing left to paste");
         app.on_key(alt_v);
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("No files")));
+    }
+
+    /// Enter on a Windows shortcut to a folder opens the folder in the panel.
+    #[test]
+    fn a_shortcut_to_a_folder_opens_it() {
+        let tmp = TempDir::new("app-lnk");
+        let target = tmp.dir("Fotky 2024");
+        let link = tmp.path().join("Fotky.lnk");
+        fs::write(&link, crate::lnk::tests::shortcut(&target.to_string_lossy(), r".\Fotky 2024")).unwrap();
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("Fotky.lnk");
+        app.on_key(key(KeyCode::Enter));
+        assert!(util::same_path(&app.active_panel().cwd, &target), "{}", app.active_panel().cwd.display());
     }
 
     /// Shift+F2 marks on each side what the other lacks or has older; F5 then copies it over.

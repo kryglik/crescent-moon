@@ -505,6 +505,25 @@ pub fn exec_bits_mean_something(_dir: &Path) -> bool {
     true
 }
 
+/// Windows' "How do you want to open this file?" for `path`, in a process of its own so rmc
+/// goes on meanwhile.
+#[cfg(windows)]
+pub fn open_with(path: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    // The rest of the command line is the file name, as it is (quotes would be taken as
+    // part of it).
+    Command::new("rundll32.exe")
+        .raw_arg(format!("shell32.dll,OpenAs_RunDLL {}", path.display()))
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Cannot ask Windows how to open it: {e}"))
+}
+
+#[cfg(not(windows))]
+pub fn open_with(_path: &Path) -> Result<(), String> {
+    Err("\"Open with\" is Windows' own; here F3 views a file and Enter opens it in its app.".into())
+}
+
 #[cfg(windows)]
 pub fn runs_as_program(_path: &Path) -> bool {
     true

@@ -9,6 +9,7 @@ mod find;
 mod finder;
 mod history;
 mod hotlist;
+mod lnk;
 mod mouse;
 mod ops;
 mod options;

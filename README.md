@@ -51,7 +51,8 @@ Press **F1** inside rmc for the full list. The essentials:
 | Key | Action |
 | --- | --- |
 | Tab | switch panel |
-| Enter / Backspace | open directory or file / parent directory |
+| Enter / Backspace | open directory or file / parent directory; a Windows shortcut (.lnk) to a folder opens the folder in the panel, as in Total Commander |
+| Shift+Enter | open with… : Windows asks which app to open the file in |
 | Alt+F1, Alt+F2 | drive picker for the left / right panel |
 | Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
 | Alt+Left / Alt+Right | back / forward through the folders the panel was in, as in a browser (mc's Alt+Y / Alt+U too); `cd -` goes back |

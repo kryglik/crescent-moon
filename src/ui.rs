@@ -378,6 +378,14 @@ fn draw_panel(
     }
     let status = match panel.current() {
         Some(e) if e.is_parent => "UP--DIR".to_string(),
+        // Where a link or a junction leads, as mc shows it.
+        Some(e) if e.is_link => match std::fs::read_link(&e.path) {
+            Ok(target) => {
+                let target = target.display().to_string();
+                format!("{} -> {}", e.name, target.strip_prefix(r"\\?\").unwrap_or(&target))
+            }
+            Err(_) => e.name.clone(),
+        },
         Some(e) => e.name.clone(),
         None => String::new(),
     };

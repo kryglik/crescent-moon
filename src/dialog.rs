@@ -229,6 +229,8 @@ pub const HELP: &[&str] = &[
     "Panels",
     "  Arrows, PgUp/PgDn, Home/End  move the cursor",
     "  Enter        open a directory, or a file in its app",
+    "               (a Windows shortcut to a folder opens it here)",
+    "  Shift+Enter  open with… (Windows asks which app)",
     "  Backspace    parent directory (with an empty command line)",
     "  Tab          switch panel",
     "  Alt+F1/F2    choose the drive of the left/right panel",
