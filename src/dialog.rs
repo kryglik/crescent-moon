@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use crate::ops::Answer;
+use crate::panel::SortBy;
 use crate::platform::DriveInfo;
 use crate::util;
 
@@ -35,6 +36,8 @@ pub enum Dialog {
     /// The list itself lives in `App::hotlist`.
     Hotlist { cursor: usize },
     Help { scroll: usize },
+    /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
+    Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
     /// A question from a running job; the answer goes back over `reply`.
     Question {
         title: String,
@@ -200,7 +203,8 @@ pub const HELP: &[&str] = &[
     "  Insert, Shift+Up/Down   mark files",
     "  + - *        mark by pattern, unmark by pattern, invert",
     "  Ctrl+S, Alt+S   quick search by name (again: next match)",
-    "  F9           sort by name, extension, size, time",
+    "  F9           sort by name, extension, size or time;",
+    "               F9 F9 (or the same one again) flips A-Z / Z-A",
     "  Ctrl+R       reload       Alt+. or Ctrl+H  hidden files",
     "  Ctrl+U       swap panels",
     "  Alt+I/Alt+O  other panel: same dir / dir under cursor",
@@ -215,7 +219,8 @@ pub const HELP: &[&str] = &[
     "Mouse",
     "  click        select       double-click  open",
     "  right-click  mark         wheel         scroll",
-    "  click Name / Size / Modify time to sort, F-key labels to run",
+    "  click Name / Size / Modify time to sort (again: flip the order)",
+    "  click the F-key labels to run them",
     "  Shift+drag selects text; rmc --no-mouse leaves the mouse alone",
     "",
     "Command line",

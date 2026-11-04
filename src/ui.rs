@@ -15,7 +15,7 @@ use crate::dialog::{self, Button, Dialog};
 use crate::hotlist::Hotlist;
 use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
-use crate::panel::{Entry, Panel};
+use crate::panel::{Entry, Panel, SortBy};
 use crate::platform::DriveInfo;
 use crate::subshell::Subshell;
 use crate::util;
@@ -128,16 +128,20 @@ fn draw_panel(
         details,
     };
 
-    // Column headings, with the sort indicator in the corner like mc.
+    // Column headings, with the sort indicator in the corner like mc, and an arrow on the
+    // sorted column: ↑ for A to Z (small to big, old to new), ↓ the other way.
     let heading = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let sort = panel.sort.indicator();
-    buf.set_string(inner.x, inner.y, sort, base);
-    buf.set_string(inner.x + 2, inner.y, util::center("Name", name_w.saturating_sub(2)), heading);
+    buf.set_string(inner.x, inner.y, panel.sort.indicator(), base);
+    let arrow = if panel.sort.descending(panel.reverse) { "↓" } else { "↑" };
+    let title = |text: &str, sorted: bool| if sorted { format!("{text}{arrow}") } else { text.to_string() };
+    let by_name = matches!(panel.sort, SortBy::Name | SortBy::Extension);
+    buf.set_string(inner.x + 2, inner.y, util::center(&title("Name", by_name), name_w.saturating_sub(2)), heading);
     if details {
         buf.set_string(size_x - 1, inner.y, "│", base);
-        buf.set_string(size_x, inner.y, util::center("Size", size_w), heading);
+        buf.set_string(size_x, inner.y, util::center(&title("Size", panel.sort == SortBy::Size), size_w), heading);
         buf.set_string(time_x - 1, inner.y, "│", base);
-        buf.set_string(time_x, inner.y, util::center("Modify time", time_w), heading);
+        let time = title("Modify time", panel.sort == SortBy::Time);
+        buf.set_string(time_x, inner.y, util::center(&time, time_w), heading);
     }
 
     let now = SystemTime::now();
@@ -455,6 +459,7 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
             (Some(cursor), DialogHit { area: outer, ..DialogHit::default() })
         }
         Dialog::Drives { drives, cursor, side, .. } => (None, draw_drives(frame, area, drives, *cursor, *side)),
+        Dialog::Sort { cursor, current, reverse, .. } => (None, draw_sort(frame, area, *cursor, *current, *reverse)),
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         Dialog::Help { scroll } => {
             let height = (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -475,6 +480,28 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
             (None, DialogHit { area: outer, ..DialogHit::default() })
         }
     }
+}
+
+/// The F9 menu: the four orders with their keys; the current one says which way round it is.
+fn draw_sort(frame: &mut Frame, area: Rect, cursor: usize, current: SortBy, reverse: bool) -> DialogHit {
+    let rows = SortBy::ALL.len() as u16;
+    let (outer, inner) = dialog_frame(frame, area, 36, rows + 4, "Sort by", false);
+    let style = dialog_style(false);
+    let mut lines: Vec<Line> = SortBy::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, &by)| {
+            let order = if by == current { by.direction(reverse) } else { "" };
+            let text = format!("{}  {:<12}{order}", by.letter(), by.label());
+            let row_style = if i == cursor { cursor_style() } else { style };
+            Line::from(Span::styled(util::pad(&text, inner.width as usize), row_style))
+        })
+        .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("again: the other way round", style.fg(Color::DarkGray))).right_aligned());
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let list = Rect::new(inner.x, inner.y, inner.width, rows.min(inner.height));
+    DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
 }
 
 /// The drive picker: letter, label (or network share), type and free space. Slow drives
@@ -650,6 +677,28 @@ mod tests {
         assert!(screen.contains(r"2 E:\devel"));
         assert!(screen.contains("3072M"), "measured size shown");
         assert!(screen.contains("5.0M…"), "running total shown");
+    }
+
+    #[test]
+    fn renders_sort_arrows_and_the_sort_menu() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let tmp = TempDir::new("ui-sort");
+        tmp.file("a.txt", "a");
+        let mut app = app_for(&tmp);
+        let screen = render(&mut app, 100, 16);
+        assert!(screen.contains("Name↑"), "{screen}");
+
+        app.panels[0].choose_sort(SortBy::Time);
+        app.panels[0].choose_sort(SortBy::Time);
+        app.on_key(KeyEvent::from(KeyCode::F(9)));
+        let screen = render(&mut app, 100, 16);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Modify time↑"), "oldest first goes up:\n{screen}");
+        assert!(screen.contains("Sort by"));
+        assert!(screen.contains("e  Extension"));
+        assert!(screen.contains("t  Modify time oldest first"), "{screen}");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, Lin
 use crate::hotlist::Hotlist;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
-use crate::panel::{DirSize, Panel};
+use crate::panel::{DirSize, Panel, SortBy};
 use crate::platform::{self, OpenError, Shell};
 use crate::sizes::Sizer;
 use crate::subshell::Subshell;
@@ -201,11 +201,7 @@ impl App {
             KeyCode::F(7) => self.start_input("Make directory", "New directory name:", "", InputAction::Mkdir),
             KeyCode::F(8) => self.confirm_delete(!shift),
             KeyCode::Delete if cmd_empty => self.confirm_delete(!shift),
-            KeyCode::F(9) => {
-                let panel = self.active_panel_mut();
-                panel.sort = panel.sort.next();
-                panel.reload();
-            }
+            KeyCode::F(9) => self.open_sort_menu(),
             KeyCode::F(10) => {
                 self.dialog = Some(Dialog::Confirm {
                     title: "Quit".into(),
@@ -376,6 +372,40 @@ impl App {
                 _ => Some(Dialog::Drives { side, drives, cursor }),
             },
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
+            Dialog::Sort { side, mut cursor, current, reverse } => {
+                let last = SortBy::ALL.len() - 1;
+                let chosen = match key.code {
+                    KeyCode::Up => {
+                        cursor = cursor.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down => {
+                        cursor = (cursor + 1).min(last);
+                        None
+                    }
+                    KeyCode::Home | KeyCode::PageUp => {
+                        cursor = 0;
+                        None
+                    }
+                    KeyCode::End | KeyCode::PageDown => {
+                        cursor = last;
+                        None
+                    }
+                    // F9 again picks the row under the cursor, which starts on the current
+                    // order: F9 F9 flips it.
+                    KeyCode::Enter | KeyCode::F(9) => SortBy::ALL.get(cursor).copied(),
+                    KeyCode::Char(c) => SortBy::ALL.iter().copied().find(|s| s.letter() == c.to_ascii_lowercase()),
+                    KeyCode::Esc | KeyCode::F(10) => return,
+                    _ => None,
+                };
+                match chosen {
+                    Some(by) => {
+                        self.panels[side].choose_sort(by);
+                        None
+                    }
+                    None => Some(Dialog::Sort { side, cursor, current, reverse }),
+                }
+            }
             Dialog::Question { title, lines, buttons, answers, mut focus, error, reply } => {
                 match dialog::handle_buttons(buttons, &mut focus, &key) {
                     ButtonOutcome::Pressed(i) => {
@@ -470,6 +500,14 @@ impl App {
         shell.follow_panel(&cwd, &self.config.shell);
         shell.send_text(&format!("{line}\r"));
         self.shell_shown = true;
+    }
+
+    /// F9: a menu of sort orders, the cursor on the current one (so F9 F9 reverses it).
+    fn open_sort_menu(&mut self) {
+        let panel = self.active_panel();
+        let (current, reverse) = (panel.sort, panel.reverse);
+        let cursor = SortBy::ALL.iter().position(|&s| s == current).unwrap_or(0);
+        self.dialog = Some(Dialog::Sort { side: self.active, cursor, current, reverse });
     }
 
     fn open_hotlist(&mut self) {
@@ -1097,9 +1135,9 @@ mod tests {
         assert_eq!(size_of("small").bytes, 3);
         assert_eq!(panel.total(), Some(8005));
 
-        // Sorting by size (F9 twice: extension, then size) uses the measured sizes.
+        // Sorting by size (F9, s) uses the measured sizes.
         app.on_key(key(KeyCode::F(9)));
-        app.on_key(key(KeyCode::F(9)));
+        app.on_key(key(KeyCode::Char('s')));
         let order: Vec<&str> = app.active_panel().entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(order, ["..", "big", "small", "loose.txt"]);
 
@@ -1308,6 +1346,44 @@ mod tests {
         wait_for_job(&mut app);
         assert!(app.dialog.is_none(), "nothing more to dismiss");
         assert_eq!(fs::read_to_string(right.path().join("x.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn f9_menu_sorts_and_f9_twice_reverses() {
+        let tmp = TempDir::new("app-sort");
+        tmp.file("a.txt", "1");
+        tmp.file("b.txt", "12");
+        tmp.file("c.txt", "123");
+        let mut app = test_app(tmp.path(), tmp.path());
+        let names = |app: &App| app.active_panel().entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        let order = |app: &App| (app.active_panel().sort, app.active_panel().reverse);
+
+        // F9 F9: the cursor starts on the current order (Name), so it flips to Z to A.
+        app.on_key(key(KeyCode::F(9)));
+        assert!(matches!(app.dialog, Some(Dialog::Sort { cursor: 0, .. })));
+        app.on_key(key(KeyCode::F(9)));
+        assert!(app.dialog.is_none());
+        assert_eq!(names(&app), ["..", "c.txt", "b.txt", "a.txt"]);
+
+        // A letter picks an order, the usual way round; the same letter again flips it.
+        app.on_key(key(KeyCode::F(9)));
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(order(&app), (SortBy::Size, false));
+        assert_eq!(names(&app), ["..", "c.txt", "b.txt", "a.txt"], "largest first");
+        app.on_key(key(KeyCode::F(9)));
+        app.on_key(key(KeyCode::Char('S')));
+        assert_eq!(order(&app), (SortBy::Size, true));
+
+        // Arrows and Enter; Esc leaves the order alone.
+        app.on_key(key(KeyCode::F(9)));
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(order(&app), (SortBy::Name, false));
+        app.on_key(key(KeyCode::F(9)));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dialog.is_none());
+        assert_eq!(order(&app), (SortBy::Name, false));
     }
 
     #[test]

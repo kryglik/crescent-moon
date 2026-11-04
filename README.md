@@ -58,7 +58,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | F3 / F4 / Shift+F4 | view / edit / new file (in the editor) |
 | F5 / F6 / F7 | copy / move / make directory |
 | F8, Delete | to the Recycle Bin (Shift: permanently) |
-| F9 | sort by name, extension, size, time |
+| F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
@@ -100,8 +100,10 @@ command is still running, so it never refuses one.
 ### Mouse
 
 Click selects, double-click opens, right-click marks, the wheel scrolls the panel under the
-pointer. Click a column heading (Name, Size, Modify time) to sort by it, and the F-key bar
-labels to run them; dialog buttons and the drive and hotlist rows are clickable too.
+pointer. Click a column heading (Name, Size, Modify time) to sort by it, and again to flip
+the order; an arrow on the heading shows which way round it is (↑ A to Z, small to big, old
+to new). Click the F-key bar labels to run them; dialog buttons and the drive, hotlist and
+sort menu rows are clickable too.
 
 While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
 `rmc --no-mouse` to leave the mouse to the terminal.

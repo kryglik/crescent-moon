@@ -18,13 +18,44 @@ pub enum SortBy {
 }
 
 impl SortBy {
-    pub fn next(self) -> Self {
+    /// In the order of the F9 menu.
+    pub const ALL: [SortBy; 4] = [SortBy::Name, SortBy::Extension, SortBy::Size, SortBy::Time];
+
+    pub fn label(self) -> &'static str {
         match self {
-            SortBy::Name => SortBy::Extension,
-            SortBy::Extension => SortBy::Size,
-            SortBy::Size => SortBy::Time,
-            SortBy::Time => SortBy::Name,
+            SortBy::Name => "Name",
+            SortBy::Extension => "Extension",
+            SortBy::Size => "Size",
+            SortBy::Time => "Modify time",
         }
+    }
+
+    /// Its key in the F9 menu.
+    pub fn letter(self) -> char {
+        match self {
+            SortBy::Name => 'n',
+            SortBy::Extension => 'e',
+            SortBy::Size => 's',
+            SortBy::Time => 't',
+        }
+    }
+
+    /// The order the list is in. Without `reverse` names go A to Z, and sizes and times
+    /// biggest and newest first, which is what one usually looks for.
+    pub fn direction(self, reverse: bool) -> &'static str {
+        match (self, reverse) {
+            (SortBy::Name | SortBy::Extension, false) => "A to Z",
+            (SortBy::Name | SortBy::Extension, true) => "Z to A",
+            (SortBy::Size, false) => "largest first",
+            (SortBy::Size, true) => "smallest first",
+            (SortBy::Time, false) => "newest first",
+            (SortBy::Time, true) => "oldest first",
+        }
+    }
+
+    /// Whether the list goes from high to low (Z..A, big..small, new..old): the heading's ↓.
+    pub fn descending(self, reverse: bool) -> bool {
+        matches!(self, SortBy::Size | SortBy::Time) != reverse
     }
 
     /// Shown in the panel header, as in mc.
@@ -90,6 +121,8 @@ pub struct Panel {
     /// Sizes of subdirectories, by name, for the current directory only.
     pub dir_sizes: HashMap<String, DirSize>,
     pub sort: SortBy,
+    /// The other way round: Z to A, smallest or oldest first. Directories stay on top.
+    pub reverse: bool,
     pub show_hidden: bool,
     /// Visible list rows, updated on every draw (used for PgUp/PgDn).
     pub page: usize,
@@ -109,6 +142,7 @@ impl Panel {
             marked: HashSet::new(),
             dir_sizes: HashMap::new(),
             sort: SortBy::Name,
+            reverse: false,
             show_hidden,
             page: 20,
             space: None,
@@ -150,7 +184,7 @@ impl Panel {
     /// Re-reads the directory. Marks of entries that still exist are kept.
     pub fn load(&mut self) -> io::Result<()> {
         let mut entries = read_entries(&self.cwd, self.show_hidden)?;
-        sort_entries(&mut entries, self.sort, &self.dir_sizes);
+        sort_entries(&mut entries, self.sort, self.reverse, &self.dir_sizes);
         // On Windows a drive root gets ".." too: it opens the drive picker.
         if self.cwd.parent().is_some() || cfg!(windows) {
             entries.insert(0, Entry::parent(&self.cwd));
@@ -164,6 +198,17 @@ impl Panel {
         Ok(())
     }
 
+    /// Sorts by `by`. Choosing the order it already has flips it (A to Z, then Z to A), like
+    /// clicking a column heading twice.
+    pub fn choose_sort(&mut self, by: SortBy) {
+        if self.sort == by {
+            self.reverse = !self.reverse;
+        } else {
+            (self.sort, self.reverse) = (by, false);
+        }
+        self.resort();
+    }
+
     /// Reloads and keeps the cursor on the same name when it still exists.
     pub fn reload(&mut self) {
         let name = self.current().map(|e| e.name.clone());
@@ -171,10 +216,10 @@ impl Panel {
             // The directory vanished (deleted, drive removed): climb to something that exists.
             let cwd = self.cwd.clone();
             let show_hidden = self.show_hidden;
-            let sort = self.sort;
+            let (sort, reverse) = (self.sort, self.reverse);
             let drive_dirs = std::mem::take(&mut self.drive_dirs);
             *self = Panel::new(cwd, show_hidden);
-            self.sort = sort;
+            (self.sort, self.reverse) = (sort, reverse);
             for (drive, dir) in drive_dirs {
                 self.drive_dirs.entry(drive).or_insert(dir);
             }
@@ -388,7 +433,7 @@ impl Panel {
     fn resort(&mut self) {
         let name = self.current().map(|e| e.name.clone());
         let start = usize::from(self.entries.first().is_some_and(|e| e.is_parent));
-        sort_entries(&mut self.entries[start..], self.sort, &self.dir_sizes);
+        sort_entries(&mut self.entries[start..], self.sort, self.reverse, &self.dir_sizes);
         if let Some(name) = name {
             self.select_name(&name);
         }
@@ -433,17 +478,18 @@ fn read_entries(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     Ok(out)
 }
 
-fn sort_entries(entries: &mut [Entry], sort: SortBy, sizes: &HashMap<String, DirSize>) {
+/// Directories first, then by `sort` (names break ties); `reverse` turns the order round but
+/// keeps directories on top, as mc and Total Commander do.
+fn sort_entries(entries: &mut [Entry], sort: SortBy, reverse: bool, sizes: &HashMap<String, DirSize>) {
     entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| match sort {
-                SortBy::Name => Ordering::Equal,
-                SortBy::Extension => a.extension().cmp(b.extension()),
-                SortBy::Size => effective_size(b, sizes).cmp(&effective_size(a, sizes)),
-                SortBy::Time => b.modified.cmp(&a.modified),
-            })
-            .then_with(|| a.sort_name.cmp(&b.sort_name))
+        let order = match sort {
+            SortBy::Name => Ordering::Equal,
+            SortBy::Extension => a.extension().cmp(b.extension()),
+            SortBy::Size => effective_size(b, sizes).cmp(&effective_size(a, sizes)),
+            SortBy::Time => b.modified.cmp(&a.modified),
+        }
+        .then_with(|| a.sort_name.cmp(&b.sort_name));
+        b.is_dir.cmp(&a.is_dir).then(if reverse { order.reverse() } else { order })
     });
 }
 
@@ -490,6 +536,36 @@ mod tests {
         panel.sort = SortBy::Extension;
         panel.reload();
         assert_eq!(names(&panel), ["..", "big.md", "mid.rs", "small.txt"]);
+    }
+
+    #[test]
+    fn choosing_the_same_order_again_reverses_it() {
+        let tmp = TempDir::new("panel-reverse");
+        tmp.dir("Alpha");
+        tmp.dir("zeta");
+        tmp.file("a.txt", "1");
+        tmp.file("B.md", "123");
+        tmp.file("c.rs", "12");
+        let mut panel = Panel::new(tmp.path().to_path_buf(), true);
+        assert!(panel.select_name("B.md"));
+        assert_eq!(names(&panel), ["..", "Alpha", "zeta", "a.txt", "B.md", "c.rs"]);
+
+        // Name again: Z to A, directories still on top, the cursor stays on its file.
+        panel.choose_sort(SortBy::Name);
+        assert!(panel.reverse);
+        assert_eq!(names(&panel), ["..", "zeta", "Alpha", "c.rs", "B.md", "a.txt"]);
+        assert_eq!(panel.current().unwrap().name, "B.md");
+
+        // Another order starts the usual way round (largest first), and again flips it.
+        panel.choose_sort(SortBy::Size);
+        assert_eq!((panel.sort, panel.reverse), (SortBy::Size, false));
+        assert_eq!(names(&panel), ["..", "Alpha", "zeta", "B.md", "c.rs", "a.txt"]);
+        panel.choose_sort(SortBy::Size);
+        assert_eq!(names(&panel), ["..", "zeta", "Alpha", "a.txt", "c.rs", "B.md"]);
+
+        // A reload keeps the order.
+        panel.reload();
+        assert_eq!(names(&panel), ["..", "zeta", "Alpha", "a.txt", "c.rs", "B.md"]);
     }
 
     #[test]

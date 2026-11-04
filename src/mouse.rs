@@ -113,16 +113,15 @@ impl App {
             _ => return,
         };
         self.active = side;
+        // A column heading sorts by it; clicking it again flips the order (A-Z / Z-A).
+        // (Sorting by extension is in the F9 menu.)
         if hit.details && pos.y == hit.header_y && button == MouseButton::Left {
-            let panel = &mut self.panels[side];
-            panel.sort = match pos.x {
+            let by = match pos.x {
                 x if x >= hit.time_x => SortBy::Time,
                 x if x >= hit.size_x => SortBy::Size,
-                // Clicking Name again sorts by extension.
-                _ if panel.sort == SortBy::Name => SortBy::Extension,
                 _ => SortBy::Name,
             };
-            panel.reload();
+            self.panels[side].choose_sort(by);
             return;
         }
         if !hit.list.contains(pos) {
@@ -181,6 +180,7 @@ impl App {
                 match &mut self.dialog {
                     Some(Dialog::Drives { cursor, drives, .. }) if i < drives.len() => *cursor = i,
                     Some(Dialog::Hotlist { cursor }) if i < self.hotlist.dirs.len() => *cursor = i,
+                    Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
                     _ => return,
                 }
                 self.on_key(KeyEvent::from(KeyCode::Enter));
@@ -194,7 +194,13 @@ impl App {
             DialogAction::Close => {
                 if matches!(
                     self.dialog,
-                    Some(Dialog::Help { .. } | Dialog::Drives { .. } | Dialog::Hotlist { .. } | Dialog::Message { .. })
+                    Some(
+                        Dialog::Help { .. }
+                            | Dialog::Drives { .. }
+                            | Dialog::Hotlist { .. }
+                            | Dialog::Sort { .. }
+                            | Dialog::Message { .. }
+                    )
                 ) {
                     self.on_key(KeyEvent::from(KeyCode::Esc));
                 }
@@ -295,10 +301,26 @@ mod tests {
         let tmp = sample();
         let mut app = app(tmp.path());
         let hit = app.hit.panels[0];
+        let order = |app: &App| (app.panels[0].sort, app.panels[0].reverse);
         click(&mut app, hit.size_x + 2, hit.header_y);
-        assert_eq!(app.panels[0].sort, SortBy::Size);
+        assert_eq!(order(&app), (SortBy::Size, false));
+        click(&mut app, hit.size_x + 2, hit.header_y);
+        assert_eq!(order(&app), (SortBy::Size, true), "the same heading again flips it");
         click(&mut app, hit.time_x + 2, hit.header_y);
-        assert_eq!(app.panels[0].sort, SortBy::Time);
+        assert_eq!(order(&app), (SortBy::Time, false));
+        click(&mut app, hit.list.x + 10, hit.header_y);
+        assert_eq!(order(&app), (SortBy::Name, false));
+        click(&mut app, hit.list.x + 10, hit.header_y);
+        assert_eq!(order(&app), (SortBy::Name, true));
+
+        // "9Sort" opens the sort menu; its rows are clickable ("Size" is the third).
+        let bar = app.hit.keybar;
+        click(&mut app, bar.x + bar.width / 10 * 8 + 2, bar.y);
+        assert!(matches!(app.dialog, Some(Dialog::Sort { .. })));
+        let (rows, _) = app.hit.dialog.as_ref().unwrap().rows.unwrap();
+        click(&mut app, rows.x + 2, rows.y + 2);
+        assert!(app.dialog.is_none());
+        assert_eq!(order(&app), (SortBy::Size, false));
 
         // "7Mkdir" opens the make-directory dialog; clicking outside an input dialog keeps it.
         let bar = app.hit.keybar;
