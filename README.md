@@ -39,6 +39,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | F5 / F6 / F7 | copy / move / make directory |
 | F8, Delete | to the Recycle Bin (Shift: permanently) |
 | F9 | sort by name, extension, size, time |
+| Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | F10 | quit |
@@ -135,7 +136,7 @@ itself in a Windows Terminal window, the scripts in `tools/` attach to its conso
 
 ```powershell
 wt -w new cmd /c rmc E:\some\dir          # then find its pid: Get-Process rmc
-tools\sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:dir', 'enter'
+tools\sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:dir', 'enter'   # also esc, f1-f12, alt+f1, shift+f4, ctrl+d…
 tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
 ```
 

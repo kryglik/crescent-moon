@@ -210,6 +210,7 @@ pub const HELP: &[&str] = &[
     "  F5 copy      F6 move    F7 make directory",
     "  F8, Delete               move to the Recycle Bin",
     "  Shift+F8, Shift+Delete   delete permanently",
+    "  Esc          close a dialog, stop a copy/move/delete",
     "",
     "Mouse",
     "  click        select       double-click  open",

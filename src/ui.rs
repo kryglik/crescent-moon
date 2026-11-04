@@ -458,7 +458,8 @@ fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, hotlist: &Hotlist
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         Dialog::Help { scroll } => {
             let height = (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
-            let (outer, inner) = dialog_frame(frame, area, 64, height, "rmc keys (Esc closes)", false);
+            // 72 columns: room for the longest help line (68) inside the border and padding.
+            let (outer, inner) = dialog_frame(frame, area, 72, height, "rmc keys (Esc closes)", false);
             let visible = inner.height as usize;
             let start = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
             let lines: Vec<Line> = dialog::HELP[start..]
@@ -702,6 +703,9 @@ mod tests {
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(1)));
         let help = render(&mut app, 80, 40);
         assert!(help.contains("rmc keys"));
+        // The longest help lines fit whole.
+        assert!(help.contains("Enter runs it in the shell, in the panel's folder"), "{help}");
+        assert!(help.contains("rmc --no-mouse leaves the mouse alone"), "{help}");
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Esc));
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(7)));
         let mkdir = render(&mut app, 80, 24);

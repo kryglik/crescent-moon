@@ -1,6 +1,8 @@
 # Sends key presses into the console of a running process (for testing rmc's real main loop).
-# Usage: sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o' | 'text:hello' | 'enter' ...
-param([int] $ProcessId, [string[]] $Keys)
+# Usage: sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:hello', 'enter', 'esc', 'alt+f1', 'shift+f4' ...
+# From another script (pwsh -File), pass the keys as separate words after the process id:
+#   pwsh -File sendkey.ps1 -ProcessId <pid> home down f2
+param([int] $ProcessId, [Parameter(ValueFromRemainingArguments)] [string[]] $Keys)
 
 Add-Type -TypeDefinition @'
 using System;
@@ -47,22 +49,54 @@ public static class ConsoleKeys {
 }
 '@
 
+# Control key state bits of a console key event.
+$LEFT_ALT = 0x0002
 $LEFT_CTRL = 0x0008
+$SHIFT = 0x0010
+
+# Named keys: virtual key code and the character the console reports with them.
+$named = @{
+    'esc' = @(0x1B, 27); 'enter' = @(0x0D, 13); 'tab' = @(0x09, 9); 'space' = @(0x20, 32)
+    'backspace' = @(0x08, 8); 'insert' = @(0x2D, 0); 'delete' = @(0x2E, 0)
+    'up' = @(0x26, 0); 'down' = @(0x28, 0); 'left' = @(0x25, 0); 'right' = @(0x27, 0)
+    'home' = @(0x24, 0); 'end' = @(0x23, 0); 'pgup' = @(0x21, 0); 'pgdn' = @(0x22, 0)
+}
+1..12 | ForEach-Object { $named["f$_"] = @((0x6F + $_), 0) }
+
 foreach ($key in $Keys) {
     if ($key -like 'text:*') {
         foreach ($c in $key.Substring(5).ToCharArray()) {
-            $vk = [uint16][char]::ToUpper($c)
+            # Letters and digits have their own key codes; anything else (like '-', whose code
+            # would be Insert's) goes as a bare character.
+            $vk = if ($c -match '[a-zA-Z0-9 ]') { [uint16][char]::ToUpper($c) } else { 0 }
             [ConsoleKeys]::Send($ProcessId, $vk, $c, 0) | Out-Null
             Start-Sleep -Milliseconds 15
         }
         continue
     }
-    $result = switch ($key) {
-        'ctrl+o' { [ConsoleKeys]::Send($ProcessId, 0x4F, [char]0x0F, $LEFT_CTRL) }
-        'enter'  { [ConsoleKeys]::Send($ProcessId, 0x0D, [char]13, 0) }
-        'f10'    { [ConsoleKeys]::Send($ProcessId, 0x79, [char]0, 0) }
-        default  { "unknown key $key" }
+    # 'ctrl+alt+shift+NAME', where NAME is one of $named or a single letter or digit.
+    $parts = $key.ToLower().Split('+')
+    $name = $parts[-1]
+    $state = 0
+    foreach ($modifier in $parts | Select-Object -SkipLast 1) {
+        switch ($modifier) {
+            'ctrl' { $state = $state -bor $LEFT_CTRL }
+            'alt' { $state = $state -bor $LEFT_ALT }
+            'shift' { $state = $state -bor $SHIFT }
+        }
     }
+    if ($named.ContainsKey($name)) {
+        $vk, $code = $named[$name]
+        $char = [char]$code
+    } elseif ($name.Length -eq 1 -and $name -match '[a-z0-9]') {
+        $vk = [int][char]$name.ToUpper()
+        # Ctrl+letter arrives as its control code, as from a real keyboard.
+        $char = if (($state -band $LEFT_CTRL) -and $name -match '[a-z]') { [char]($vk - 0x40) } else { [char]$name }
+    } else {
+        "$key -> unknown key"
+        continue
+    }
+    $result = [ConsoleKeys]::Send($ProcessId, [uint16]$vk, $char, [uint32]$state)
     "$key -> $result"
     Start-Sleep -Milliseconds 100
 }

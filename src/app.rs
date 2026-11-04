@@ -635,15 +635,16 @@ impl App {
             panel.dir_sizes.clear();
             panel.reload();
         }
-        if cancelled {
-            self.dialog = Some(Dialog::Message { title: "Cancelled".into(), lines: vec!["Stopped.".into()], error: false });
-        } else if !errors.is_empty() {
+        // Esc just stops the job: no "cancelled" box to dismiss as well. Failures from before
+        // the stop are still worth knowing about.
+        if !errors.is_empty() {
             let mut lines = vec![format!("{} item(s) were not processed:", errors.len())];
             lines.extend(errors.iter().take(8).cloned());
             if errors.len() > 8 {
                 lines.push(format!("… and {} more", errors.len() - 8));
             }
-            self.dialog = Some(Dialog::Message { title: "Problems".into(), lines, error: true });
+            let title = if cancelled { "Stopped" } else { "Problems" };
+            self.dialog = Some(Dialog::Message { title: title.into(), lines, error: true });
         }
     }
 
@@ -1255,6 +1256,24 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(tmp.path().join("Gamma.txt").exists());
         assert_eq!(app.active_panel().current().unwrap().name, "Gamma.txt");
+    }
+
+    #[test]
+    fn esc_on_a_job_question_stops_it_without_another_box() {
+        let left = TempDir::new("app-esc-left");
+        let right = TempDir::new("app-esc-right");
+        left.file("x.txt", "new");
+        right.file("x.txt", "old");
+        let mut app = test_app(left.path(), right.path());
+        assert!(app.active_panel_mut().select_name("x.txt"));
+        app.on_key(key(KeyCode::F(5)));
+        app.on_key(key(KeyCode::Enter));
+        wait_until("the overwrite question", &mut app, |app| matches!(app.dialog, Some(Dialog::Question { .. })));
+
+        app.on_key(key(KeyCode::Esc));
+        wait_for_job(&mut app);
+        assert!(app.dialog.is_none(), "nothing more to dismiss");
+        assert_eq!(fs::read_to_string(right.path().join("x.txt")).unwrap(), "old");
     }
 
     #[test]
