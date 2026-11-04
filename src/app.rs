@@ -228,7 +228,8 @@ impl App {
             // Ctrl+\ is a dead key on the Czech layout, so Ctrl+D (as in Total Commander) works too.
             KeyCode::Char('\\' | 'd' | '\u{1c}') if ctrl && !alt => self.open_hotlist(),
             KeyCode::Char(' ') if ctrl && !alt => self.calculate_sizes(),
-            KeyCode::Char('s') if ctrl && !alt => self.quicksearch = Some(String::new()),
+            // Ctrl+S or Alt+S, as in mc (both together is AltGr, which types a character).
+            KeyCode::Char('s') if ctrl != alt => self.quicksearch = Some(String::new()),
             KeyCode::Char('i') if alt && !ctrl => {
                 let cwd = self.active_panel().cwd.clone();
                 self.change_dir(1 - self.active, cwd);
@@ -259,8 +260,10 @@ impl App {
     fn on_quicksearch_key(&mut self, key: &KeyEvent) -> bool {
         let Some(query) = self.quicksearch.as_mut() else { return false };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('s') if ctrl => {
+            // The same key again: the next name that starts with what was typed.
+            KeyCode::Char('s') if ctrl != alt => {
                 let query = query.clone();
                 self.active_panel_mut().find_prefix(&query, true);
             }
@@ -1252,5 +1255,27 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(tmp.path().join("Gamma.txt").exists());
         assert_eq!(app.active_panel().current().unwrap().name, "Gamma.txt");
+    }
+
+    #[test]
+    fn alt_s_is_quick_search_too() {
+        let tmp = TempDir::new("app-alt-s");
+        tmp.file("bar.txt", "");
+        tmp.file("baz.txt", "");
+        tmp.file("foo.txt", "");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(with_mods(KeyCode::Char('s'), KeyModifiers::ALT));
+        typing(&mut app, "ba");
+        assert_eq!(app.active_panel().current().unwrap().name, "bar.txt");
+        // Alt+S again: the next match.
+        app.on_key(with_mods(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert_eq!(app.active_panel().current().unwrap().name, "baz.txt");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.quicksearch, None);
+        assert!(app.cmdline.is_empty());
+
+        // AltGr (Ctrl+Alt) is a character on some layouts, not quick search.
+        app.on_key(with_mods(KeyCode::Char('s'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(app.quicksearch, None);
     }
 }

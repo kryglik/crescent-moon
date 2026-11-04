@@ -39,7 +39,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | F5 / F6 / F7 | copy / move / make directory |
 | F8, Delete | to the Recycle Bin (Shift: permanently) |
 | F9 | sort by name, extension, size, time |
-| Ctrl+S | quick search |
+| Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | F10 | quit |
 

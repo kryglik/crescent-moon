@@ -199,7 +199,7 @@ pub const HELP: &[&str] = &[
     "  Ctrl+Space   size of the directory (on '..': all of them)",
     "  Insert, Shift+Up/Down   mark files",
     "  + - *        mark by pattern, unmark by pattern, invert",
-    "  Ctrl+S       quick search by name",
+    "  Ctrl+S, Alt+S   quick search by name (again: next match)",
     "  F9           sort by name, extension, size, time",
     "  Ctrl+R       reload       Alt+. or Ctrl+H  hidden files",
     "  Ctrl+U       swap panels",
