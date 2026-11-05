@@ -206,6 +206,20 @@ impl LineEdit {
                 let at = self.byte_index(self.cursor);
                 self.text.truncate(at);
             }
+            // The word before the cursor, as in bash.
+            KeyCode::Char('w') if ctrl => {
+                let chars: Vec<char> = self.text.chars().collect();
+                let mut start = self.cursor;
+                while start > 0 && chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                while start > 0 && !chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                let (from, to) = (self.byte_index(start), self.byte_index(self.cursor));
+                self.text.replace_range(from..to, "");
+                self.cursor = start;
+            }
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
                 let at = self.byte_index(self.cursor);
@@ -281,6 +295,8 @@ pub const COMMANDS: &[Command] = &[
     command("Back to the previous folder", "Alt+Left", KeyCode::Left, ALT),
     command("Forward again", "Alt+Right", KeyCode::Right, ALT),
     command("Quick view of the file in the other panel", "Ctrl+Q", KeyCode::Char('q'), CTRL),
+    command("New tab (this folder)", "Ctrl+T", KeyCode::Char('t'), CTRL),
+    command("Close the tab", "Ctrl+W", KeyCode::Char('w'), CTRL),
     command("Filter: show only matching files", "Ctrl+F", KeyCode::Char('f'), CTRL),
     command("Quick search by name", "Ctrl+S", KeyCode::Char('s'), CTRL),
     command("Mark everything", "Ctrl+A", KeyCode::Char('a'), CTRL),
@@ -344,6 +360,7 @@ pub const HELP: &[&str] = &[
     "               F9 F9 (or the same one again) flips A-Z / Z-A",
     "  Ctrl+R       reload       Alt+. or Ctrl+H  hidden files",
     "  Ctrl+U       swap panels",
+    "  Ctrl+T, Ctrl+W   new tab here, close the tab; Alt+1…9 go to one",
     "  Shift+F2     compare: mark what the other side lacks or has older",
     "  Ctrl+Q       quick view of the file in the other panel (Tab: scroll)",
     "  Alt+I/Alt+O  other panel: same dir / dir under cursor",

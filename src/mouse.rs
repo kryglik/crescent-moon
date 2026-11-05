@@ -25,6 +25,8 @@ pub struct HitAreas {
     pub find: Option<(Rect, usize)>,
     /// The quick view, where the other panel was.
     pub preview: Option<Rect>,
+    /// Each side's tabs and their numbers (when there are several).
+    pub tabs: [Vec<(Rect, usize)>; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -112,6 +114,15 @@ impl App {
                 self.on_key(KeyEvent::from(KeyCode::F(n)));
             }
             return;
+        }
+        // A tab: shown, and its side active.
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            let clicked = (0..2).find_map(|side| self.hit.tabs[side].iter().find(|(r, _)| r.contains(pos)).map(|&(_, i)| (side, i)));
+            if let Some((side, i)) = clicked {
+                self.active = side;
+                self.switch_tab(side, i);
+                return;
+            }
         }
         // The quick view: the wheel scrolls it, a click gives it the focus (for the arrows).
         if let Some(area) = self.hit.preview

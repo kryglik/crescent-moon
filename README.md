@@ -51,6 +51,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | Key | Action |
 | --- | --- |
 | Tab | switch panel |
+| Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
 | Enter / Backspace | open directory or file / parent directory; a Windows shortcut (.lnk) to a folder opens the folder in the panel, as in Total Commander |
 | Shift+Enter | open with… : Windows asks which app to open the file in |
 | Alt+F1, Alt+F2 | drive picker for the left / right panel |

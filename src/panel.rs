@@ -174,7 +174,28 @@ fn name_order(a: &str, b: &str) -> Ordering {
 impl Panel {
     /// Opens `cwd`, falling back to its parents, the home directory or the system root.
     pub fn new(cwd: PathBuf, show_hidden: bool) -> Panel {
-        let mut panel = Panel {
+        let mut panel = Panel::blank(show_hidden);
+        let cwd = util::normalize(&cwd);
+        let candidates: Vec<PathBuf> = cwd
+            .ancestors()
+            .map(Path::to_path_buf)
+            .chain(util::home_dir())
+            .chain([system_root()])
+            .collect();
+        for dir in candidates {
+            panel.cwd = dir;
+            if panel.load().is_ok() {
+                break;
+            }
+        }
+        panel.remember_drive();
+        panel
+    }
+
+    /// A panel showing nothing, made without touching the disk (a place holder while tabs
+    /// change places).
+    pub fn blank(show_hidden: bool) -> Panel {
+        Panel {
             cwd: PathBuf::new(),
             entries: Vec::new(),
             cursor: 0,
@@ -191,22 +212,16 @@ impl Panel {
             back: Vec::new(),
             forward: Vec::new(),
             archive: None,
-        };
-        let cwd = util::normalize(&cwd);
-        let candidates: Vec<PathBuf> = cwd
-            .ancestors()
-            .map(Path::to_path_buf)
-            .chain(util::home_dir())
-            .chain([system_root()])
-            .collect();
-        for dir in candidates {
-            panel.cwd = dir;
-            if panel.load().is_ok() {
-                break;
-            }
         }
-        panel.remember_drive();
-        panel
+    }
+
+    /// A new tab of this panel: the same folder, order, filter and memory of drives.
+    pub fn new_tab(&self) -> Panel {
+        let mut tab = Panel::new(self.cwd.clone(), self.show_hidden);
+        (tab.sort, tab.reverse, tab.filter) = (self.sort, self.reverse, self.filter.clone());
+        tab.drive_dirs = self.drive_dirs.clone();
+        tab.reload();
+        tab
     }
 
     fn remember_drive(&mut self) {

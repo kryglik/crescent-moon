@@ -252,6 +252,10 @@ pub struct App {
     after_job: Option<(AfterJob, PathBuf)>,
     /// Each panel's folder, watched for changes other programs make (see `watch`).
     watches: [Option<Watch>; 2],
+    /// Each side's other tabs, in order; the shown one (`panels[side]`) sits at
+    /// `tab_index[side]` among them.
+    pub tabs: [Vec<Panel>; 2],
+    pub tab_index: [usize; 2],
 }
 
 impl App {
@@ -300,7 +304,62 @@ impl App {
             pasting_cut: false,
             after_job: None,
             watches: [None, None],
+            tabs: [Vec::new(), Vec::new()],
+            tab_index: [0, 0],
         }
+    }
+
+    /// Ctrl+T: a new tab of the active side, on the same folder, right after the shown one.
+    fn new_tab(&mut self) {
+        let side = self.active;
+        let tab = self.panels[side].new_tab();
+        let shown = std::mem::replace(&mut self.panels[side], tab);
+        self.tabs[side].insert(self.tab_index[side], shown);
+        self.tab_index[side] += 1;
+    }
+
+    /// Ctrl+W: closes the shown tab; the one after it (or before, at the end) takes its place.
+    fn close_tab(&mut self) {
+        let side = self.active;
+        if self.tabs[side].is_empty() {
+            self.notice = Some("The last tab stays (Ctrl+T opens another)".into());
+            return;
+        }
+        let at = self.tab_index[side].min(self.tabs[side].len() - 1);
+        self.panels[side] = self.tabs[side].remove(at);
+        self.tab_index[side] = at;
+        self.panels[side].reload();
+    }
+
+    /// Alt+1…9 (or a click on it): tab `to` of `side` is shown.
+    pub(crate) fn switch_tab(&mut self, side: usize, to: usize) {
+        let (from, count) = (self.tab_index[side], self.tabs[side].len() + 1);
+        if to >= count || to == from {
+            return;
+        }
+        let shown = std::mem::replace(&mut self.panels[side], Panel::blank(false));
+        let mut all = std::mem::take(&mut self.tabs[side]);
+        all.insert(from, shown);
+        self.panels[side] = all.remove(to);
+        self.tabs[side] = all;
+        self.tab_index[side] = to;
+        // Things may have changed there meanwhile.
+        self.panels[side].reload();
+    }
+
+    /// The names of side `side`'s tabs (its folder's name), with the shown one's index; empty
+    /// with one tab.
+    pub fn tab_names(&self, side: usize) -> Vec<String> {
+        if self.tabs[side].is_empty() {
+            return Vec::new();
+        }
+        let name = |panel: &Panel| {
+            let location = panel.location();
+            location.file_name().map_or_else(|| location.display().to_string(), |n| n.to_string_lossy().into_owned())
+        };
+        let mut names: Vec<String> = self.tabs[side].iter().map(name).collect();
+        names.insert(self.tab_index[side], name(&self.panels[side]));
+        names
     }
 
     /// Saves the history file (on exit, and from `tick` now and then).
@@ -533,7 +592,14 @@ impl App {
             KeyCode::Char('r') if ctrl && !alt => self.reload_panels(),
             KeyCode::Char('h') if ctrl && !alt => self.toggle_hidden(),
             KeyCode::Char('.') if alt && !ctrl => self.toggle_hidden(),
-            KeyCode::Char('u') if ctrl && !alt => self.panels.swap(0, 1),
+            KeyCode::Char('u') if ctrl && !alt => {
+                self.panels.swap(0, 1);
+                self.tabs.swap(0, 1);
+                self.tab_index.swap(0, 1);
+            }
+            KeyCode::Char('t') if ctrl && !alt => self.new_tab(),
+            KeyCode::Char('w') if ctrl && !alt && cmd_empty => self.close_tab(),
+            KeyCode::Char(c @ '1'..='9') if alt && !ctrl => self.switch_tab(self.active, c as usize - '1' as usize),
             KeyCode::Char('o') if ctrl && !alt => self.show_shell(),
             // Ctrl+\ is a dead key on the Czech layout, so Ctrl+D (as in Total Commander) works too.
             // Unix terminals send Ctrl+\ as 0x1C, which crossterm reports as Ctrl+4.
@@ -2514,6 +2580,38 @@ mod tests {
         let marked = |side: usize| app.panels[side].marked.iter().cloned().collect::<Vec<_>>();
         assert_eq!((marked(0), marked(1)), (vec!["only-left.jpg".to_string()], vec!["only-right.jpg".to_string()]));
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("1 left, 1 right")), "{:?}", app.notice);
+    }
+
+    /// Ctrl+T opens a tab on the same folder, Alt+N switches, Ctrl+W closes; each tab keeps
+    /// its own folder.
+    #[test]
+    fn tabs_open_switch_and_close() {
+        let tmp = TempDir::new("app-tabs");
+        let (a, b) = (tmp.dir("a"), tmp.dir("b"));
+        let mut app = test_app(&a, &a);
+        app.on_key(ctrl('t'));
+        assert_eq!((app.tabs[0].len(), app.tab_index[0]), (1, 1));
+        app.change_dir(0, b.clone());
+        assert_eq!(app.tab_names(0), ["a", "b"]);
+        app.on_key(with_mods(KeyCode::Char('1'), KeyModifiers::ALT));
+        assert!(util::same_path(&app.active_panel().cwd, &a));
+        app.on_key(with_mods(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert!(util::same_path(&app.active_panel().cwd, &b));
+        // Ctrl+W on the last tab: the one before takes its place.
+        app.on_key(ctrl('w'));
+        assert!(app.tabs[0].is_empty() && util::same_path(&app.active_panel().cwd, &a));
+        app.on_key(ctrl('w'));
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("last tab")));
+        // With text on the command line Ctrl+W deletes a word instead.
+        typing(&mut app, "ls -la");
+        app.on_key(ctrl('w'));
+        assert_eq!(app.cmdline.text(), "ls ");
+        // The tab row shows above the panels.
+        app.on_key(ctrl('t'));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let top: String = (0..80).map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string()).collect();
+        assert!(top.contains("1:a") && top.contains("2:a"), "{top}");
     }
 
     /// Alt+A sets attributes: read-only and hidden on Windows, the permission bits elsewhere;

@@ -70,9 +70,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let [panels_area, cmd_area, keys_area] =
         Layout::vertical([Constraint::Min(4), Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panels_area);
-
     let mut hit = HitAreas { keybar: keys_area, ..HitAreas::default() };
+    // A row of tabs above the panels once either side has more than one.
+    let panels_area = if app.tabs.iter().any(|t| !t.is_empty()) {
+        let [tabs_area, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(panels_area);
+        let halves: [Rect; 2] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(tabs_area);
+        for (side, rect) in halves.into_iter().enumerate() {
+            hit.tabs[side] = draw_tabs(frame.buffer_mut(), rect, &app.tab_names(side), app.tab_index[side], side == app.active);
+        }
+        rest
+    } else {
+        panels_area
+    };
+    let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panels_area);
     let active = app.active;
     let search = app.quicksearch.clone();
     let mut search_cursor = None;
@@ -402,6 +412,29 @@ fn draw_panel(
     };
     buf.set_string(inner.x, status_y, util::fit(&status, inner_w), base);
     (None, hit)
+}
+
+/// A side's tabs, `1:photos 2:Downloads …`, the shown one lit up. Returns each tab's place.
+fn draw_tabs(buf: &mut Buffer, area: Rect, names: &[String], shown: usize, active: bool) -> Vec<(Rect, usize)> {
+    let mut places = Vec::new();
+    let mut x = area.x;
+    buf.set_string(area.x, area.y, " ".repeat(area.width as usize), Style::new().bg(Color::Black));
+    for (i, name) in names.iter().enumerate() {
+        let label = format!(" {}:{} ", i + 1, util::take_width(name, 18));
+        let width = util::width(&label) as u16;
+        if x + width > area.right() {
+            break;
+        }
+        let style = match (i == shown, active) {
+            (true, true) => cursor_style(),
+            (true, false) => panel_style().fg(Color::White),
+            (false, _) => Style::new().fg(Color::Gray).bg(Color::DarkGray),
+        };
+        buf.set_string(x, area.y, &label, style);
+        places.push((Rect::new(x, area.y, width, 1), i));
+        x += width + 1;
+    }
+    places
 }
 
 /// Ctrl+Q: the other panel shows what is under the cursor. Returns the area of its text.
