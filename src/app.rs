@@ -1590,6 +1590,7 @@ impl App {
         }
         let paths = self.active_panel().selection();
         if paths.is_empty() {
+            self.notice = Some("Alt+A works on the file under the cursor, or the marked ones".into());
             return;
         }
         let values: Vec<u32> = match paths.iter().map(|p| platform::attributes(p)).collect::<std::io::Result<_>>() {
