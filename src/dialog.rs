@@ -362,7 +362,7 @@ pub const HELP: &[&str] = &[
     "  Ctrl+U       swap panels",
     "  Ctrl+T, Ctrl+W   new tab here, close the tab; Alt+1…9 go to one",
     "  Shift+F2     compare: mark what the other side lacks or has older",
-    "  Ctrl+Q       quick view of the file in the other panel (Tab: scroll)",
+    "  Ctrl+Q       quick view in the other panel (Tab: scroll it)",
     "  Alt+I/Alt+O  other panel: same dir / dir under cursor",
     "",
     "Files",
@@ -440,6 +440,24 @@ mod tests {
         let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
         edit.handle_key(&altgr);
         assert_eq!(edit.text(), "@ůň");
+    }
+
+    /// The help box is 72 wide: 68 columns inside its border and padding.
+    #[test]
+    fn help_lines_fit_the_box() {
+        for line in HELP {
+            assert!(util::width(line) <= 68, "{} columns: {line}", util::width(line));
+        }
+    }
+
+    #[test]
+    fn deleting_the_word_before_the_cursor() {
+        let mut edit = LineEdit::new("cp a.txt  Účty");
+        let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        edit.handle_key(&ctrl_w);
+        assert_eq!(edit.text(), "cp a.txt  ");
+        edit.handle_key(&ctrl_w);
+        assert_eq!(edit.text(), "cp ");
     }
 
     #[test]
