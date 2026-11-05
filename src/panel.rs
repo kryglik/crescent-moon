@@ -349,7 +349,7 @@ impl Panel {
         loop {
             let next = if back { self.back.pop() } else { self.forward.pop() };
             let Some(dir) = next else { return Ok(false) };
-            if !dir.is_dir() {
+            if !crate::lfs::is_dir(&dir) {
                 continue;
             }
             let here = self.cwd.clone();
@@ -694,7 +694,7 @@ fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> i
     let mut out = Vec::new();
     // On a Windows drive in WSL every file looks executable.
     let exec_bits = platform::exec_bits_mean_something(dir);
-    for item in fs::read_dir(dir)? {
+    for item in crate::lfs::read_dir(dir)? {
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
         let own = item.metadata().ok();
@@ -703,9 +703,9 @@ fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> i
             continue;
         }
         let is_link = own.as_ref().is_some_and(|m| m.file_type().is_symlink());
-        let path = item.path();
+        let path = dir.join(item.file_name());
         // For links, show what they point to (a broken link falls back to the link itself).
-        let target = if is_link { fs::metadata(&path).ok() } else { None };
+        let target = if is_link { crate::lfs::metadata(&path).ok() } else { None };
         let meta = target.as_ref().or(own.as_ref());
         let is_dir = meta.is_some_and(|m| m.is_dir());
         if !is_dir && filter.is_some_and(|f| !f.matches(&name)) {

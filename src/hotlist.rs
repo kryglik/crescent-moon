@@ -37,11 +37,9 @@ impl Hotlist {
 
     pub fn save(&self) -> io::Result<()> {
         let Some(file) = &self.file else { return Ok(()) };
-        if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let text: String = self.dirs.iter().map(|d| format!("{}\n", d.display())).collect();
-        fs::write(file, text)
+        // Never half a hotlist, whatever happens while it is written.
+        util::write_atomically(file, &text)
     }
 
     /// Adds `dir` unless it is already listed; returns its position.

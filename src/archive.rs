@@ -218,9 +218,10 @@ pub fn extract_file(file: &Path, index: usize, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// A folder of rmc's own in the temp folder, for files taken out of archives to be viewed.
-pub fn temp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("rmc-{}-archives", std::process::id()))
+/// A folder of rmc's own, for files taken out of archives to be viewed: in the session's
+/// private folder, so nobody else on the machine reads them.
+pub fn temp_dir() -> std::io::Result<PathBuf> {
+    crate::util::session_dir().map(|dir| dir.join("archives"))
 }
 
 #[cfg(test)]

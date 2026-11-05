@@ -115,6 +115,18 @@ pub fn resolve(base: &Path, input: &str) -> PathBuf {
     normalize(&base.join(with_drive_root(&expanded)))
 }
 
+/// A path the user typed for something new, as Windows makes it: the last name without its
+/// trailing dots and spaces (`report.` becomes `report`, as in Explorer). A name that exists
+/// as typed is kept (it may be a `foo.` made elsewhere), and elsewhere nothing changes.
+pub fn as_windows_makes_it(path: PathBuf) -> PathBuf {
+    if !cfg!(windows) || crate::lfs::symlink_metadata(&path).is_ok() {
+        return path;
+    }
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return path };
+    let trimmed = name.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() || trimmed == name { path } else { path.with_file_name(trimmed) }
+}
+
 fn strip_quotes(s: &str) -> &str {
     s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
 }
@@ -183,6 +195,82 @@ pub fn random() -> u64 {
     hasher.finish()
 }
 
+/// A new folder in the temp folder, made fresh with a name nobody can guess and on Linux
+/// readable by its owner only: /tmp is shared with other users, who could otherwise read
+/// what rmc puts there or plant a link under a name rmc is about to use.
+pub fn private_dir(tag: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..100 {
+        let dir = std::env::temp_dir().join(format!("rmc-{}-{tag}-{:016x}", std::process::id(), random()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no private folder could be made in the temp folder"))
+}
+
+/// Writes `text` to `file` aside first, flushed to the disk, and renames it over the old one:
+/// a crash or a full disk never leaves half a file (or an empty one). The name aside is
+/// unique, so two rmc windows saving at once don't trip over each other.
+pub fn write_atomically(file: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = file.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let temp = file.with_file_name(format!(".{name}.{}-{:08x}.tmp", std::process::id(), random() as u32));
+    let written = (|| {
+        let mut out = std::fs::File::create_new(&temp)?;
+        out.write_all(text.as_bytes())?;
+        out.sync_all()?;
+        drop(out);
+        std::fs::rename(&temp, file)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+static SESSION_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// This rmc's own private folder (see `private_dir`), made when first needed: files taken
+/// out of archives, the last folder of a one-off shell. `remove_session_dir` clears it.
+pub fn session_dir() -> std::io::Result<PathBuf> {
+    let mut dir = SESSION_DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = dir.as_ref() {
+        return Ok(dir.clone());
+    }
+    let made = private_dir("session")?;
+    *dir = Some(made.clone());
+    Ok(made)
+}
+
+/// Removes the session folder, if one was made (a file still open in an app stays).
+pub fn remove_session_dir() {
+    if let Some(dir) = SESSION_DIR.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Where an internal error on a background thread is written: the per-user temp folder on
+/// Windows, `~/.cache/rmc` elsewhere (not /tmp, which other users share).
+pub fn panic_log() -> PathBuf {
+    if cfg!(windows) {
+        return std::env::temp_dir().join("rmc-panic.txt");
+    }
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cache")));
+    cache.map_or_else(|| std::env::temp_dir().join("rmc-panic.txt"), |dir| dir.join("rmc").join("panic.txt"))
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
@@ -220,33 +308,43 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
-/// A file's identity, the same whichever path reaches it: the volume and file index on
+/// A file's identity, the same whichever path reaches it: the volume and file id on
 /// Windows, the device and inode elsewhere. Links are followed.
 #[cfg(windows)]
-pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+pub fn file_id(path: &Path) -> Option<(u64, u128)> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
     };
     let file = std::fs::OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
+        .open(crate::lfs::literal(path))
         .ok()?;
+    let handle = file.as_raw_handle() as _;
+    // The whole 128-bit id: ReFS (Dev Drives) has ids of that size, and the 64 bits of the
+    // older call can be the same for two different files there.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<FILE_ID_INFO>() as u32;
+    if unsafe { GetFileInformationByHandleEx(handle, FileIdInfo, (&raw mut info).cast(), size) } != 0 {
+        return Some((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)));
+    }
+    // FAT and other file systems without it: the 64-bit index.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
         return None;
     }
-    Some((info.dwVolumeSerialNumber as u64, (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64))
+    Some((info.dwVolumeSerialNumber as u64, u128::from((info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64)))
 }
 
 #[cfg(not(windows))]
-pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+pub fn file_id(path: &Path) -> Option<(u64, u128)> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    std::fs::metadata(path).ok().map(|m| (m.dev(), u128::from(m.ino())))
 }
 
 /// Whether two existing paths lead to the same file or folder: another letter case on a
@@ -256,18 +354,52 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     matches!((file_id(a), file_id(b)), (Some(x), Some(y)) if x == y)
 }
 
+/// Whether two existing paths are names of the one entry itself, links not followed: another
+/// letter case where case doesn't count, a hard link. A link and the file it leads to are
+/// two entries (`same_file` says they are one file).
+pub fn same_entry(a: &Path, b: &Path) -> bool {
+    matches!((entry_id(a), entry_id(b)), (Some(x), Some(y)) if x == y)
+}
+
+#[cfg(windows)]
+fn entry_id(path: &Path) -> Option<(u64, u128)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(crate::lfs::literal(path))
+        .ok()?;
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<FILE_ID_INFO>() as u32;
+    let ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle() as _, FileIdInfo, (&raw mut info).cast(), size) };
+    // Without the id (FAT has no links): the file's own identity.
+    if ok == 0 { file_id(path) } else { Some((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier))) }
+}
+
+#[cfg(not(windows))]
+fn entry_id(path: &Path) -> Option<(u64, u128)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), u128::from(m.ino())))
+}
+
 /// Like `is_inside`, but with links, junctions and mapped drives resolved, so a folder
 /// reached again through one counts. `path` need not exist yet.
 pub fn really_inside(path: &Path, dir: &Path) -> bool {
-    let Ok(dir) = std::fs::canonicalize(dir) else { return false };
+    let Ok(dir) = crate::lfs::canonicalize(dir) else { return false };
     let mut existing = path;
     let mut rest = Vec::new();
-    while !existing.exists() {
+    while !crate::lfs::exists(existing) {
         let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else { return false };
         rest.push(name);
         existing = parent;
     }
-    let Ok(mut real) = std::fs::canonicalize(existing) else { return false };
+    let Ok(mut real) = crate::lfs::canonicalize(existing) else { return false };
     real.extend(rest.iter().rev());
     is_inside(&real, &dir)
 }

@@ -239,24 +239,11 @@ mod win {
         s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// A path as a wide string for raw Windows calls. A long one gets the `\\?\` prefix,
-    /// without which those calls stop at 260 characters (std adds it for its own calls).
+    /// A path as a wide string for raw Windows calls, in the literal `\\?\` form when it is
+    /// long (those calls stop at 260 characters without it) or has a name Windows would read
+    /// otherwise (`foo.`, `nul`): see `lfs::literal`.
     pub fn long_wide(path: &Path) -> Vec<u16> {
-        let text = path.as_os_str();
-        let plain = text.to_string_lossy();
-        if text.len() < 240 || plain.starts_with(r"\\?\") || !path.is_absolute() {
-            return wide(path);
-        }
-        let mut out: Vec<u16> = Vec::new();
-        if plain.starts_with(r"\\") {
-            out.extend(r"\\?\UNC\".encode_utf16());
-            out.extend(text.encode_wide().skip(2));
-        } else {
-            out.extend(r"\\?\".encode_utf16());
-            out.extend(text.encode_wide());
-        }
-        out.push(0);
-        out
+        wide(crate::lfs::literal(path).as_os_str())
     }
 
     /// Whether rmc running as administrator can get at `path`. Not on a network share or a
@@ -276,7 +263,8 @@ mod win {
         // A subst drive's device is a folder ("\??\C:\work") rather than a volume.
         let mut buf = [0u16; 1024];
         let n = unsafe { QueryDosDeviceW(wide(format!("{letter}:")).as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-        !String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]).starts_with(r"\??\")
+        // Unknown when Windows can't say: not offered.
+        n != 0 && !String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]).starts_with(r"\??\")
     }
 
     /// Stops Windows from popping up "There is no disk in the drive" boxes.
@@ -584,7 +572,8 @@ mod win {
         // Windows' file-opening API stops at 260 characters: a longer path goes by its short
         // (8.3) name, where the drive keeps those.
         let short;
-        let path = if path.as_os_str().len() >= 260 {
+        // In UTF-16 units, as Windows counts: a Czech name takes more bytes than that.
+        let path = if path.as_os_str().encode_wide().count() >= 260 {
             short = short_path(path).ok_or_else(|| {
                 super::OpenError::Failed(format!(
                     "\"{}\" is too long a path for Windows to open (over 260 characters).",
@@ -629,7 +618,7 @@ mod win {
             Some(unc) => format!(r"\\{unc}"),
             None => short.strip_prefix(r"\\?\").unwrap_or(&short).to_string(),
         };
-        (short.len() < 260).then(|| PathBuf::from(short))
+        (short.encode_utf16().count() < 260).then(|| PathBuf::from(short))
     }
 }
 
@@ -1328,7 +1317,23 @@ impl Shell {
                 quoted.push('\'');
                 quoted
             }
-            Shell::Cmd => format!("\"{s}\""),
+            // cmd expands %NAME% inside quotes too. After each %, the quotes close for a ^
+            // before the next character (`"a%"^b"c%"`): cmd then finds no variable "^b…",
+            // drops the ^, and the name arrives as it is.
+            Shell::Cmd => {
+                let mut quoted = String::from("\"");
+                let mut chars = s.chars().peekable();
+                while let Some(c) = chars.next() {
+                    quoted.push(c);
+                    if c == '%'
+                        && let Some(next) = chars.next_if(|&n| n != '"')
+                    {
+                        quoted.push_str(&format!("\"^{next}\""));
+                    }
+                }
+                quoted.push('"');
+                quoted
+            }
             Shell::Posix(_) => format!("'{}'", s.replace('\'', "'\\''")),
         }
     }
@@ -1347,6 +1352,20 @@ impl Shell {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// cmd expands %NAME% inside quotes too: a quoted name with % in it must reach the
+    /// program as it is, never as a variable's value.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_quoting_keeps_percent_signs() {
+        let tmp = TempDir::new("cmd-percent");
+        for name in ["pct%USERNAME%x.txt", "a%%b.txt", "end%.txt", "%PATH%", "x%^y & z.txt", "%%%"] {
+            let path = tmp.file(name, name);
+            let line = format!("type {}", Shell::Cmd.quote(&path.display().to_string()));
+            let out = Shell::Cmd.command(&line).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), name, "{line}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
 
     /// An rmc started where another one is drawn is told; one in a new window isn't.
     #[test]

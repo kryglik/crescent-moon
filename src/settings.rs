@@ -69,10 +69,8 @@ impl Settings {
     }
 
     pub fn save(&self, file: &Path) -> io::Result<()> {
-        if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(file, self.to_text())
+        // Never half a settings file, whatever happens while it is written.
+        util::write_atomically(file, &self.to_text())
     }
 
     pub fn big_file_bytes(&self) -> u64 {

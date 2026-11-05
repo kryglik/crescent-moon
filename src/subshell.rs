@@ -398,23 +398,10 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-/// A new folder in the temp folder for one shell's files, made fresh with a name nobody can
-/// guess, and on Linux readable by its owner only: the shell runs the start-up file in it,
-/// and /tmp is shared with other users.
+/// A new folder for one shell's files (see `util::private_dir`): the shell runs the
+/// start-up file in it.
 fn private_dir() -> std::io::Result<PathBuf> {
-    for _ in 0..100 {
-        let dir = std::env::temp_dir().join(format!("rmc-{}-shell-{:016x}", std::process::id(), util::random()));
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        match builder.create(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::other("no folder could be made for the shell's files"))
+    util::private_dir("shell")
 }
 
 /// A path as the bytes to write to a file the shell reads (on Linux not necessarily UTF-8).

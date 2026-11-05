@@ -25,7 +25,11 @@ What it does differently from the Windows port of mc:
 - Copies and moves never put a file at risk: an overwrite only replaces the old file once the
   new one is complete, a move to another drive deletes each file only after its copy, and the
   same file under another name is recognised.
-- Long paths (over 260 characters) work, as do Czech and other non-ASCII names everywhere.
+- Long paths (over 260 characters) work, as do Czech and other non-ASCII names everywhere. So
+  do names Windows itself reads as something else: `foo.` and `foo ` (from WSL, Linux or a Mac)
+  are copied, moved and deleted as themselves and never taken for `foo`, and a file called
+  `nul` or `con` is a file. (The Recycle Bin and other programs can't reach them: Shift+F8
+  deletes them, and Shift+F6 renames them to something they can open.)
 - F3/F4 open files in **Neovim** (or any editor you set) instead of a built-in viewer and editor.
 - F12 lists every command, found by typing part of its name.
 

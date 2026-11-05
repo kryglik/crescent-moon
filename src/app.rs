@@ -1152,7 +1152,8 @@ impl App {
         }
         crate::panel::NATURAL_SORT.store(settings.natural_sort, Ordering::Relaxed);
         if settings.show_hidden != self.config.settings.show_hidden || settings.natural_sort != self.config.settings.natural_sort {
-            for panel in &mut self.panels {
+            // The tabs in the background too, or switching to one would bring the old back.
+            for panel in self.panels.iter_mut().chain(self.tabs.iter_mut().flatten()) {
                 panel.show_hidden = settings.show_hidden;
                 panel.reload();
             }
@@ -1452,7 +1453,7 @@ impl App {
                 Ok(pairs) => self.start_job(Job::Copy(pairs)),
                 Err(e) => self.error(e),
             },
-            InputAction::Move(sources) => match ops::plan(&sources, &text, &cwd) {
+            InputAction::Move(sources) => match ops::plan_move(&sources, &text, &cwd) {
                 Ok(pairs) => self.start_job(Job::Move(pairs)),
                 Err(e) => self.error(e),
             },
@@ -1590,7 +1591,7 @@ impl App {
                 Err(TryRecvError::Empty) => break,
                 // The worker is gone without a word (it panicked): don't wait for it forever.
                 Err(TryRecvError::Disconnected) => {
-                    let log = std::env::temp_dir().join("rmc-panic.txt");
+                    let log = util::panic_log();
                     let error = format!("The job stopped unexpectedly (an internal error, see {}).", log.display());
                     finished = Some((vec![error], true, None));
                     break;
@@ -2059,6 +2060,9 @@ impl App {
             self.go_up();
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
+        } else if crate::lfs::needs_literal(&entry.path) {
+            // `foo.` would open as `foo` in any program it was given to.
+            self.error(crate::lfs::unopenable(&entry.path));
         } else if archive::is_archive(&entry.path) {
             // A zip opens as a folder, as in Total Commander and mc.
             if let Err(e) = self.panels[self.active].open_archive(&entry.path, entry.path.clone()) {
@@ -2082,6 +2086,9 @@ impl App {
     /// Shift+Enter: Windows' "How do you want to open this file?" for the file under the cursor.
     fn open_with(&mut self) {
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent && !e.is_dir).cloned() else { return };
+        if crate::lfs::needs_literal(&entry.path) {
+            return self.error(crate::lfs::unopenable(&entry.path));
+        }
         if let Err(e) = platform::open_with(&entry.path) {
             self.error(e);
         }
@@ -2108,7 +2115,10 @@ impl App {
         let inner = archive::join(&view.inner, &entry.name);
         let file = view.archive.file.clone();
         static TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = archive::temp_dir().join(TAKEN.fetch_add(1, Ordering::Relaxed).to_string());
+        let dir = match archive::temp_dir() {
+            Ok(dir) => dir.join(TAKEN.fetch_add(1, Ordering::Relaxed).to_string()),
+            Err(e) => return self.error(format!("No folder for files taken out of the archive:\n{e}")),
+        };
         self.after_job = Some((then, dir.join(&entry.name)));
         self.start_job(Job::Extract { archive: file, items: vec![inner], dest: dir });
     }
@@ -2248,12 +2258,15 @@ impl App {
         }
         let dir = from.parent().unwrap_or(from);
         let target = util::resolve(dir, input);
-        // A change of letter case only is fine on Windows, where both names are the same file.
-        if target.exists() && !util::same_path(from, &target) {
+        // Another letter case is fine where both names are the one file (Windows, Linux's
+        // /mnt/c); where they are two files (as in a folder WSL made), the other one stays.
+        // A rename replaces what it lands on, so anything there (a broken link too) counts.
+        if fs::symlink_metadata(&target).is_ok() && !util::same_file(from, &target) {
             self.error(format!("\"{}\" already exists.", target.display()));
             return;
         }
-        if let Err(e) = fs::rename(from, &target) {
+        // The file as listed (`foo.` is not `foo`), the new name as Windows makes it.
+        if let Err(e) = fs::rename(crate::lfs::literal(from), &target) {
             self.error(format!("Cannot rename \"{}\":\n{e}", from.display()));
             return;
         }
@@ -2323,7 +2336,8 @@ impl App {
 
     fn toggle_hidden(&mut self) {
         let show = !self.panels[0].show_hidden;
-        for panel in &mut self.panels {
+        // The tabs in the background too, or switching to one would bring the old back.
+        for panel in self.panels.iter_mut().chain(self.tabs.iter_mut().flatten()) {
             panel.show_hidden = show;
             panel.reload();
         }
@@ -2332,8 +2346,10 @@ impl App {
     fn insert_current_name(&mut self) {
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
         let name = &entry.name;
-        // PowerShell also takes ‘ ’ ‚ ‛ as single quotes and “ ” „ as double ones.
-        let needs_quotes = name.chars().any(|c| c.is_whitespace() || "'\"&()[]{};,$`#@|<>‘’‚‛“”„".contains(c));
+        // PowerShell also takes ‘ ’ ‚ ‛ as single quotes and “ ” „ as double ones. A name with
+        // * or ? (legal on Linux) would match other files unquoted (`rm a*`), ! is bash's
+        // history, % cmd's variables, ~ a home folder, \ an escape.
+        let needs_quotes = name.chars().any(|c| c.is_whitespace() || "'\"&()[]{};,$`#@|<>‘’‚‛“”„*?!%~\\".contains(c));
         let mut text = if needs_quotes { self.shell().quote(name) } else { name.clone() };
         text.push(' ');
         if !self.cmdline.is_empty() && !self.cmdline.text().ends_with(' ') {
@@ -3498,6 +3514,50 @@ mod tests {
         config.colours.off = true;
         let app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
         assert_eq!(app.scheme, scheme::mono());
+    }
+
+    /// Shift+F6 to another letter case where that names another file (a folder that respects
+    /// case, as WSL makes them): refused, and both files stay. Where the two names are one
+    /// file (the usual Windows folder), it renames.
+    #[test]
+    fn a_rename_never_lands_on_another_file_that_differs_in_case() {
+        let tmp = TempDir::new("app-rename-case");
+        let dir = tmp.dir("strict");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("fsutil").args(["file", "setCaseSensitiveInfo"]).arg(&dir).arg("enable").output().unwrap();
+            if !made.status.success() {
+                return;
+            }
+        }
+        let lower = tmp.file("strict/readme.md", "lower");
+        let upper = tmp.file("strict/README.md", "upper");
+        let mut app = test_app(&dir, &dir);
+        app.rename(&lower, "README.md");
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "an error: it exists");
+        assert_eq!((fs::read_to_string(&lower).unwrap(), fs::read_to_string(&upper).unwrap()), ("lower".into(), "upper".into()));
+
+        #[cfg(windows)]
+        {
+            let one = tmp.file("Plain.txt", "one");
+            let mut app = test_app(tmp.path(), tmp.path());
+            app.rename(&one, "PLAIN.txt");
+            assert!(app.dialog.is_none(), "renamed: {:?}", app.dialog.is_some());
+            assert!(fs::read_dir(tmp.path()).unwrap().flatten().any(|e| e.file_name() == "PLAIN.txt"));
+        }
+    }
+
+    /// Hidden files shown or not: the tabs in the background follow too.
+    #[test]
+    fn showing_hidden_files_reaches_every_tab() {
+        let tmp = TempDir::new("app-hidden-tabs");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(ctrl('t'));
+        app.on_key(ctrl('t'));
+        assert_eq!(app.tabs[app.active].len(), 2);
+        let before = app.panels[0].show_hidden;
+        app.toggle_hidden();
+        assert!(app.panels.iter().chain(app.tabs.iter().flatten()).all(|p| p.show_hidden == !before));
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod finder;
 mod git;
 mod history;
 mod hotlist;
+mod lfs;
 mod lnk;
 mod mouse;
 mod ops;
@@ -18,6 +19,8 @@ mod options;
 mod panel;
 mod platform;
 mod preview;
+#[cfg(test)]
+mod sandbox_tests;
 mod scheme;
 mod settings;
 mod sizes;
@@ -200,7 +203,10 @@ fn main() -> ExitCode {
             ratatui::restore();
             previous_hook(info);
         } else {
-            let log = std::env::temp_dir().join("rmc-panic.txt");
+            let log = util::panic_log();
+            if let Some(dir) = log.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
             let _ = std::fs::write(log, format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
         }
     }));
@@ -211,7 +217,7 @@ fn main() -> ExitCode {
     title.restore();
     app.save_history();
     // Files taken out of archives to be viewed (one still open in an app stays).
-    let _ = fs::remove_dir_all(archive::temp_dir());
+    util::remove_session_dir();
 
     if let Some(file) = args.cwd_file {
         let _ = std::fs::write(file, app.active_panel().cwd.to_string_lossy().as_bytes());
@@ -407,8 +413,17 @@ fn run_external(
     external: External,
     mouse: Mouse,
 ) -> io::Result<(Result<(), String>, Option<PathBuf>)> {
+    // Windows programs read `foo.` as `foo` (and `nul` as the device): the editor would show
+    // and save another file than the one under the cursor.
+    if let External::Edit(path, _) | External::View(path, _) | External::Page(path, _) = &external
+        && lfs::needs_literal(path)
+    {
+        return Ok((Err(lfs::unopenable(path)), None));
+    }
     let cwd = app.active_panel().cwd.clone();
-    let cwd_file = std::env::temp_dir().join(format!("rmc-{}-cwd.txt", std::process::id()));
+    // In rmc's private folder: in a shared /tmp another user could put a folder of their own
+    // choosing there, or a link.
+    let cwd_file = util::session_dir()?.join("cwd.txt");
     let _ = std::fs::remove_file(&cwd_file);
     let config = &app.config;
     let (mut command, name) = match &external {

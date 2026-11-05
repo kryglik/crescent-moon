@@ -16,6 +16,9 @@ pub struct History {
     pub dirs: Vec<PathBuf>,
     /// Oldest first, as typed.
     pub commands: Vec<String>,
+    /// Commands run here since the last save: another rmc window may have saved its own
+    /// meanwhile, and these go after them.
+    unsaved: Vec<String>,
     file: Option<PathBuf>,
 }
 
@@ -46,25 +49,46 @@ impl History {
         history
     }
 
-    pub fn save(&self) -> io::Result<()> {
+    /// Saves the history together with what other rmc windows saved meanwhile: their
+    /// folders after this window's, their commands before the ones run here since the last
+    /// save. (This window's own lists stay as they are until it starts again.)
+    pub fn save(&mut self) -> io::Result<()> {
         let Some(file) = &self.file else { return Ok(()) };
-        if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent)?;
+        let on_disk = History::load(Some(file.clone()));
+        let mut dirs = self.dirs.clone();
+        for dir in on_disk.dirs {
+            if !dirs.iter().any(|d| util::same_path(d, &dir)) {
+                dirs.push(dir);
+            }
         }
+        dirs.truncate(MAX_DIRS);
+        let mut commands = on_disk.commands;
+        if commands.is_empty() {
+            // Nothing saved yet (or the file is gone): what this window knows.
+            commands = self.commands.clone();
+        } else {
+            for line in &self.unsaved {
+                if commands.last() != Some(line) {
+                    commands.push(line.clone());
+                }
+            }
+        }
+        let excess = commands.len().saturating_sub(MAX_COMMANDS);
+        commands.drain(..excess);
+
         let mut text = String::from("[folders]\n");
-        for dir in &self.dirs {
+        for dir in &dirs {
             text.push_str(&dir.to_string_lossy());
             text.push('\n');
         }
         text.push_str("[commands]\n");
-        for command in &self.commands {
+        for command in &commands {
             text.push_str(command);
             text.push('\n');
         }
-        // Written aside and renamed, so a crash never leaves half a file.
-        let temp = file.with_extension("tmp");
-        fs::write(&temp, text)?;
-        fs::rename(&temp, file)
+        util::write_atomically(file, &text)?;
+        self.unsaved.clear();
+        Ok(())
     }
 
     /// A panel arrived in `dir`: it moves to the front of the list.
@@ -80,6 +104,7 @@ impl History {
             return;
         }
         self.commands.push(line.to_string());
+        self.unsaved.push(line.to_string());
         let excess = self.commands.len().saturating_sub(MAX_COMMANDS);
         self.commands.drain(..excess);
     }
@@ -122,5 +147,30 @@ mod tests {
         assert_eq!(loaded.commands, ["cargo test", "git status"]);
         assert_eq!(loaded.matching("fot úč"), [&PathBuf::from(r"E:\Fotky\Účty")]);
         assert_eq!(loaded.matching("").len(), 2);
+    }
+
+    /// Two rmc windows open at once: each one's save keeps what the other saved.
+    #[test]
+    fn two_windows_keep_each_others_history() {
+        let tmp = TempDir::new("history-two");
+        let file = tmp.path().join("history.txt");
+        let mut first = History::load(Some(file.clone()));
+        first.command("make");
+        first.save().unwrap();
+        let mut a = History::load(Some(file.clone()));
+        let mut b = History::load(Some(file.clone()));
+        a.visit(Path::new("/from/a"));
+        a.command("echo a");
+        b.visit(Path::new("/from/b"));
+        b.command("echo b");
+        a.save().unwrap();
+        b.save().unwrap();
+        a.command("echo a again");
+        a.save().unwrap();
+        let both = History::load(Some(file));
+        assert_eq!(both.commands, ["make", "echo a", "echo b", "echo a again"]);
+        assert!(both.dirs.contains(&PathBuf::from("/from/a")) && both.dirs.contains(&PathBuf::from("/from/b")));
+        let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "nothing left aside: {left:?}");
     }
 }

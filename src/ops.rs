@@ -1,7 +1,7 @@
 //! Copy, move and delete jobs. They run on a worker thread and talk to the UI over channels,
 //! so the screen stays responsive and the user can answer questions or cancel.
 
-use std::fs::{self, File, Metadata};
+use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::archive::{self, Archive};
+use crate::lfs as fs;
 use crate::{platform, util};
 
 /// Guards against link loops when copying through directory links.
@@ -46,17 +47,30 @@ impl Job {
     }
 }
 
-/// Pairs each source with its destination for a copy or move typed as `input`.
+/// Pairs each source with its destination for a copy typed as `input`.
 ///
 /// The destination is a directory to put the sources into when there are several sources,
 /// when it already is a directory, or when it ends with a slash; otherwise it is the new name.
 pub fn plan(sources: &[PathBuf], input: &str, base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    plan_for(sources, input, base, false)
+}
+
+/// The same for a move, which may also give one item a name that differs in letter case
+/// only: where case doesn't count (Windows, Linux's /mnt/c) both names are the one file, and
+/// the move renames it.
+pub fn plan_move(sources: &[PathBuf], input: &str, base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    plan_for(sources, input, base, true)
+}
+
+fn plan_for(sources: &[PathBuf], input: &str, base: &Path, moving: bool) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("No destination given.".into());
     }
-    let dest = util::resolve(base, input);
-    let into_dir = sources.len() > 1 || dest.is_dir() || input.ends_with(['/', '\\']);
+    let dest = util::as_windows_makes_it(util::resolve(base, input));
+    // `Folder` to `folder`: the "existing" folder is the item itself, not a place to put it.
+    let recase = moving && sources.len() == 1 && changes_only_case(&sources[0], &dest);
+    let into_dir = !recase && (sources.len() > 1 || fs::is_dir(&dest) || input.ends_with(['/', '\\']));
     let mut pairs = Vec::new();
     for source in sources {
         let target = if into_dir {
@@ -69,15 +83,30 @@ pub fn plan(sources: &[PathBuf], input: &str, base: &Path) -> Result<Vec<(PathBu
         };
         // The same path, or the same file under another name (another letter case on a
         // drive that ignores case, a link): copying would empty it, moving would delete it.
-        if util::same_path(source, &target) || util::same_file(source, &target) {
+        // (Not merely the same path in other letter case: in a folder that respects case, as
+        // WSL makes them, `readme.md` and `README.md` are two files.)
+        if !recase && (source == &target || util::same_file(source, &target)) {
             return Err(format!("\"{}\" is the same as its destination.", source.display()));
         }
-        if source.is_dir() && (util::is_inside(&target, source) || util::really_inside(&target, source)) {
+        if !recase && fs::is_dir(source) && (util::is_inside(&target, source) || util::really_inside(&target, source)) {
             return Err(format!("\"{}\" cannot be put inside itself.", source.display()));
         }
         pairs.push((source.clone(), target));
     }
     Ok(pairs)
+}
+
+/// Whether `target` is `source` in the same folder with its name in other letter case, and
+/// is either free or the very same file (on a disk that respects case, `Folder` and an
+/// existing, different `folder` are two folders, and a move puts one into the other).
+fn changes_only_case(source: &Path, target: &Path) -> bool {
+    let (Some(a), Some(b)) = (source.file_name(), target.file_name()) else { return false };
+    let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+    let same_folder = source.parent().zip(target.parent()).is_some_and(|(p, q)| util::same_path(p, q));
+    a != b
+        && a.to_lowercase() == b.to_lowercase()
+        && same_folder
+        && (fs::symlink_metadata(target).is_err() || util::same_file(source, target))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -317,7 +346,7 @@ impl Worker {
     /// would climb out of `dest` were left out when it was read.
     fn extract(&mut self, file: &Path, items: &[String], dest: &Path) -> Flow<()> {
         let Some(archive) = self.attempt(file, |_| Archive::open(file))? else { return Ok(()) };
-        let Some(mut zip) = self.attempt(file, |_| ZipArchive::new(File::open(file)?).map_err(archive::to_io))? else {
+        let Some(mut zip) = self.attempt(file, |_| ZipArchive::new(fs::open(file)?).map_err(archive::to_io))? else {
             return Ok(());
         };
         // What goes where: paths relative to each item's folder in the zip.
@@ -384,7 +413,7 @@ impl Worker {
         buffer.resize(BUFFER_SIZE, 0);
         let result = (|| {
             let mut input = zip.by_index(index).map_err(archive::to_io)?;
-            let mut output = File::create_new(&temp)?;
+            let mut output = fs::create_new(&temp)?;
             loop {
                 if self.cancel.load(Ordering::Relaxed) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -418,8 +447,12 @@ impl Worker {
     /// failed or stopped pack leaves no half zip (and an older zip of that name as it was).
     fn pack(&mut self, sources: &[PathBuf], dest: &Path) -> Flow<()> {
         self.scan_all(sources.iter().map(PathBuf::as_path), true)?;
+        // Into a folder that isn't there yet (typed in the question), as copies do.
+        if !self.prepare_parent(dest)? {
+            return Ok(());
+        }
         let temp = temp_name(dest);
-        let Some(file) = self.attempt(dest, |_| File::create_new(&temp))? else { return Ok(()) };
+        let Some(file) = self.attempt(dest, |_| fs::create_new(&temp))? else { return Ok(()) };
         let mut zip = ZipWriter::new(file);
         let result = (|| {
             for source in sources {
@@ -489,7 +522,7 @@ impl Worker {
     }
 
     fn pack_file(&mut self, zip: &mut ZipWriter<File>, path: &Path, name: &str, options: SimpleFileOptions) -> io::Result<()> {
-        let mut input = File::open(path)?;
+        let mut input = fs::open(path)?;
         zip.start_file(name, options).map_err(archive::to_io)?;
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.resize(BUFFER_SIZE, 0);
@@ -595,7 +628,7 @@ impl Worker {
                 {
                     ancestors.push(path.to_path_buf());
                     for child in children.flatten() {
-                        self.scan(&child.path(), copying, ancestors)?;
+                        self.scan(&path.join(child.file_name()), copying, ancestors)?;
                     }
                     ancestors.pop();
                 }
@@ -618,7 +651,7 @@ impl Worker {
     /// Creates the destination's parent directory if needed; false if that was skipped.
     fn prepare_parent(&mut self, dst: &Path) -> Flow<bool> {
         match dst.parent() {
-            Some(parent) if !parent.exists() => Ok(self.attempt(parent, |_| fs::create_dir_all(parent))?.is_some()),
+            Some(parent) if !fs::exists(parent) => Ok(self.attempt(parent, |_| fs::create_dir_all(parent))?.is_some()),
             _ => Ok(true),
         }
     }
@@ -775,8 +808,8 @@ impl Worker {
     }
 
     fn copy_contents(&mut self, src: &Path, dst: &Path, meta: &Metadata, buffer: &mut [u8]) -> io::Result<()> {
-        let mut input = File::open(src)?;
-        let mut output = File::create_new(dst)?;
+        let mut input = fs::open(src)?;
+        let mut output = fs::create_new(dst)?;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -807,26 +840,40 @@ impl Worker {
         self.send_progress(false);
         let Some(src_meta) = self.attempt(src, |_| fs::symlink_metadata(src))? else { return Ok(false) };
         let mut overwrite = false;
-        // The same file under another name (another letter case where case doesn't count) is
-        // simply renamed.
-        if let Ok(existing) = fs::symlink_metadata(dst)
-            && !util::same_file(src, dst)
-        {
-            if existing.is_dir() && src_meta.is_dir() {
-                return self.merge(src, dst, ancestors);
-            }
-            if existing.is_dir() || src_meta.is_dir() {
-                self.errors.push(format!("{}: cannot replace a file with a directory or the other way round", dst.display()));
+        if let Ok(existing) = fs::symlink_metadata(dst) {
+            if util::same_entry(src, dst) {
+                // The one entry under another name (another letter case where case doesn't
+                // count, a hard link): simply renamed.
+            } else if util::same_file(src, dst) {
+                // One is a link to the other. Moved over it, the link would take the place of
+                // the file it leads to, and that file would be gone.
+                self.errors.push(format!("{}: a link to its destination (or the other way round), skipped", src.display()));
                 return Ok(false);
+            } else {
+                if existing.is_dir() && src_meta.is_dir() {
+                    return self.merge(src, dst, ancestors);
+                }
+                if existing.is_dir() || src_meta.is_dir() {
+                    self.errors.push(format!("{}: cannot replace a file with a directory or the other way round", dst.display()));
+                    return Ok(false);
+                }
+                if !self.confirm_overwrite(dst, (&src_meta).into(), &existing)? {
+                    return Ok(false);
+                }
+                overwrite = true;
             }
-            if !self.confirm_overwrite(dst, (&src_meta).into(), &existing)? {
-                return Ok(false);
-            }
-            overwrite = true;
         }
         // The rename replaces an existing file in one step: no moment without either.
         match self.attempt(src, |_| rename_over(src, dst, overwrite))? {
-            Some(true) => Ok(true),
+            Some(true) => {
+                // Two hard links of one file: rename() leaves both names (as POSIX says), so
+                // the source's goes now; the file stays under the destination's.
+                #[cfg(unix)]
+                if still_listed(src) && util::same_entry(src, dst) {
+                    return Ok(self.attempt(src, |_| fs::remove_file(src))?.is_some());
+                }
+                Ok(true)
+            }
             Some(false) => {
                 // Another drive: copied, then deleted. The overwrite was agreed to already.
                 self.confirmed = overwrite.then(|| dst.to_path_buf());
@@ -925,10 +972,30 @@ impl Worker {
     fn trash(&mut self, path: &Path) -> Flow<()> {
         self.progress.current = path.display().to_string();
         self.send_progress(true);
-        self.attempt(path, |_| trash::delete(path).map_err(|e| trash_error(path, &e)))?;
+        self.attempt(path, |_| {
+            // The Recycle Bin reads paths the usual way, which would make `foo.` into `foo`
+            // and put the wrong file in the bin.
+            if fs::needs_literal(path) {
+                return Err(io::Error::other(format!(
+                    "The {} can't take a name that ends in a dot or a space, or is a device name \
+                     (NUL, CON, COM1…): Windows would take another file for it.\n\
+                     Shift+F8 deletes it permanently instead.",
+                    platform::TRASH_NAME
+                )));
+            }
+            trash::delete(path).map_err(|e| trash_error(path, &e))
+        })?;
         self.advance((1, 0));
         Ok(())
     }
+}
+
+/// Whether the folder still lists `path`'s exact name (on a disk that ignores case, a
+/// renamed `readme.md` is found as `README.md`, but not listed under the old name).
+#[cfg(unix)]
+fn still_listed(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return false };
+    fs::read_dir(parent).is_ok_and(|mut entries| entries.any(|e| e.is_ok_and(|e| e.file_name() == name)))
 }
 
 fn child_names(dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
@@ -979,14 +1046,15 @@ fn loops_back(dir: &Path, ancestors: &[PathBuf]) -> bool {
 fn temp_name(target: &Path) -> PathBuf {
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    target.with_file_name(format!(".rmc-{}-{n}.part", std::process::id()))
+    // Random too: a crashed rmc's leftover with a reused process id mustn't be in the way.
+    target.with_file_name(format!(".rmc-{}-{n}-{:08x}.part", std::process::id(), util::random() as u32))
 }
 
 /// Puts the finished copy `temp` in place of `target` (replacing an existing file).
 fn replace_with(temp: &Path, target: &Path) -> io::Result<()> {
     match fs::rename(temp, target) {
         // Windows won't replace a read-only file.
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && target.exists() => {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && fs::exists(target) => {
             make_writable(target);
             fs::rename(temp, target)
         }
@@ -1049,6 +1117,7 @@ fn remove_file_or_link(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::testutil::TempDir;
 
     /// Runs a job to completion, answering every question with `answer`.
@@ -1319,6 +1388,23 @@ mod tests {
         assert_eq!(questions, 1, "asked once");
         assert_eq!(handed_over, Some(vec![first.clone(), second.clone()]));
         assert!(first.exists() && second.exists(), "nothing deleted here");
+    }
+
+    /// Cancelled in the middle of a file: the part written goes, and the file it was to
+    /// replace stays as it was.
+    #[test]
+    fn a_copy_cancelled_midway_leaves_the_old_file_and_no_part() {
+        let tmp = TempDir::new("ops-cancel-midway");
+        let src = tmp.file("a/x.bin", &"new".repeat(100_000));
+        let dst = tmp.file("b/x.bin", "old");
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(tx, Arc::new(AtomicBool::new(true)));
+        let meta = fs::metadata(&src).unwrap();
+        let error = worker.copy_file(&src, &dst, &meta).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "old");
+        assert_eq!(fs::read_dir(tmp.path().join("b")).unwrap().count(), 1, "no part file left");
+        assert_eq!(worker.progress.bytes_done, 0);
     }
 
     #[test]
