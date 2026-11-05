@@ -195,6 +195,7 @@ impl Subshell {
         command.cwd(cwd);
         command.env("RMC_CWD_FILE", &report_file);
         command.env("RMC_REQUEST_FILE", &request_file);
+        command.env(crate::platform::RMC_PID, std::process::id().to_string());
         let child = pair.slave.spawn_command(command).map_err(|e| error(&e))?;
         log.write(&format!("spawned pid {:?}, report file {}", child.process_id(), report_file.display()));
         drop(pair.slave);

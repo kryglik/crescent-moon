@@ -229,6 +229,11 @@ screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
 - A command typed in rmc while the shell is busy is refused rather than typed into the running
   program.
 - `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.
+- `rmc` typed there (or in rmc's command line) doesn't start a second rmc inside the first: it
+  says rmc is already running in this terminal, and Ctrl+O goes back to it. A tab or window
+  opened from there is a terminal of its own, so rmc starts there as usual. (rmc tells by the
+  `RMC_PID` it passes to everything it runs, and checks which processes share the console, or
+  on Linux the session.)
 
 This works with pwsh or Windows PowerShell, bash and zsh: rmc starts the shell with a small
 start-up script that loads your usual one (your profile, `~/.bashrc`, or `.zshenv` and `.zshrc`

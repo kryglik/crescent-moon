@@ -173,6 +173,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Typed in rmc's shell or command line, a second rmc would run inside the first one's
+    // screen, both wanting the keys.
+    if platform::running_inside().is_some() {
+        eprintln!("rmc: already running in this terminal; Ctrl+O goes back to it.");
+        return ExitCode::FAILURE;
+    }
     platform::init();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dirs: Vec<PathBuf> = args.dirs.iter().map(|d| util::resolve(&cwd, &d.to_string_lossy())).collect();
@@ -415,7 +421,7 @@ fn run_external(
         External::Command(line) => (config.shell.command(line), "the shell"),
     };
     let wait = matches!(external, External::Command(_));
-    command.current_dir(&cwd);
+    command.current_dir(&cwd).env(platform::RMC_PID, std::process::id().to_string());
 
     mouse.release();
     terminal::disable_raw_mode()?;

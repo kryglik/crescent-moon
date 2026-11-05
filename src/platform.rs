@@ -37,6 +37,84 @@ pub fn query_space_later(roots: Vec<PathBuf>) -> Receiver<(PathBuf, Option<(u64,
     rx
 }
 
+/// What rmc passes to everything it runs (its shell, a command typed in it, the editor): its
+/// process id, so an rmc started there can tell it would run inside this one.
+pub const RMC_PID: &str = "RMC_PID";
+
+/// The rmc this process would run inside of, drawing over it and fighting it for the keys:
+/// one whose shell it was started from (Ctrl+O, a command typed in rmc), in the terminal rmc
+/// made for that shell, or one that lent it its own terminal (a command or an editor rmc
+/// runs). A tab or window opened from there is a terminal of its own and doesn't count.
+pub fn running_inside() -> Option<u32> {
+    let rmc: u32 = std::env::var(RMC_PID).ok()?.parse().ok()?;
+    (rmc != std::process::id() && in_terminal_of(rmc)).then_some(rmc)
+}
+
+/// Whether, among the processes `sharing` a terminal, `rmc` is one or started one.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shares_terminal(rmc: u32, sharing: &[u32], parent: impl Fn(u32) -> Option<u32>) -> bool {
+    sharing.iter().any(|&pid| pid == rmc || parent(pid) == Some(rmc))
+}
+
+/// Windows: the terminal is the console, and the processes attached to it say whose it is.
+#[cfg(windows)]
+fn in_terminal_of(rmc: u32) -> bool {
+    use std::collections::HashMap;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    let mut attached = vec![0u32; 16];
+    loop {
+        let n = unsafe { GetConsoleProcessList(attached.as_mut_ptr(), attached.len() as u32) } as usize;
+        if n == 0 {
+            return false;
+        }
+        if n <= attached.len() {
+            attached.truncate(n);
+            break;
+        }
+        attached = vec![0; n + 8];
+    }
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut parents = HashMap::new();
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    // Still running: once it has ended, its number may be another program's.
+    parents.contains_key(&rmc) && shares_terminal(rmc, &attached, |pid| parents.get(&pid).copied())
+}
+
+/// Unix: the terminal is the session: rmc's own, or the one its shell leads in the terminal
+/// rmc made for it.
+#[cfg(unix)]
+fn in_terminal_of(rmc: u32) -> bool {
+    let session = unsafe { libc::getsid(0) };
+    let rmc_session = unsafe { libc::getsid(rmc as libc::pid_t) };
+    rmc_session >= 0 && (rmc_session == session || parent_of(session as u32) == Some(rmc))
+}
+
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // "pid (name) state ppid …", where the name may hold spaces and parentheses.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 #[cfg(windows)]
 pub use win::{
     admin_can_reach, close_elevated, delete_denied, delete_privileged, disk_space, drives, enable_admin_privileges, init,
@@ -1269,6 +1347,39 @@ impl Shell {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// An rmc started where another one is drawn is told; one in a new window isn't.
+    #[test]
+    fn an_rmc_in_the_terminal_of_another_is_told() {
+        let parents = |pairs: &'static [(u32, u32)]| move |pid: u32| pairs.iter().find(|(p, _)| *p == pid).map(|(_, q)| *q);
+        // A command or an editor rmc (7) runs: rmc lends it its own terminal.
+        assert!(shares_terminal(7, &[7, 30], parents(&[(30, 7)])));
+        // In its shell (20, which rmc started) and so in the terminal rmc made for it.
+        assert!(shares_terminal(7, &[20, 30], parents(&[(20, 7), (30, 20)])));
+        // A new window opened from that shell: its processes are the shell's, none rmc's.
+        assert!(!shares_terminal(7, &[40, 50], parents(&[(40, 20), (50, 40)])));
+    }
+
+    /// Unix, for real: a terminal is a session. The process that started these tests is in
+    /// theirs; one this process started in a session of its own isn't.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_is_a_terminal() {
+        use std::os::unix::process::CommandExt;
+        assert!(in_terminal_of(unsafe { libc::getppid() } as u32));
+        let mut command = Command::new("sleep");
+        command.arg("5");
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        assert!(!in_terminal_of(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn ctrl_o_shell_reports_its_folder_at_each_prompt() {
