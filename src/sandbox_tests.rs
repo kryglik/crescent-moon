@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use crate::ops::{self, Answer, Job, Msg};
 use crate::testutil::TempDir;
-#[cfg(unix)]
 use crate::util;
+
+mod random;
 
 /// Runs a job to the end, answering every question with `answer`: the errors, whether it
 /// was cancelled, and how many questions it asked.
@@ -737,6 +738,86 @@ fn packing_keeps_links_and_permissions() {
     let (errors, _, _) = run(Job::Extract { archive: dest, items, dest: out.clone() }, Answer::Skip);
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(fs::metadata(out.join("src/run.sh")).unwrap().permissions().mode() & 0o777, 0o750);
+}
+
+/// Where case counts, `README.md` beside the `Readme.md` a job wrote is another file: the job
+/// asks about it as about any other.
+#[cfg(unix)]
+#[test]
+fn names_differing_in_case_are_two_files_where_case_counts() {
+    let tmp = TempDir::new("edge-case-counts");
+    let first = tmp.file("src/Readme.md", "first");
+    let second = tmp.file("src/README.md", "second");
+    tmp.file("dst/README.md", "old");
+    let dst = tmp.path().join("dst");
+    let job = Job::Copy(vec![(first, dst.join("Readme.md")), (second, dst.join("README.md"))]);
+    let (errors, _, questions) = run(job, Answer::Yes);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(questions, 1);
+    assert_eq!(fs::read_to_string(dst.join("Readme.md")).unwrap(), "first");
+    assert_eq!(fs::read_to_string(dst.join("README.md")).unwrap(), "second");
+}
+
+/// Merged into a folder already there, a move goes item by item: never into what is mounted.
+#[cfg(unix)]
+#[test]
+fn a_merge_keeps_out_of_a_mounted_file_system() {
+    let tmp = TempDir::new("edge-merge-mount");
+    let inside = tmp.file("chroot/home/user/precious.txt", "precious");
+    tmp.file("backup/chroot/home/other.txt", "other");
+    let mount = fs::canonicalize(tmp.path().join("chroot/home")).unwrap();
+    assert!(ops::merged_with_mounts(&tmp.path().join("chroot"), &tmp.path().join("backup/chroot"), vec![mount]));
+    assert_eq!(fs::read_to_string(&inside).unwrap(), "precious");
+    assert!(!tmp.path().join("backup/chroot/home/user").exists());
+}
+
+/// One file by two ways, which look like two disks: found out before anything is copied, as a
+/// copy would replace the file and then "the source" could be deleted. (A hard link stands in
+/// for the second mount of a share here: the same inode.)
+#[cfg(unix)]
+#[test]
+fn one_file_by_two_ways_is_left_alone() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new("edge-two-mounts");
+    let src = tmp.file("a/file.txt", "the only copy");
+    let dst = tmp.path().join("file.txt");
+    fs::hard_link(&src, &dst).unwrap();
+    let inode = fs::metadata(&dst).unwrap().ino();
+    let errors = ops::moved_across(&src, &dst);
+    assert!(errors.iter().any(|error| error.contains("same file")), "{errors:?}");
+    assert_eq!(fs::read_to_string(&src).unwrap(), "the only copy");
+    assert_eq!(fs::metadata(&dst).unwrap().ino(), inode, "no copy was made");
+}
+
+/// F8 of a link to a mount (or above one) only takes the link: it is no folder holding one.
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_mount_is_only_a_link() {
+    let tmp = TempDir::new("edge-link-mount");
+    let holder = tmp.dir("holder");
+    let mount = fs::canonicalize(tmp.dir("holder/mounted")).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&holder, &link).unwrap();
+    let mounts = [mount];
+    assert!(ops::mount_in_the_way(&holder, &mounts));
+    assert!(!ops::mount_in_the_way(&link, &mounts));
+}
+
+/// Where a disk keeps no file ids, the folder's list tells two spellings of one name from two
+/// files.
+#[test]
+fn two_spellings_of_one_name() {
+    let tmp = TempDir::new("edge-spellings");
+    let file = tmp.file("Readme.md", "x");
+    let other_spelling = tmp.path().join("README.md");
+    if other_spelling.exists() {
+        assert!(util::same_entry(&file, &other_spelling));
+        assert!(util::one_spelling(&file, &other_spelling));
+    } else {
+        fs::write(&other_spelling, "y").unwrap();
+        assert!(!util::one_spelling(&file, &other_spelling), "two files");
+    }
+    assert!(!util::one_spelling(&file, &file), "not two spellings");
 }
 
 /// `Makefile` and `makefile` going to a disk that ignores case, or files of one name from two

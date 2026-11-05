@@ -793,10 +793,13 @@ mod unix {
 
     /// Whether another file system is mounted at folder `path`, which has `meta`: deleting
     /// must never go down into one (a chroot's /dev and /home, an sshfs of a server). A
-    /// device of its own shows that, a bind mount of the same disk only in the mount list.
+    /// device of its own shows that, a bind mount of the same disk only in the mount list. A
+    /// btrfs subvolume has a device of its own too without being mounted: the root of one is
+    /// inode 256, and the list says whether it is.
     pub fn is_mount(path: &Path, meta: &std::fs::Metadata, mounts: &[PathBuf]) -> bool {
         let parent = path.parent().and_then(|parent| std::fs::metadata(parent).ok());
-        parent.is_some_and(|parent| parent.dev() != meta.dev())
+        let subvolume = meta.ino() == 256 && !mounts.is_empty();
+        parent.is_some_and(|parent| parent.dev() != meta.dev()) && !subvolume
             || std::fs::canonicalize(path).is_ok_and(|real| mounts.contains(&real))
     }
 
@@ -1414,16 +1417,20 @@ impl Shell {
             }
             // cmd expands %NAME% inside quotes too. After each %, the quotes close for a ^
             // before the next character (`"a%"^b"c%"`): cmd then finds no variable "^b…",
-            // drops the ^, and the name arrives as it is.
+            // drops the ^, and the name arrives as it is. What separates arguments has to
+            // stay inside the quotes, so it is the character after that (`"50% "^o"ff.txt"`).
             Shell::Cmd => {
                 let mut quoted = String::from("\"");
                 let mut chars = s.chars().peekable();
                 while let Some(c) = chars.next() {
                     quoted.push(c);
-                    if c == '%'
-                        && let Some(next) = chars.next_if(|&n| n != '"')
-                    {
-                        quoted.push_str(&format!("\"^{next}\""));
+                    if c == '%' {
+                        while let Some(separator) = chars.next_if(|&n| n.is_whitespace() || ",;=".contains(n)) {
+                            quoted.push(separator);
+                        }
+                        if let Some(next) = chars.next_if(|&n| n != '"') {
+                            quoted.push_str(&format!("\"^{next}\""));
+                        }
                     }
                 }
                 quoted.push('"');
@@ -1454,7 +1461,11 @@ mod tests {
     #[test]
     fn cmd_quoting_keeps_percent_signs() {
         let tmp = TempDir::new("cmd-percent");
-        for name in ["pct%USERNAME%x.txt", "a%%b.txt", "end%.txt", "%PATH%", "x%^y & z.txt", "%%%"] {
+        let names = [
+            "pct%USERNAME%x.txt", "a%%b.txt", "end%.txt", "%PATH%", "x%^y & z.txt", "%%%", "50% off.txt", "a%,b.txt", "a%;b.txt",
+            "a%=b.txt", "100% of %PATH%.txt", "% %USERNAME% %",
+        ];
+        for name in names {
             let path = tmp.file(name, name);
             let line = format!("type {}", Shell::Cmd.quote(&path.display().to_string()));
             let out = Shell::Cmd.command(&line).output().unwrap();

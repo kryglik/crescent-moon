@@ -17,6 +17,7 @@ use crate::finder::{Field as FindField, Finder};
 use crate::git::{self, Tracker, Worktree};
 use crate::history::History;
 use crate::hotlist::Hotlist;
+use crate::lfs;
 use crate::lnk;
 use crate::mouse::{HitAreas, LastClick};
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
@@ -31,6 +32,9 @@ use crate::subshell::Subshell;
 use crate::survey::{Survey, Tally};
 use crate::util;
 use crate::watch::Watch;
+
+/// A viewer that comes back sooner than this went on by itself, and still reads its file.
+const VIEWER_STAYS: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 0 } else { 3 });
 
 /// What happens to a file taken out of an archive (into rmc's temp folder) once it is out.
 #[derive(Debug)]
@@ -217,7 +221,7 @@ pub struct App {
     /// that pins the scheme, as the built-in one keeps getting rmc's updates.
     scheme_file_written: Option<(PathBuf, String)>,
     /// The folder of a file taken out of an archive for the viewer, removed when it closes.
-    viewed_copy: Option<PathBuf>,
+    viewed_copy: Option<(PathBuf, Instant)>,
     /// The panel the running job started from: its marks are the ones the job uses up.
     job_side: usize,
     /// When an overwrite question opened, and how long it takes no answer (see `on_key`).
@@ -860,6 +864,7 @@ impl App {
                         None
                     }
                     ButtonOutcome::Pressed(2) => {
+                        self.prepare_for_job();
                         self.job = Some(admin::start(paths, Vec::new()));
                         None
                     }
@@ -1516,16 +1521,16 @@ impl App {
                 if text.trim().is_empty() {
                     return;
                 }
-                let dest = util::resolve(&cwd, &text);
+                let dest = util::as_windows_makes_it(util::resolve(&cwd, &text));
                 self.start_job(Job::Extract { archive, items, dest });
             }
             InputAction::Pack(sources) => {
                 if text.trim().is_empty() {
                     return;
                 }
-                let mut dest = util::resolve(&cwd, &text);
+                let mut dest = util::as_windows_makes_it(util::resolve(&cwd, &text));
                 // A folder, also one typed with a slash at the end that isn't there yet.
-                if dest.is_dir() || text.trim_end().ends_with(['/', '\\']) {
+                if dest.is_dir() || util::strip_quotes(text.trim()).ends_with(['/', '\\']) {
                     let name = sources[0].file_name().map_or_else(|| "archive".into(), |n| n.to_string_lossy().into_owned());
                     dest = dest.join(format!("{name}.zip"));
                 } else if dest.extension().is_none() {
@@ -1569,12 +1574,17 @@ impl App {
     }
 
     fn start_job(&mut self, job: Job) {
+        self.prepare_for_job();
+        self.job = Some(ops::start(job));
+    }
+
+    /// Before any job: it works for the active panel. An open watch keeps Windows from moving
+    /// a folder above it (the other panel inside what is moved). A job reloads the panels at
+    /// its end, so none is needed until then.
+    fn prepare_for_job(&mut self) {
         self.job_side = self.active;
-        // An open watch keeps Windows from moving a folder above it (the other panel inside
-        // what is moved). A job reloads the panels at its end, so none is needed until then.
         self.watches = [None, None];
         self.git.close_watches();
-        self.job = Some(ops::start(job));
     }
 
     /// Picks up directory sizes, drive space, the end of the shell, and the progress, questions
@@ -1741,8 +1751,11 @@ impl App {
         }
         // F4 in the scheme list: the file edited counts at once (one left as it was goes).
         self.reload_schemes();
-        // A file taken out of an archive to look at: looked at.
-        if let Some(copy) = self.viewed_copy.take() {
+        // A file taken out of an archive to look at: looked at. A viewer back at once went on
+        // by itself (gvim, code) and still needs the copy, which then goes when rmc ends.
+        if let Some((copy, since)) = self.viewed_copy.take()
+            && since.elapsed() >= VIEWER_STAYS
+        {
             let _ = fs::remove_dir_all(copy);
         }
         if let Err(e) = result {
@@ -2017,7 +2030,7 @@ impl App {
             // Forget a folder.
             KeyCode::Delete => {
                 if let Some(dir) = rows.get(cursor) {
-                    self.history.dirs.retain(|d| !util::same_path(d, dir));
+                    self.history.forget(dir);
                     self.history_changed = true;
                     cursor = cursor.min(rows.len().saturating_sub(2));
                 }
@@ -2245,7 +2258,7 @@ impl App {
                 }
             }
             AfterJob::View => {
-                self.viewed_copy = path.parent().map(Path::to_path_buf);
+                self.viewed_copy = path.parent().map(|folder| (folder.to_path_buf(), Instant::now()));
                 self.view(path, size, None);
             }
         }
@@ -2366,17 +2379,21 @@ impl App {
             return;
         }
         let dir = from.parent().unwrap_or(from);
-        let target = util::resolve(dir, input);
+        // The name as Windows makes it, said here: left to Windows, `foo.` beside `foo` lands
+        // on `foo`, and the file there is gone.
+        let target = util::as_windows_makes_it(util::resolve(dir, input));
+        if target == from {
+            return;
+        }
         // Another letter case is fine where both names are the one entry (Windows, Linux's
         // /mnt/c); where they are two files (as in a folder WSL made), or one is a link to the
         // other, the other one stays. A rename replaces what it lands on, so anything there
         // (a broken link too) counts.
-        if fs::symlink_metadata(&target).is_ok() && !util::same_entry(from, &target) {
+        if lfs::symlink_metadata(&target).is_ok() && !util::same_entry(from, &target) {
             self.error(format!("\"{}\" already exists.", target.display()));
             return;
         }
-        // The file as listed (`foo.` is not `foo`), the new name as Windows makes it.
-        if let Err(e) = fs::rename(crate::lfs::literal(from), &target) {
+        if let Err(e) = lfs::rename(from, &target) {
             self.error(format!("Cannot rename \"{}\":\n{e}", from.display()));
             return;
         }
@@ -2388,13 +2405,13 @@ impl App {
         if input.trim().is_empty() {
             return;
         }
-        let target = util::resolve(cwd, input);
-        if target.exists() {
+        let target = util::as_windows_makes_it(util::resolve(cwd, input));
+        if lfs::exists(&target) {
             self.error(format!("\"{}\" already exists.", target.display()));
             self.select_in_active(&target);
             return;
         }
-        if let Err(e) = fs::create_dir_all(&target) {
+        if let Err(e) = lfs::create_dir_all(&target) {
             self.error(format!("Cannot create \"{}\":\n{e}", target.display()));
             return;
         }
@@ -2406,12 +2423,12 @@ impl App {
         if input.trim().is_empty() {
             return;
         }
-        let target = util::resolve(cwd, input);
-        if !target.exists() {
+        let target = util::as_windows_makes_it(util::resolve(cwd, input));
+        if !lfs::exists(&target) {
             let created = target
                 .parent()
-                .map_or(Ok(()), fs::create_dir_all)
-                .and_then(|()| fs::File::create_new(&target).map(drop));
+                .map_or(Ok(()), lfs::create_dir_all)
+                .and_then(|()| lfs::create_new(&target).map(drop));
             if let Err(e) = created {
                 self.error(format!("Cannot create \"{}\":\n{e}", target.display()));
                 return;
@@ -3655,6 +3672,50 @@ mod tests {
             assert!(app.dialog.is_none(), "renamed: {:?}", app.dialog.is_some());
             assert!(fs::read_dir(tmp.path()).unwrap().flatten().any(|e| e.file_name() == "PLAIN.txt"));
         }
+    }
+
+    /// F2 and Enter on `foo.` beside `foo`: no rename, and above all none onto `foo`. Another
+    /// name typed with a dot at the end is that name without it, as in Explorer.
+    #[cfg(windows)]
+    #[test]
+    fn renaming_a_name_ending_in_a_dot_spares_the_one_without() {
+        let tmp = TempDir::new("rename-dot");
+        let plain = tmp.file("foo", "plain");
+        let dotted = tmp.path().join("foo.");
+        let literal = lfs::to_literal(&dotted).unwrap();
+        fs::write(&literal, "dot").unwrap();
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.rename(&dotted, "foo.");
+        assert!(app.dialog.is_none());
+        assert_eq!((fs::read_to_string(&plain).unwrap(), fs::read_to_string(&literal).unwrap()), ("plain".into(), "dot".into()));
+
+        app.rename(&dotted, "FOO.");
+        assert!(app.dialog.is_none());
+        assert_eq!(fs::read_to_string(&plain).unwrap(), "plain", "only the letter case");
+        assert!(fs::read_dir(tmp.path()).unwrap().flatten().any(|e| e.file_name() == "FOO."));
+
+        app.rename(&tmp.path().join("FOO."), "bar.");
+        assert!(app.dialog.is_none());
+        assert_eq!(fs::read_to_string(tmp.path().join("bar")).unwrap(), "dot");
+
+        let other = tmp.file("other", "other");
+        app.rename(&other, "foo.");
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "`foo` is there");
+        assert_eq!(fs::read_to_string(&plain).unwrap(), "plain");
+    }
+
+    /// New names typed with a dot at the end are made as Windows makes them, and are found.
+    #[cfg(windows)]
+    #[test]
+    fn new_names_are_what_windows_makes_them() {
+        let tmp = TempDir::new("new-dot");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.mkdir(tmp.path(), "folder.");
+        assert!(tmp.path().join("folder").is_dir());
+        assert_eq!(app.active_panel().current().map(|e| e.name.as_str()), Some("folder"));
+        app.new_file(tmp.path(), "report.");
+        assert!(tmp.path().join("report").is_file());
+        assert!(matches!(app.external, Some(External::Edit(ref path, _)) if path.ends_with("report")));
     }
 
     /// Enter pressed twice, or held: the overwrite question that opens under it isn't answered

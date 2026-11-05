@@ -1041,6 +1041,11 @@ impl Worker {
                 return Ok(false);
             } else {
                 if existing.is_dir() && src_meta.is_dir() {
+                    // Going through it item by item would empty what is mounted here.
+                    if platform::is_mount(src, &src_meta, &self.mounts) {
+                        self.errors.push(format!("{}: a file system is mounted here, skipped", src.display()));
+                        return Ok(false);
+                    }
                     return self.merge(src, dst, ancestors);
                 }
                 if existing.is_dir() || src_meta.is_dir() {
@@ -1059,7 +1064,7 @@ impl Worker {
                 // Two hard links of one file: rename() leaves both names (as POSIX says), so
                 // the source's goes now; the file stays under the destination's.
                 #[cfg(unix)]
-                if still_listed(src) && util::same_entry(src, dst) {
+                if util::same_entry(src, dst) && still_listed(src) {
                     return Ok(self.attempt(src, |_| fs::remove_file(src))?.is_some());
                 }
                 self.written.insert(name_key(dst));
@@ -1100,15 +1105,16 @@ impl Worker {
         self.check_cancel()?;
         let Some(meta) = self.attempt(src, |_| fs::symlink_metadata(src))? else { return Ok(false) };
         if !meta.is_dir() {
-            // A file or a link (on Windows a junction's folder is copied, then the junction goes).
-            if !self.copy_tree(src, dst, ancestors)? {
-                return Ok(false);
-            }
             // The one file through two mounts of a share, which look like two disks: "the
-            // source" would be the only copy.
+            // source" would be the only copy. Seen before copying: a copy replaces the file on
+            // the server, and the name it is deleted by then still shows the old inode.
             #[cfg(unix)]
             if same_inode(src, dst) {
                 self.errors.push(format!("{}: looks like the same file as {}, left in place", src.display(), dst.display()));
+                return Ok(false);
+            }
+            // A file or a link (on Windows a junction's folder is copied, then the junction goes).
+            if !self.copy_tree(src, dst, ancestors)? {
                 return Ok(false);
             }
             return Ok(self.attempt(src, |_| remove_file_or_link(src))?.is_some());
@@ -1269,16 +1275,53 @@ pub fn deleted_with_mounts(path: &Path, mounts: Vec<PathBuf>) -> bool {
     worker.errors.iter().any(|error| error.contains("mounted"))
 }
 
+/// A move of folder `src` onto the existing `dst` with these file systems mounted; whether an
+/// error said so.
+#[cfg(all(test, unix))]
+pub fn merged_with_mounts(src: &Path, dst: &Path, mounts: Vec<PathBuf>) -> bool {
+    let (tx, _) = mpsc::channel();
+    let mut worker = Worker::new(tx, Arc::new(AtomicBool::new(false)));
+    worker.mounts = mounts;
+    let _ = worker.move_entry(src, dst, &mut Vec::new());
+    worker.errors.iter().any(|error| error.contains("mounted"))
+}
+
+/// A move of `src` to another disk, where `dst` may be the same file by another way; the errors.
+/// (Nobody answers questions here: one ends the job.)
+#[cfg(all(test, unix))]
+pub fn moved_across(src: &Path, dst: &Path) -> Vec<String> {
+    let (tx, _) = mpsc::channel();
+    let mut worker = Worker::new(tx, Arc::new(AtomicBool::new(false)));
+    let _ = worker.move_across(src, dst, &mut Vec::new());
+    worker.errors
+}
+
+/// Whether the Recycle Bin is kept from a folder by a file system mounted in it.
+#[cfg(all(test, unix))]
+pub fn mount_in_the_way(path: &Path, mounts: &[PathBuf]) -> bool {
+    holds_mount(path, mounts)
+}
+
 /// A failure on the destination's side, said as such: errors are shown with the source's path.
 fn writing(error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("writing the copy: {error}"))
 }
 
-/// A number for `path` as a disk that ignores case reads it: two names of a job that land on
-/// one. (Compact, as a big job has many; 64 bits make a false match out of the question.)
+/// A number to know `path` again, for two names of a job that land on one. On Linux that is
+/// the file itself: `README.md` and `Readme.md` are one file on some disks and two on others.
+/// On Windows, where a file's id takes opening it, it is the path as a disk that ignores case
+/// reads it. (Compact, as a big job has many; 64 bits make a false match out of the question.)
 fn name_key(path: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    #[cfg(unix)]
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        if meta.ino() != 0 {
+            (meta.dev(), meta.ino()).hash(&mut hasher);
+            return hasher.finish();
+        }
+    }
     path.to_string_lossy().to_lowercase().hash(&mut hasher);
     hasher.finish()
 }
@@ -1291,9 +1334,12 @@ fn finish_folder(dst: &Path, meta: &Metadata) {
     fs::keep_looks(dst, meta);
 }
 
-/// Whether a file system is mounted at or below `path`.
+/// Whether a file system is mounted at or below the folder `path`. (A link leads there, but
+/// throwing it away takes only the link.)
 fn holds_mount(path: &Path, mounts: &[PathBuf]) -> bool {
-    !mounts.is_empty() && fs::canonicalize(path).is_ok_and(|real| mounts.iter().any(|mount| mount.starts_with(&real)))
+    !mounts.is_empty()
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+        && fs::canonicalize(path).is_ok_and(|real| mounts.iter().any(|mount| mount.starts_with(&real)))
 }
 
 /// The same inode on what looks like another device, with the same size: a share mounted

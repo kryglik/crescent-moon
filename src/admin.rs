@@ -5,7 +5,8 @@
 //! `rmc --admin-job FOLDER` as administrator (Windows asks the user first). That helper turns
 //! on the backup and restore privileges, so even TrustedInstaller's files can go, runs the
 //! delete, writes its progress to `status.txt` and the outcome to `result.txt`, and stops
-//! when a `stop` file appears. Meanwhile rmc shows the progress as for any job.
+//! when a `stop` file appears. It starts on rmc's word, a `go` file, so that a job stopped
+//! while Windows was asking touches nothing. Meanwhile rmc shows the progress as for any job.
 
 use std::fs;
 use std::io;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ops::{self, Answer, Job, Msg, Progress, Question, Running};
 
@@ -122,6 +123,8 @@ fn run_and_watch(dir: &Path, cancel: &AtomicBool, tx: &Sender<Msg>) -> io::Resul
     use crate::platform;
     let exe = std::env::current_exe()?;
     let process = platform::run_elevated(&exe, &format!("--admin-job \"{}\"", dir.display()))?;
+    // Windows has said yes. Stopped while it was asking, the helper is told so before it starts.
+    let _ = fs::write(dir.join(if cancel.load(Ordering::Relaxed) { "stop" } else { "go" }), b"");
     loop {
         let ended = platform::wait_elevated(&process, 100);
         if let Some(progress) = fs::read_to_string(dir.join("status.txt")).ok().as_deref().and_then(parse_status) {
@@ -147,6 +150,22 @@ fn run_and_watch(_dir: &Path, _cancel: &AtomicBool, _tx: &Sender<Msg>) -> io::Re
     Err(io::Error::other("deleting as administrator is only there on Windows"))
 }
 
+/// Waits for rmc's word, which it gives as soon as Windows has let the helper start. No word
+/// (rmc is gone) is no.
+fn told_to_go(dir: &Path) -> bool {
+    let since = Instant::now();
+    while since.elapsed() < Duration::from_secs(10) {
+        if dir.join("stop").exists() {
+            return false;
+        }
+        if dir.join("go").exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 /// `rmc --admin-job FOLDER`: the elevated side. Deletes what the job file lists, answering
 /// questions itself (failures are skipped and reported), until done or told to stop.
 pub fn run_helper(dir: &Path) -> i32 {
@@ -163,7 +182,7 @@ pub fn run_helper(dir: &Path) -> i32 {
         return 2;
     };
     // Stopped while Windows was still asking for permission: nothing is touched.
-    if dir.join("stop").exists() {
+    if !told_to_go(dir) {
         let _ = fs::write(dir.join("result.txt"), result_text(&[], true));
         return 0;
     }
@@ -232,6 +251,14 @@ mod tests {
         let job = tmp.dir("job");
         fs::write(job.join("job.txt"), job_text(std::slice::from_ref(&doomed))).unwrap();
 
+        // Stopped before it began: nothing is touched.
+        fs::write(job.join("stop"), b"").unwrap();
+        assert_eq!(run_helper(&job), 0);
+        assert_eq!(parse_result(&fs::read_to_string(job.join("result.txt")).unwrap()), Some((Vec::new(), true)));
+        assert!(doomed.exists());
+        fs::remove_file(job.join("stop")).unwrap();
+
+        fs::write(job.join("go"), b"").unwrap();
         assert_eq!(run_helper(&job), 0);
         let (errors, stopped) = parse_result(&fs::read_to_string(job.join("result.txt")).unwrap()).unwrap();
         assert!(errors.is_empty() && !stopped, "{errors:?}");

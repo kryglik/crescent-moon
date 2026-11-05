@@ -19,6 +19,8 @@ pub struct History {
     /// Commands run here since the last save: another rmc window may have saved its own
     /// meanwhile, and these go after them.
     unsaved: Vec<String>,
+    /// Folders forgotten here (Delete in Alt+H), which what is on disk mustn't bring back.
+    forgotten: Vec<PathBuf>,
     file: Option<PathBuf>,
 }
 
@@ -57,7 +59,7 @@ impl History {
         let on_disk = History::load(Some(file.clone()));
         let mut dirs = self.dirs.clone();
         for dir in on_disk.dirs {
-            if !dirs.iter().any(|d| util::same_path(d, &dir)) {
+            if !dirs.iter().chain(&self.forgotten).any(|d| util::same_path(d, &dir)) {
                 dirs.push(dir);
             }
         }
@@ -96,6 +98,12 @@ impl History {
         self.dirs.retain(|d| !util::same_path(d, dir));
         self.dirs.insert(0, dir.to_path_buf());
         self.dirs.truncate(MAX_DIRS);
+    }
+
+    /// `dir` goes from the list, also from what is saved.
+    pub fn forget(&mut self, dir: &Path) {
+        self.dirs.retain(|d| !util::same_path(d, dir));
+        self.forgotten.push(dir.to_path_buf());
     }
 
     /// A command was run; a repeat of the last one isn't added again.
@@ -147,6 +155,21 @@ mod tests {
         assert_eq!(loaded.commands, ["cargo test", "git status"]);
         assert_eq!(loaded.matching("fot úč"), [&PathBuf::from(r"E:\Fotky\Účty")]);
         assert_eq!(loaded.matching("").len(), 2);
+    }
+
+    /// A folder forgotten stays forgotten, though it is still in the file when saving.
+    #[test]
+    fn a_forgotten_folder_stays_forgotten() {
+        let tmp = TempDir::new("history-forget");
+        let file = tmp.path().join("history.txt");
+        let mut first = History::load(Some(file.clone()));
+        first.visit(Path::new("/keep"));
+        first.visit(Path::new("/forget"));
+        first.save().unwrap();
+        let mut second = History::load(Some(file.clone()));
+        second.forget(Path::new("/forget"));
+        second.save().unwrap();
+        assert_eq!(History::load(Some(file)).dirs, [PathBuf::from("/keep")]);
     }
 
     /// Two rmc windows open at once: each one's save keeps what the other saved.

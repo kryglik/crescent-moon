@@ -377,7 +377,6 @@ pub fn file_id(path: &Path) -> Option<(u64, u128)> {
 
 /// Some file systems (network and virtual ones) give every file the id 0 or all ones: that
 /// says nothing, and taken at its word any two files would be one.
-#[cfg(windows)]
 fn known_id(volume: u64, id: u128) -> Option<(u64, u128)> {
     (id != 0 && id != u128::MAX).then_some((volume, id))
 }
@@ -385,7 +384,7 @@ fn known_id(volume: u64, id: u128) -> Option<(u64, u128)> {
 #[cfg(not(windows))]
 pub fn file_id(path: &Path) -> Option<(u64, u128)> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), u128::from(m.ino())))
+    std::fs::metadata(path).ok().and_then(|m| known_id(m.dev(), u128::from(m.ino())))
 }
 
 /// Whether two existing paths lead to the same file or folder: another letter case on a
@@ -399,7 +398,25 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 /// letter case where case doesn't count, a hard link. A link and the file it leads to are
 /// two entries (`same_file` says they are one file).
 pub fn same_entry(a: &Path, b: &Path) -> bool {
-    matches!((entry_id(a), entry_id(b)), (Some(x), Some(y)) if x == y)
+    match (entry_id(a), entry_id(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => one_spelling(a, b),
+    }
+}
+
+/// For a disk that keeps no file ids: whether `a` and `b` are two spellings of one name in a
+/// folder, both there, of which the folder lists at most one.
+pub fn one_spelling(a: &Path, b: &Path) -> bool {
+    let (Some(one), Some(other)) = (a.file_name(), b.file_name()) else { return false };
+    let (Some(folder), Some(other_folder)) = (a.parent(), b.parent()) else { return false };
+    if one == other || one.to_string_lossy().to_lowercase() != other.to_string_lossy().to_lowercase() {
+        return false;
+    }
+    let there = |path| crate::lfs::symlink_metadata(path).is_ok();
+    same_path(folder, other_folder)
+        && there(a)
+        && there(b)
+        && crate::lfs::read_dir(folder).is_ok_and(|entries| entries.flatten().filter(|e| e.file_name() == one || e.file_name() == other).count() < 2)
 }
 
 #[cfg(windows)]
@@ -426,7 +443,7 @@ fn entry_id(path: &Path) -> Option<(u64, u128)> {
 #[cfg(not(windows))]
 fn entry_id(path: &Path) -> Option<(u64, u128)> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), u128::from(m.ino())))
+    std::fs::symlink_metadata(path).ok().and_then(|m| known_id(m.dev(), u128::from(m.ino())))
 }
 
 /// Like `is_inside`, but with links, junctions and mapped drives resolved, so a folder

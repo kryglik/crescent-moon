@@ -389,6 +389,7 @@ rmc shows the mono scheme.
 | `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |
 | `src/lfs.rs` | file calls that give Windows a path literally when it has to be (`foo.`, `nul`), and keeping a copy's flags and mode |
 | `src/sandbox_tests.rs` | the jobs at the edges, on real files: links, odd names, long paths, locked files, crafted zips |
+| `src/sandbox_tests/random.rs` | random colliding trees through every job and way of answering, the whole disk checked after each (`RMC_ROUNDS=2000 cargo test random_` for a long run) |
 | `src/archive.rs` | zip archives: the index, names (none that would land outside the folder), times |
 | `src/git.rs` | git: the branch, operation under way and worktrees from the repository's files; `git status` in the background |
 | `src/watch.rs` | watching the panels' folders for changes (Windows change notifications, inotify) |

@@ -2,7 +2,6 @@
 //! changed with the options editor (Ctrl+P) or by hand. One `name = value` per line; unknown
 //! names and unreadable values are ignored, so an older or newer file still loads.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -146,6 +145,8 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::testutil::TempDir;
 

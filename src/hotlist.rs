@@ -1,6 +1,5 @@
 //! Favourite directories (Ctrl+\ or Ctrl+D), one per line in a text file in the config directory.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +53,8 @@ impl Hotlist {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::testutil::TempDir;
 
