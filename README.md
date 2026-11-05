@@ -79,6 +79,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | Ctrl+P | options (see Settings) |
 | F10 | quit (right away; it asks only if the option says so, or while the shell is busy) |
+| F12 | every command with its key: type part of a name ("zip", "clip", "hist") to narrow the list, Enter runs it |
 
 Typing anywhere goes to the command line; Enter runs it in the shell (see below), in the
 active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder.

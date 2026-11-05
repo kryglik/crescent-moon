@@ -109,8 +109,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         *scroll = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
     }
     if let Some(Dialog::History { filter, cursor }) = &app.dialog {
-        let rows = app.history_rows(filter.text());
-        let (position, dialog_hit) = draw_history(frame, area, &rows, filter, *cursor);
+        let rows: Vec<String> = app.history_rows(filter.text()).iter().map(|d| d.display().to_string()).collect();
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Folder history", &rows, filter, *cursor, HISTORY_HINT);
+        frame.set_cursor_position(position);
+        hit.dialog = Some(dialog_hit);
+    } else if let Some(Dialog::Commands { filter, cursor }) = &app.dialog {
+        let commands = dialog::matching_commands(filter.text());
+        let label_w = commands.iter().map(|c| util::width(c.label)).max().unwrap_or(0);
+        let rows: Vec<String> = commands.iter().map(|c| format!("{}  {}", util::pad(c.label, label_w), c.keys)).collect();
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Commands", &rows, filter, *cursor, COMMANDS_HINT);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(dialog) = &app.dialog {
@@ -761,7 +768,7 @@ fn draw_dialog(
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         // Drawn by `draw`, which has the rows.
-        Dialog::History { .. } => (None, DialogHit::default()),
+        Dialog::History { .. } | Dialog::Commands { .. } => (None, DialogHit::default()),
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
@@ -926,12 +933,24 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
     DialogHit { area: outer, buttons: Vec::new(), rows }
 }
 
-/// Alt+H: the filter line, then the folders, newest first. Returns the text cursor and
-/// where the rows are, for the mouse.
-fn draw_history(frame: &mut Frame, area: Rect, rows: &[std::path::PathBuf], filter: &LineEdit, cursor: usize) -> (Position, DialogHit) {
+const HISTORY_HINT: &str = "type to narrow · Enter goes there · Del forgets · Esc";
+const COMMANDS_HINT: &str = "type to narrow · Enter runs it · Esc";
+
+/// A list narrowed by typing (Alt+H's folders, F12's commands): the filter line, then the
+/// rows. Returns the text cursor and where the rows are, for the mouse.
+fn draw_filtered_list(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    rows: &[String],
+    filter: &LineEdit,
+    cursor: usize,
+    hint: &str,
+) -> (Position, DialogHit) {
     let height = (rows.len() as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
-    let width = (area.width * 2 / 3).clamp(50, 100).min(area.width);
-    let (outer, inner) = dialog_frame(frame, area, width, height, "Folder history", false);
+    let widest = rows.iter().map(|r| util::width(r)).max().unwrap_or(0) as u16 + 4;
+    let width = (area.width * 2 / 3).clamp(50, 100).max(widest.min(area.width)).min(area.width);
+    let (outer, inner) = dialog_frame(frame, area, width, height, title, false);
     let style = dialog_style(false);
     let grey = style.fg(Color::DarkGray);
     let field_w = inner.width as usize;
@@ -943,16 +962,16 @@ fn draw_history(frame: &mut Frame, area: Rect, rows: &[std::path::PathBuf], filt
     let cursor = cursor.min(rows.len().saturating_sub(1));
     let offset = (cursor + 1).saturating_sub(list_h);
     if rows.is_empty() {
-        let empty = if filter.text().is_empty() { "No other folders visited yet." } else { "No folder matches." };
+        let empty = if filter.text().is_empty() { "Nothing here yet." } else { "Nothing matches." };
         lines.push(Line::from(Span::styled(empty, grey)));
     }
-    for (i, dir) in rows.iter().enumerate().skip(offset).take(list_h) {
-        let text = util::fit_left(&dir.display().to_string(), field_w);
+    for (i, row) in rows.iter().enumerate().skip(offset).take(list_h) {
+        let text = util::fit_left(row, field_w);
         let row_style = if i == cursor { cursor_style() } else { style };
         lines.push(Line::from(Span::styled(util::pad(&text, field_w), row_style)));
     }
     lines.resize(list_h + 2, Line::default());
-    lines.push(Line::from(Span::styled(util::fit_left("type to narrow · Enter goes there · Del forgets · Esc", field_w), grey)).right_aligned());
+    lines.push(Line::from(Span::styled(util::fit_left(hint, field_w), grey)).right_aligned());
     frame.render_widget(Paragraph::new(lines).style(style), inner);
     let shown = rows.len().saturating_sub(offset).min(list_h) as u16;
     let rows_area = (shown > 0).then(|| (Rect::new(inner.x, inner.y + 1, inner.width, shown), offset));
@@ -1312,6 +1331,18 @@ mod tests {
         assert!(!app.preview_focus);
         app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert!(!render(&mut app, 100, 16).contains("Quick view"));
+    }
+
+    #[test]
+    fn renders_the_command_list() {
+        let tmp = TempDir::new("ui-commands");
+        let mut app = app_for(&tmp);
+        app.dialog = Some(Dialog::Commands { filter: LineEdit::new("clip"), cursor: 1 });
+        let screen = render(&mut app, 100, 20);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Commands") && screen.contains("Files to the clipboard (cut)") && screen.contains("Ctrl+X"));
     }
 
     #[test]

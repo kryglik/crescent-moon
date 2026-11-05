@@ -487,6 +487,7 @@ impl App {
             KeyCode::Delete if cmd_empty => self.confirm_delete(!shift),
             KeyCode::F(9) => self.open_sort_menu(),
             KeyCode::F(10) => self.request_quit(),
+            KeyCode::F(12) => self.dialog = Some(Dialog::Commands { filter: LineEdit::default(), cursor: 0 }),
             KeyCode::Char('p') if ctrl && !alt => self.open_options(),
             KeyCode::Char('q') if ctrl && !alt => self.toggle_quick_view(),
             KeyCode::Char('c') if ctrl && !alt => self.copy_to_clipboard(Effect::Copy),
@@ -674,6 +675,7 @@ impl App {
             },
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
             Dialog::History { filter, cursor } => self.on_history_key(&key, filter, cursor),
+            Dialog::Commands { filter, cursor } => self.on_commands_key(&key, filter, cursor),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
                 let buttons = dialog::delete_buttons(&survey.tally());
                 match dialog::handle_buttons(buttons, &mut focus, &key) {
@@ -1510,6 +1512,33 @@ impl App {
         } else {
             self.start_job(Job::Copy(pairs));
         }
+    }
+
+    /// F12: the command list. Typing narrows it, Enter runs the command (by pressing its key).
+    fn on_commands_key(&mut self, key: &KeyEvent, mut filter: LineEdit, mut cursor: usize) -> Option<Dialog> {
+        let rows = dialog::matching_commands(filter.text());
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) | KeyCode::F(12) => return None,
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(last),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+            KeyCode::PageDown => cursor = (cursor + 10).min(last),
+            KeyCode::Enter => {
+                if let Some(command) = rows.get(cursor) {
+                    self.on_key(KeyEvent::new(command.code, command.modifiers));
+                }
+                return None;
+            }
+            _ => {
+                let before = filter.text().to_string();
+                filter.handle_key(key);
+                if filter.text() != before {
+                    cursor = 0;
+                }
+            }
+        }
+        Some(Dialog::Commands { filter, cursor })
     }
 
     /// Shift+F2 (Total Commander's key): marks in each panel what the other one lacks or has
@@ -2411,6 +2440,29 @@ mod tests {
         let marked = |side: usize| app.panels[side].marked.iter().cloned().collect::<Vec<_>>();
         assert_eq!((marked(0), marked(1)), (vec!["only-left.jpg".to_string()], vec!["only-right.jpg".to_string()]));
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("1 left, 1 right")), "{:?}", app.notice);
+    }
+
+    /// F12 lists the commands; typing narrows them, Enter runs one.
+    #[test]
+    fn the_command_list_finds_and_runs_commands() {
+        let tmp = TempDir::new("app-commands");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(key(KeyCode::F(12)));
+        typing(&mut app, "zip");
+        let Some(Dialog::Commands { filter, .. }) = &app.dialog else { panic!() };
+        let labels: Vec<&str> = dialog::matching_commands(filter.text()).iter().map(|c| c.label).collect();
+        assert_eq!(labels, ["Pack into a zip", "Unpack the zip under the cursor"]);
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        typing(&mut app, "quick view");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none() && app.quick_view, "it ran");
+        // Every command's key does something that isn't typing into the command line.
+        for command in dialog::COMMANDS {
+            let mut app = test_app(tmp.path(), tmp.path());
+            app.on_key(KeyEvent::new(command.code, command.modifiers));
+            assert!(app.cmdline.is_empty() || command.keys.len() == 1, "{} ({}) typed into the command line", command.label, command.keys);
+        }
     }
 
     /// With Caps Lock on, Windows reports Ctrl+D as Ctrl with a capital D: it still works.

@@ -251,14 +251,15 @@ impl App {
                     self.click_option(i);
                     return;
                 }
-                let history_len = match &self.dialog {
+                let list_len = match &self.dialog {
                     Some(Dialog::History { filter, .. }) => self.history_rows(filter.text()).len(),
+                    Some(Dialog::Commands { filter, .. }) => crate::dialog::matching_commands(filter.text()).len(),
                     _ => 0,
                 };
                 match &mut self.dialog {
                     Some(Dialog::Drives { cursor, drives, .. }) if i < drives.len() => *cursor = i,
                     Some(Dialog::Hotlist { cursor }) if i < self.hotlist.dirs.len() => *cursor = i,
-                    Some(Dialog::History { cursor, .. }) if i < history_len => *cursor = i,
+                    Some(Dialog::History { cursor, .. } | Dialog::Commands { cursor, .. }) if i < list_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
                     _ => return,
                 }
@@ -278,6 +279,7 @@ impl App {
                             | Dialog::Drives { .. }
                             | Dialog::Hotlist { .. }
                             | Dialog::History { .. }
+                            | Dialog::Commands { .. }
                             | Dialog::Sort { .. }
                             | Dialog::Options { .. }
                             | Dialog::Message { .. }

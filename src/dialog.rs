@@ -51,6 +51,8 @@ pub enum Dialog {
     Hotlist { cursor: usize },
     /// Alt+H: folders visited lately (`App::history_rows`), narrowed by what is typed.
     History { filter: LineEdit, cursor: usize },
+    /// F12: every command with its key (`COMMANDS`), narrowed by what is typed.
+    Commands { filter: LineEdit, cursor: usize },
     Help { scroll: usize },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
@@ -234,7 +236,84 @@ impl LineEdit {
     }
 }
 
+/// A command in the F12 list: what it does, its key as shown, and the key that runs it.
+pub struct Command {
+    pub label: &'static str,
+    pub keys: &'static str,
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+}
+
+const fn command(label: &'static str, keys: &'static str, code: KeyCode, modifiers: KeyModifiers) -> Command {
+    Command { label, keys, code, modifiers }
+}
+
+const NONE: KeyModifiers = KeyModifiers::NONE;
+const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+const ALT: KeyModifiers = KeyModifiers::ALT;
+
+/// F12: everything rmc does, for finding a command (and learning its key) by typing.
+pub const COMMANDS: &[Command] = &[
+    command("Keys: all of them (help)", "F1", KeyCode::F(1), NONE),
+    command("Rename", "F2", KeyCode::F(2), NONE),
+    command("Compare the folders: mark what the other lacks", "Shift+F2", KeyCode::F(2), SHIFT),
+    command("View the file", "F3", KeyCode::F(3), NONE),
+    command("Edit the file", "F4", KeyCode::F(4), NONE),
+    command("New file", "Shift+F4", KeyCode::F(4), SHIFT),
+    command("Copy", "F5", KeyCode::F(5), NONE),
+    command("Pack into a zip", "Alt+F5", KeyCode::F(5), ALT),
+    command("Move", "F6", KeyCode::F(6), NONE),
+    command("Make a folder", "F7", KeyCode::F(7), NONE),
+    command("Find text in files below (like ag)", "Alt+F7", KeyCode::F(7), ALT),
+    command("Delete to the Recycle Bin", "F8", KeyCode::F(8), NONE),
+    command("Delete permanently", "Shift+F8", KeyCode::F(8), SHIFT),
+    command("Sort by name, extension, size, time", "F9", KeyCode::F(9), NONE),
+    command("Unpack the zip under the cursor", "Alt+F9", KeyCode::F(9), ALT),
+    command("Quit", "F10", KeyCode::F(10), NONE),
+    command("Drive of the left panel", "Alt+F1", KeyCode::F(1), ALT),
+    command("Drive of the right panel", "Alt+F2", KeyCode::F(2), ALT),
+    command("Favourite folders (hotlist)", "Ctrl+D", KeyCode::Char('d'), CTRL),
+    command("Folder history", "Alt+H", KeyCode::Char('h'), ALT),
+    command("Back to the previous folder", "Alt+Left", KeyCode::Left, ALT),
+    command("Forward again", "Alt+Right", KeyCode::Right, ALT),
+    command("Quick view of the file in the other panel", "Ctrl+Q", KeyCode::Char('q'), CTRL),
+    command("Filter: show only matching files", "Ctrl+F", KeyCode::Char('f'), CTRL),
+    command("Quick search by name", "Ctrl+S", KeyCode::Char('s'), CTRL),
+    command("Mark everything", "Ctrl+A", KeyCode::Char('a'), CTRL),
+    command("Mark files matching a pattern", "+", KeyCode::Char('+'), NONE),
+    command("Unmark files matching a pattern", "-", KeyCode::Char('-'), NONE),
+    command("Invert the marks", "*", KeyCode::Char('*'), NONE),
+    command("Files to the clipboard (copy)", "Ctrl+C", KeyCode::Char('c'), CTRL),
+    command("Files to the clipboard (cut)", "Ctrl+X", KeyCode::Char('x'), CTRL),
+    command("Paths to the clipboard as text", "Ctrl+Shift+C", KeyCode::Char('C'), CTRL.union(SHIFT)),
+    command("Paste files from the clipboard", "Alt+V", KeyCode::Char('v'), ALT),
+    command("Sizes of the folders", "Ctrl+Space", KeyCode::Char(' '), CTRL),
+    command("Reload the panels", "Ctrl+R", KeyCode::Char('r'), CTRL),
+    command("Hidden files on / off", "Ctrl+H", KeyCode::Char('h'), CTRL),
+    command("Swap the panels", "Ctrl+U", KeyCode::Char('u'), CTRL),
+    command("Other panel: this folder", "Alt+I", KeyCode::Char('i'), ALT),
+    command("Other panel: the folder under the cursor", "Alt+O", KeyCode::Char('o'), ALT),
+    command("Open with… (Windows asks which app)", "Shift+Enter", KeyCode::Enter, SHIFT),
+    command("Shell (switch to it and back)", "Ctrl+O", KeyCode::Char('o'), CTRL),
+    command("Options", "Ctrl+P", KeyCode::Char('p'), CTRL),
+];
+
+/// The commands whose label or key holds every word of `filter` (any case).
+pub fn matching_commands(filter: &str) -> Vec<&'static Command> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    COMMANDS
+        .iter()
+        .filter(|c| {
+            let text = format!("{} {}", c.label, c.keys).to_lowercase();
+            words.iter().all(|w| text.contains(w.as_str()))
+        })
+        .collect()
+}
+
 pub const HELP: &[&str] = &[
+    "  F12          every command, found by typing part of its name",
+    "",
     "Panels",
     "  Arrows, PgUp/PgDn, Home/End  move the cursor",
     "  Enter        open a directory, or a file in its app",
