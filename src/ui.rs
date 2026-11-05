@@ -308,36 +308,13 @@ fn draw_panel(
         title.push(Span::styled(filter, base.fg(Color::Yellow)));
     }
     let mut block = Block::bordered().border_style(base).style(base).title(Line::from(title));
-    // The bottom line: the git branch on the left (in a repository), free space on the right
-    // when there is room for both.
-    let repo = panel.repo.clone();
-    let status = repo.as_ref().and_then(|repo| git.status(&repo.root));
-    let space = panel.space.map(|(free, total)| {
+    // Free space on the bottom line.
+    if let Some((free, total)) = panel.space {
         let percent = free.saturating_mul(100) / total.max(1);
-        format!(" {} / {} ({percent}%) ", util::human_size(free), util::human_size(total))
-    });
-    let space_w = space.as_deref().map_or(0, util::width);
-    let mut space_fits = space_w + 2 < inner_w;
-    if let Some(repo) = &repo {
-        // Beside the free space when the counts fit there too (in words or signs); else the
-        // free space gives way, the git line counting for more in a repository.
-        let room = inner_w.saturating_sub(2);
-        let forms = git_label_forms(repo, status);
-        let beside_w = room.saturating_sub(space_w + 1);
-        let beside = forms[..2].iter().find(|line| space_fits && line.width() <= beside_w).cloned();
-        space_fits = beside.is_some();
-        let line = beside.or_else(|| forms.iter().find(|line| line.width() <= room).cloned()).unwrap_or_else(|| {
-            let branch = util::take_width(&branch_name(repo, status), room.saturating_sub(2)).to_string();
-            Line::from(Span::styled(format!(" {branch} "), base.fg(Color::White).add_modifier(Modifier::BOLD)))
-        });
-        if room >= 3 {
-            block = block.title_bottom(line.left_aligned());
+        let text = format!(" {} / {} ({percent}%) ", util::human_size(free), util::human_size(total));
+        if util::width(&text) + 2 < inner_w {
+            block = block.title_bottom(Line::from(text).right_aligned());
         }
-    }
-    if let Some(text) = space
-        && space_fits
-    {
-        block = block.title_bottom(Line::from(text).right_aligned());
     }
     let inner = block.inner(area);
     block.render(area, buf);
@@ -345,7 +322,16 @@ fn draw_panel(
         return (None, PanelHit { area, ..PanelHit::default() });
     }
 
-    let list_h = (inner.height - 3) as usize;
+    // In a repository the row below the path is git's, while the list keeps 3 rows or more.
+    let repo = panel.repo.clone();
+    let status = repo.as_ref().and_then(|repo| git.status(&repo.root));
+    let git_row = repo.as_ref().filter(|_| inner.height >= 7);
+    if let Some(repo) = git_row {
+        buf.set_line(inner.x, inner.y, &git_line(repo, status, inner_w), inner.width);
+    }
+    // The column headings' row, the list below it.
+    let top = inner.y + u16::from(git_row.is_some());
+    let list_h = (inner.height - 3 - u16::from(git_row.is_some())) as usize;
     panel.ensure_visible(list_h);
     let details = inner.width >= 34;
     let (size_w, time_w) = (7usize, 12usize);
@@ -356,8 +342,8 @@ fn draw_panel(
     let time_x = size_x + size_w as u16 + 1;
     let hit = PanelHit {
         area,
-        list: Rect::new(inner.x, inner.y + 1, inner.width, list_h as u16),
-        header_y: inner.y,
+        list: Rect::new(inner.x, top + 1, inner.width, list_h as u16),
+        header_y: top,
         size_x,
         time_x,
         details,
@@ -366,22 +352,22 @@ fn draw_panel(
     // Column headings, with the sort indicator in the corner like mc, and an arrow on the
     // sorted column: ↑ for A to Z (small to big, old to new), ↓ the other way.
     let heading = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    buf.set_string(inner.x, inner.y, panel.sort.indicator(), base);
+    buf.set_string(inner.x, top, panel.sort.indicator(), base);
     let arrow = if panel.sort.descending(panel.reverse) { "↓" } else { "↑" };
     let title = |text: &str, sorted: bool| if sorted { format!("{text}{arrow}") } else { text.to_string() };
     let by_name = matches!(panel.sort, SortBy::Name | SortBy::Extension);
-    buf.set_string(inner.x + 2, inner.y, util::center(&title("Name", by_name), name_w.saturating_sub(2)), heading);
+    buf.set_string(inner.x + 2, top, util::center(&title("Name", by_name), name_w.saturating_sub(2)), heading);
     if details {
-        buf.set_string(size_x - 1, inner.y, "│", base);
-        buf.set_string(size_x, inner.y, util::center(&title("Size", panel.sort == SortBy::Size), size_w), heading);
-        buf.set_string(time_x - 1, inner.y, "│", base);
+        buf.set_string(size_x - 1, top, "│", base);
+        buf.set_string(size_x, top, util::center(&title("Size", panel.sort == SortBy::Size), size_w), heading);
+        buf.set_string(time_x - 1, top, "│", base);
         let time = title("Modify time", panel.sort == SortBy::Time);
-        buf.set_string(time_x, inner.y, util::center(&time, time_w), heading);
+        buf.set_string(time_x, top, util::center(&time, time_w), heading);
     }
 
     let now = SystemTime::now();
     for row in 0..list_h {
-        let y = inner.y + 1 + row as u16;
+        let y = top + 1 + row as u16;
         let index = panel.offset + row;
         let entry = panel.entries.get(index);
         let marked = entry.is_some_and(|e| panel.is_marked(e));
@@ -419,7 +405,7 @@ fn draw_panel(
     }
 
     // Separator line joined to the frame, with the marked-files summary on it.
-    let sep_y = inner.y + 1 + list_h as u16;
+    let sep_y = top + 1 + list_h as u16;
     buf.set_string(area.x, sep_y, "├", base);
     buf.set_string(inner.x, sep_y, "─".repeat(inner_w), base);
     buf.set_string(area.right() - 1, sep_y, "┤", base);
@@ -697,60 +683,54 @@ fn branch_name(repo: &Repo, status: Option<&Status>) -> String {
     }
 }
 
-/// The git part of a panel's bottom line, from the most words to the fewest: the branch, an
-/// operation under way, commits ahead/behind, "worktree", and how many files are changed,
-/// untracked or in conflict (` main ↑1 · 3 changed · 1 untracked `, then ` main ↑1 ~3 ?1 `);
-/// the last is the branch alone.
-fn git_label_forms(repo: &Repo, status: Option<&Status>) -> Vec<Line<'static>> {
+/// The git row below a panel's path, in as many words as fit in `room` columns: the branch
+/// (cyan in a linked worktree), an operation under way, commits ahead/behind, "worktree", and
+/// how many files are in conflict, changed or untracked. ` main ↑1 · 3 changed · 1 untracked`,
+/// then the counts as signs (` main ↑1 ~3 ?1`), without them, and the branch cut short last.
+fn git_line(repo: &Repo, status: Option<&Status>, room: usize) -> Line<'static> {
     let base = panel_style();
-    let branch = Span::styled(format!(" {}", branch_name(repo, status)), base.fg(Color::White).add_modifier(Modifier::BOLD));
-    let mut head = vec![branch.clone()];
+    let colour = if repo.linked { Color::LightCyan } else { Color::White };
+    let branch = branch_name(repo, status);
+    let name = |text: String| vec![Span::styled(" ", base), Span::styled(text, base.fg(colour).add_modifier(Modifier::BOLD))];
+    let mut bare = name(branch.clone());
     if let Some(state) = &repo.state {
-        head.push(Span::styled(format!(" {state}"), base.fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        bare.push(Span::styled(format!(" {state}"), base.fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     }
-    let mut arrows = String::new();
+    let mut head = bare.clone();
     if let Some((ahead, behind)) = status.and_then(|s| s.ahead_behind) {
-        if ahead > 0 {
-            arrows.push_str(&format!("↑{ahead}"));
-        }
-        if behind > 0 {
-            arrows.push_str(&format!("↓{behind}"));
+        let arrows: String =
+            [(ahead, "↑"), (behind, "↓")].into_iter().filter(|(n, _)| *n > 0).map(|(n, arrow)| format!("{arrow}{n}")).collect();
+        if !arrows.is_empty() {
+            head.push(Span::styled(format!(" {arrows}"), base.fg(Color::White)));
         }
     }
-    if !arrows.is_empty() {
-        head.push(Span::styled(format!(" {arrows}"), base.fg(Color::White)));
+    let mut worktree = head.clone();
+    if repo.linked {
+        worktree.extend([Span::styled(" ·", base), Span::styled(" worktree", base.fg(Color::LightCyan))]);
     }
-    // How many, in words, as a sign, and in what colour.
+    // How many, in words, as a sign, and in what colour; conflicts first, as they need you.
     let counts: Vec<(usize, String, &str, Style)> = status.map_or_else(Vec::new, |s| {
         let plural = if s.conflicts == 1 { "" } else { "s" };
-        vec![
+        let counts = [
+            (s.conflicts, format!("{} conflict{plural}", s.conflicts), "!", base.fg(Color::LightRed).add_modifier(Modifier::BOLD)),
             (s.changed, format!("{} changed", s.changed), "~", base.fg(Color::Yellow)),
             (s.untracked, format!("{} untracked", s.untracked), "?", base.fg(Color::LightGreen)),
-            (s.conflicts, format!("{} conflict{plural}", s.conflicts), "!", base.fg(Color::LightRed).add_modifier(Modifier::BOLD)),
-        ]
+        ];
+        counts.into_iter().filter(|(n, ..)| *n > 0).collect()
     });
-    let end = Span::styled(" ", base);
-
-    let mut long = head.clone();
-    if repo.linked {
-        long.extend([Span::styled(" ·", base), Span::styled(" worktree", base.fg(Color::LightCyan))]);
+    let mut long = worktree.clone();
+    for (_, words, _, style) in &counts {
+        long.extend([Span::styled(" ·", base), Span::styled(format!(" {words}"), *style)]);
     }
-    for (n, words, _, style) in &counts {
-        if *n > 0 {
-            long.extend([Span::styled(" ·", base), Span::styled(format!(" {words}"), *style)]);
-        }
-    }
-    long.push(end.clone());
-    let mut short = head.clone();
-    for (n, _, sign, style) in &counts {
-        if *n > 0 {
-            short.push(Span::styled(format!(" {sign}{n}"), *style));
-        }
-    }
-    short.push(end.clone());
-    let mut bare = head[..1 + usize::from(repo.state.is_some())].to_vec();
-    bare.push(end.clone());
-    vec![Line::from(long), Line::from(short), Line::from(bare), Line::from(vec![branch, end])]
+    let signs: Vec<Span<'static>> = counts.iter().map(|(n, _, sign, style)| Span::styled(format!(" {sign}{n}"), *style)).collect();
+    let medium = [worktree, signs.clone()].concat();
+    let short = [head, signs].concat();
+    [long, medium, short, bare, name(branch.clone())]
+        .into_iter()
+        .map(Line::from)
+        .find(|line| line.width() <= room)
+        // A space, at least one letter and "…".
+        .unwrap_or_else(|| if room >= 3 { Line::from(name(format!("{}…", util::take_width(&branch, room - 2)))) } else { Line::default() })
 }
 
 fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool, ignored: bool) -> Style {
@@ -1305,9 +1285,12 @@ mod tests {
         tmp.file("app/new.txt", "x");
         tmp.file("app/src/lib.rs", "x");
         tmp.file("app/target/app.exe", "x");
+        // The right panel in a linked worktree.
+        let other = tmp.path().join("app-login");
+        fake_worktree(&root, "app-login", &other, "login");
         // Git status on, but never run here (no ticks): the status is given.
         let settings = crate::settings::Settings { git_status: true, ..crate::settings::Settings::default() };
-        let mut app = App::new(root.clone(), root.clone(), crate::app::Config { settings, ..crate::testutil::config() });
+        let mut app = App::new(root.clone(), other.clone(), crate::app::Config { settings, ..crate::testutil::config() });
         let output = [
             "# branch.head main",
             "# branch.ab +1 -0",
@@ -1329,27 +1312,42 @@ mod tests {
         if std::env::var_os("RMC_PRINT").is_some() {
             println!("{screen}");
         }
-        assert!(screen.contains("└ main ↑1 · 2 changed · 1 untracked ─"), "{screen}");
-        let row = |name: &str| lines.iter().position(|l| l.contains(name)).unwrap_or_else(|| panic!("no {name}: {screen}"));
+        // Git's row below the path: the branch and how the working tree stands; a linked
+        // worktree's branch in cyan, and saying so (its status isn't known here). (Columns
+        // counted in characters: the lines hold │ and ─.)
         let left = |y: usize| lines[y].chars().take(70).collect::<String>();
+        let right = |y: usize| lines[y].chars().skip(70).collect::<String>();
+        let column = |y: usize, text: &str| lines[y][..lines[y].find(text).unwrap()].chars().count() as u16;
+        assert!(left(1).starts_with("│ main ↑1 · 2 changed · 1 untracked  "), "{screen}");
+        assert!(right(1).starts_with("│ login · worktree  "), "{screen}");
+        assert_eq!(buffer[(column(1, "main"), 1)].fg, Color::White);
+        assert_eq!(buffer[(column(1, "login"), 1)].fg, Color::LightCyan);
+        assert_eq!(buffer[(column(1, "worktree"), 1)].fg, Color::LightCyan);
+        // The headings below it; the path alone on the top line, the free space alone on the
+        // bottom one.
+        assert!(left(2).contains("Name↑") && right(2).contains("Name↑"), "{screen}");
+        assert!(!lines[0].contains(" main") && !lines[0].contains("worktree"), "{screen}");
+        let bottom = lines.iter().position(|l| l.starts_with('└')).unwrap();
+        assert!(left(bottom).starts_with("└──") && right(bottom).starts_with("└──"), "{screen}");
+        let row = |name: &str| lines.iter().position(|l| l.contains(name)).unwrap_or_else(|| panic!("no {name}: {screen}"));
         assert!(left(row(" changed.txt")).contains("M│"), "{screen}");
         assert!(left(row(" new.txt")).contains("?│"), "{screen}");
         assert!(left(row("/src")).contains("•│"), "{screen}");
         assert!(!left(row("/target")).contains("•") && left(row("/target")).contains(" │"));
-        // Ignored: dimmed. (Columns counted in characters: the lines hold │ and ─.)
-        let column = |y: usize, name: &str| lines[y][..lines[y].find(name).unwrap()].chars().count() as u16;
+        // Ignored: dimmed.
         let target = row("/target");
         assert_eq!(buffer[(column(target, "/target") + 1, target as u16)].fg, Color::DarkGray);
         let new = row(" new.txt");
         assert_eq!(buffer[(column(new, "new.txt"), new as u16)].fg, Color::Gray);
 
-        // Narrow: the signs instead of words, and the free space gives way.
+        // Narrow: the counts as signs.
         let screen = render(&mut app, 60, 16);
-        assert!(screen.contains("└ main ↑1 ~2 ?1 ─"), "{screen}");
+        assert!(screen.contains("│ main ↑1 ~2 ?1 "), "{screen}");
+        // Too short a panel for the row: the list keeps its rows.
+        let screen = render(&mut app, 140, 9);
+        assert!(!screen.contains("main ↑1") && screen.lines().nth(1).unwrap().contains("Name↑"), "{screen}");
 
         // Alt+W's list: the main one marked as where the panel is.
-        let other = tmp.path().join("app-login");
-        fake_worktree(&root, "app-login", &other, "login");
         let worktrees = Repo::find(&root).unwrap().worktrees();
         app.dialog = Some(Dialog::Worktrees { filter: LineEdit::default(), cursor: 1, worktrees, here: root.clone() });
         let screen = render(&mut app, 140, 16);
@@ -1359,6 +1357,36 @@ mod tests {
         assert!(screen.contains("Git worktrees"), "{screen}");
         assert!(screen.contains(&format!("* main   {}  (main)", root.display())), "{screen}");
         assert!(screen.contains(&format!("  login  {}", other.display())), "{screen}");
+    }
+
+    /// Git's row gives way a part at a time: the counts turn to signs, then "worktree" goes,
+    /// then the signs and ↑↓, then the operation under way, and last the end of the branch.
+    #[test]
+    fn the_git_row_gives_way_a_part_at_a_time() {
+        use crate::git::{Head, Repo, Status};
+        let repo = Repo {
+            root: PathBuf::from("app"),
+            git_dir: PathBuf::from("app/.git"),
+            common_dir: PathBuf::from("app/.git"),
+            linked: true,
+            head: Head::Branch("claude/gentle-fox".into()),
+            state: Some("REBASE 2/5".into()),
+        };
+        let output = ["# branch.ab +1 -0", "1 .M N... 100644 100644 100644 a a changed.txt", "? new.txt", ""].join("\0");
+        let status = Status::parse(output.as_bytes());
+        let text = |repo: &Repo, room| git_line(repo, Some(&status), room).spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let long = " claude/gentle-fox REBASE 2/5 ↑1 · worktree · 1 changed · 1 untracked";
+        assert_eq!(text(&repo, 100), long);
+        assert_eq!(text(&repo, util::width(long)), long);
+        assert_eq!(text(&repo, 60), " claude/gentle-fox REBASE 2/5 ↑1 · worktree ~1 ?1");
+        assert_eq!(text(&repo, 45), " claude/gentle-fox REBASE 2/5 ↑1 ~1 ?1");
+        assert_eq!(text(&repo, 35), " claude/gentle-fox REBASE 2/5");
+        assert_eq!(text(&repo, 20), " claude/gentle-fox");
+        assert_eq!(text(&repo, 8), " claude…");
+        assert_eq!(text(&repo, 2), "");
+        // A commit checked out; nothing to count.
+        let detached = Repo { head: Head::Detached("1a2b3c4".into()), linked: false, state: None, ..repo };
+        assert_eq!(git_line(&detached, None, 100).spans.iter().map(|s| s.content.as_ref()).collect::<String>(), " (1a2b3c4)");
     }
 
     #[test]

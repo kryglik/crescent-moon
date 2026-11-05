@@ -15,9 +15,9 @@ What it does differently from the Windows port of mc:
 - Total Commander habits: Ctrl+Q quick view, Shift+F2 compare folders, Alt+F5 / Alt+F9 pack and
   unpack zips (and zips open as folders), folder tabs (Ctrl+T), back and forward (Alt+Left /
   Alt+Right), Ctrl+D hotlist, Alt+F7 find.
-- **Git** at a glance: each panel's bottom line shows the branch and what changed, a mark beside
-  every changed, new or conflicting file (ignored ones dimmed), and Alt+W jumps between the
-  repository's worktrees, into the same subfolder.
+- **Git** at a glance: a row below each panel's path with the branch, whether it is a
+  worktree and what changed, a mark beside every changed, new or conflicting file (ignored
+  ones dimmed), and Alt+W jumps between the repository's worktrees, into the same subfolder.
 - Copies and moves never put a file at risk: an overwrite only replaces the old file once the
   new one is complete, a move to another drive deletes each file only after its copy, and the
   same file under another name is recognised.
@@ -164,12 +164,14 @@ say so.
 
 ### Git
 
-In a git repository the panel's bottom line shows the branch and how the working tree stands,
-in as many words as fit: `main ↑1 · 3 changed · 1 untracked`, or in a narrow panel
-`main ↑1 ~3 ?1`. ↑ and ↓ count the commits ahead of and behind the upstream branch. A rebase,
-merge, cherry-pick or bisect under way shows the way git's prompt shows it (`REBASE 2/5`,
-`MERGING`), a detached HEAD shows its commit (`(1a2b3c4)`), and a linked worktree says
-`worktree`.
+In a git repository the row below the panel's path is git's: the branch and how the working
+tree stands, in as many words as fit: `main ↑1 · 3 changed · 1 untracked`, or in a narrow
+panel `main ↑1 ~3 ?1`. ↑ and ↓ count the commits ahead of and behind the upstream branch,
+and files in conflict come first (`· 2 conflicts`). A rebase, merge, cherry-pick or bisect
+under way shows the way git's prompt names it (`main REBASE 2/5`, `main MERGING`), and a
+detached HEAD shows its commit (`(1a2b3c4)`). In a linked worktree the branch is cyan and
+the row says so: `login · worktree · 2 changed`; a narrow panel leaves the cyan alone to
+tell. A panel too short for the row keeps its rows for files.
 
 Beside each name is a mark, as in VS Code: **M** changed (staged or not), **A** added, **R**
 renamed, **?** untracked, **!** in conflict, and **•** on a folder with changes inside, in
