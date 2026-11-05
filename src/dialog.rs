@@ -53,6 +53,9 @@ pub enum Dialog {
     History { filter: LineEdit, cursor: usize },
     /// F12: every command with its key (`COMMANDS`), narrowed by what is typed.
     Commands { filter: LineEdit, cursor: usize },
+    /// Alt+A: what to set for each of `platform::ATTRIBUTES` on `paths`; None leaves it as each
+    /// file has it (they differ).
+    Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize },
     Help { scroll: usize },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
@@ -295,6 +298,7 @@ pub const COMMANDS: &[Command] = &[
     command("Other panel: this folder", "Alt+I", KeyCode::Char('i'), ALT),
     command("Other panel: the folder under the cursor", "Alt+O", KeyCode::Char('o'), ALT),
     command("Open with… (Windows asks which app)", "Shift+Enter", KeyCode::Enter, SHIFT),
+    command("Attributes: read-only, hidden… (permissions)", "Alt+A", KeyCode::Char('a'), ALT),
     command("Shell (switch to it and back)", "Ctrl+O", KeyCode::Char('o'), CTRL),
     command("Options", "Ctrl+P", KeyCode::Char('p'), CTRL),
 ];
@@ -332,6 +336,7 @@ pub const HELP: &[&str] = &[
     "  Insert, Shift+Up/Down   mark files",
     "  + - *        mark by pattern, unmark by pattern, invert",
     "  Ctrl+A       mark everything",
+    "  Alt+A        attributes (read-only, hidden…; on Linux permissions)",
     "  Ctrl+F       filter: only files matching *.jpg *.cr2, !*.tmp…",
     "  Ctrl+S, Alt+S   quick search by name (again: next match)",
     "  Alt+F7, Alt+?   find text in files below (regex, like ag)",

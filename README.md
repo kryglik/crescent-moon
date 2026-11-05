@@ -62,6 +62,7 @@ Press **F1** inside rmc for the full list. The essentials:
 | Ctrl+PgUp / Ctrl+PgDn | up / into a folder, as in Total Commander and Far |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
 | Ctrl+A | mark everything (with an empty command line) |
+| Alt+A | attributes of the marked files (or the one under the cursor): read-only, hidden, system, archive on Windows, the permission bits (rwx) on Linux. Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
 | Ctrl+F | filter the panel: only files matching `*.jpg *.cr2`, or not `!*.tmp`, or containing a word; folders stay. The panel's title shows it until Ctrl+F empties it |
 | F2 | rename |
 | Shift+F2 | compare the two folders (as in Total Commander): marks on each side the files and folders the other side lacks or has an older copy of (same time but another size counts too), so F5 brings the other side up to date |

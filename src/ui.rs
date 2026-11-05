@@ -769,6 +769,7 @@ fn draw_dialog(
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         // Drawn by `draw`, which has the rows.
         Dialog::History { .. } | Dialog::Commands { .. } => (None, DialogHit::default()),
+        Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor)),
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
@@ -931,6 +932,32 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
     let shown = hotlist.dirs.len().saturating_sub(offset).min(list_h) as u16;
     let rows = (shown > 0).then(|| (Rect::new(inner.x, inner.y, inner.width, shown), offset));
     DialogHit { area: outer, buttons: Vec::new(), rows }
+}
+
+/// Alt+A: a checkbox per attribute, [?] where the files differ.
+fn draw_attributes(frame: &mut Frame, area: Rect, paths: &[std::path::PathBuf], states: &[Option<bool>], cursor: usize) -> DialogHit {
+    let rows = states.len() as u16;
+    let (outer, inner) = dialog_frame(frame, area, 52, rows + 6, "Attributes", false);
+    let style = dialog_style(false);
+    let what = match paths {
+        [one] => one.file_name().map_or_else(|| one.display().to_string(), |n| n.to_string_lossy().into_owned()),
+        many => format!("{} items", many.len()),
+    };
+    let mut lines = vec![Line::from(util::fit_left(&what, inner.width as usize)), Line::default()];
+    for (i, ((label, _), state)) in crate::platform::ATTRIBUTES.iter().zip(states).enumerate() {
+        let mark = match state {
+            Some(true) => "[x]",
+            Some(false) => "[ ]",
+            None => "[?]",
+        };
+        let row_style = if i == cursor { cursor_style() } else { style };
+        lines.push(Line::from(Span::styled(util::pad(&format!("{mark} {label}"), inner.width as usize), row_style)));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Space toggles · Enter sets them · Esc", style.fg(Color::DarkGray))).right_aligned());
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let list = Rect::new(inner.x, inner.y + 2, inner.width, rows.min(inner.height.saturating_sub(2)));
+    DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
 }
 
 const HISTORY_HINT: &str = "type to narrow · Enter goes there · Del forgets · Esc";

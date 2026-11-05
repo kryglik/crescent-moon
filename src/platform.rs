@@ -49,6 +49,68 @@ pub fn admin_can_reach(_path: &Path) -> bool {
     false
 }
 
+/// What Alt+A sets: Windows' attributes.
+#[cfg(windows)]
+pub const ATTRIBUTES: &[(&str, u32)] = &[("Read-only", 0x1), ("Hidden", 0x2), ("System", 0x4), ("Archive", 0x20)];
+
+/// What Alt+A sets: the permission bits, as mc's chmod.
+#[cfg(not(windows))]
+pub const ATTRIBUTES: &[(&str, u32)] = &[
+    ("Owner may read", 0o400),
+    ("Owner may write", 0o200),
+    ("Owner may run", 0o100),
+    ("Group may read", 0o40),
+    ("Group may write", 0o20),
+    ("Group may run", 0o10),
+    ("Others may read", 0o4),
+    ("Others may write", 0o2),
+    ("Others may run", 0o1),
+];
+
+/// A file's attributes (Windows) or permission bits (elsewhere), as `ATTRIBUTES` counts them.
+#[cfg(windows)]
+pub fn attributes(path: &Path) -> std::io::Result<u32> {
+    use std::os::windows::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.file_attributes())
+}
+
+#[cfg(not(windows))]
+pub fn attributes(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode())
+}
+
+/// Sets what `attributes` returned, changed. Only the bits in `ATTRIBUTES` (and on Windows
+/// the others a program may set) are taken.
+#[cfg(windows)]
+pub fn set_attributes(path: &Path, value: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY, SetFileAttributesW,
+    };
+    let settable = FILE_ATTRIBUTE_ARCHIVE
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        | FILE_ATTRIBUTE_OFFLINE
+        | FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_SYSTEM
+        | FILE_ATTRIBUTE_TEMPORARY;
+    let value = match value & settable {
+        0 => FILE_ATTRIBUTE_NORMAL,
+        bits => bits,
+    };
+    if unsafe { SetFileAttributesW(long_wide(path).as_ptr(), value) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn set_attributes(path: &Path, value: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(value & 0o7777))
+}
+
 /// A process started as administrator (its Windows handle).
 #[cfg(windows)]
 pub struct Elevated(isize);

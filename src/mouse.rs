@@ -251,6 +251,14 @@ impl App {
                     self.click_option(i);
                     return;
                 }
+                // A click on an attribute toggles it.
+                if let Some(Dialog::Attributes { states, cursor, .. }) = &mut self.dialog {
+                    if i < states.len() {
+                        *cursor = i;
+                        crate::app::toggle_state(states, i);
+                    }
+                    return;
+                }
                 let list_len = match &self.dialog {
                     Some(Dialog::History { filter, .. }) => self.history_rows(filter.text()).len(),
                     Some(Dialog::Commands { filter, .. }) => crate::dialog::matching_commands(filter.text()).len(),
@@ -280,6 +288,7 @@ impl App {
                             | Dialog::Hotlist { .. }
                             | Dialog::History { .. }
                             | Dialog::Commands { .. }
+                            | Dialog::Attributes { .. }
                             | Dialog::Sort { .. }
                             | Dialog::Options { .. }
                             | Dialog::Message { .. }

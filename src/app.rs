@@ -562,6 +562,7 @@ impl App {
             }
             KeyCode::Char('*') if cmd_empty && plain => self.active_panel_mut().invert_marks(),
             KeyCode::Char('a') if ctrl && !alt && cmd_empty => self.active_panel_mut().mark_all(),
+            KeyCode::Char('a') if alt && !ctrl => self.open_attributes(),
             KeyCode::Char('f') if ctrl && !alt => {
                 let current = self.active_panel().filter.clone().unwrap_or_default();
                 self.start_input("Filter", "Show only files matching (empty shows all):", &current, InputAction::Filter);
@@ -676,6 +677,7 @@ impl App {
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
             Dialog::History { filter, cursor } => self.on_history_key(&key, filter, cursor),
             Dialog::Commands { filter, cursor } => self.on_commands_key(&key, filter, cursor),
+            Dialog::Attributes { paths, states, cursor } => self.on_attributes_key(&key, paths, states, cursor),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
                 let buttons = dialog::delete_buttons(&survey.tally());
                 match dialog::handle_buttons(buttons, &mut focus, &key) {
@@ -1514,6 +1516,71 @@ impl App {
         }
     }
 
+    /// Alt+A: the attributes (Windows) or permissions (elsewhere) of the marked files, or the
+    /// one under the cursor. Where they differ, a row shows [?] and is left as each has it.
+    fn open_attributes(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
+        let paths = self.active_panel().selection();
+        if paths.is_empty() {
+            return;
+        }
+        let values: Vec<u32> = match paths.iter().map(|p| platform::attributes(p)).collect::<std::io::Result<_>>() {
+            Ok(values) => values,
+            Err(e) => return self.error(format!("Cannot read the attributes:\n{e}")),
+        };
+        let states = platform::ATTRIBUTES
+            .iter()
+            .map(|(_, bit)| match values.iter().filter(|v| *v & bit != 0).count() {
+                0 => Some(false),
+                n if n == values.len() => Some(true),
+                _ => None,
+            })
+            .collect();
+        self.dialog = Some(Dialog::Attributes { paths, states, cursor: 0 });
+    }
+
+    fn on_attributes_key(&mut self, key: &KeyEvent, paths: Vec<PathBuf>, mut states: Vec<Option<bool>>, mut cursor: usize) -> Option<Dialog> {
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => return None,
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(states.len().saturating_sub(1)),
+            KeyCode::Char(' ') | KeyCode::Insert => toggle_state(&mut states, cursor),
+            KeyCode::Enter => {
+                self.apply_attributes(&paths, &states);
+                return None;
+            }
+            _ => {}
+        }
+        Some(Dialog::Attributes { paths, states, cursor })
+    }
+
+    /// Sets what the attributes dialog says, file by file (rows left at [?] untouched).
+    fn apply_attributes(&mut self, paths: &[PathBuf], states: &[Option<bool>]) {
+        let mut errors = Vec::new();
+        for path in paths {
+            let result = platform::attributes(path).and_then(|old| {
+                let mut new = old;
+                for ((_, bit), state) in platform::ATTRIBUTES.iter().zip(states) {
+                    match state {
+                        Some(true) => new |= bit,
+                        Some(false) => new &= !bit,
+                        None => {}
+                    }
+                }
+                if new == old { Ok(()) } else { platform::set_attributes(path, new) }
+            });
+            if let Err(e) = result {
+                errors.push(format!("{}: {e}", path.display()));
+            }
+        }
+        self.reload_panels();
+        if !errors.is_empty() {
+            self.error(format!("Some attributes could not be set:\n{}", errors.join("\n")));
+        }
+    }
+
     /// F12: the command list. Typing narrows it, Enter runs the command (by pressing its key).
     fn on_commands_key(&mut self, key: &KeyEvent, mut filter: LineEdit, mut cursor: usize) -> Option<Dialog> {
         let rows = dialog::matching_commands(filter.text());
@@ -2001,6 +2068,13 @@ impl App {
     }
 }
 
+/// An attributes row clicked or spaced: set if it was clear or mixed, clear if it was set.
+pub fn toggle_state(states: &mut [Option<bool>], row: usize) {
+    if let Some(state) = states.get_mut(row) {
+        *state = Some(!state.unwrap_or(false));
+    }
+}
+
 /// `cd`, `cd DIR`, and cmd-style `cd..` / `cd\`; None for any other command.
 fn cd_argument(line: &str) -> Option<&str> {
     let head = line.get(..2)?;
@@ -2440,6 +2514,42 @@ mod tests {
         let marked = |side: usize| app.panels[side].marked.iter().cloned().collect::<Vec<_>>();
         assert_eq!((marked(0), marked(1)), (vec!["only-left.jpg".to_string()], vec!["only-right.jpg".to_string()]));
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("1 left, 1 right")), "{:?}", app.notice);
+    }
+
+    /// Alt+A sets attributes: read-only and hidden on Windows, the permission bits elsewhere;
+    /// a row where the marked files differ shows [?] and is left alone.
+    #[test]
+    fn attributes_are_shown_and_set() {
+        let tmp = TempDir::new("app-attributes");
+        tmp.file("a.txt", "a");
+        tmp.file("b.txt", "b");
+        let mut app = test_app(tmp.path(), tmp.path());
+        let first_row = if cfg!(windows) { "Read-only" } else { "Owner may read" };
+        assert_eq!(platform::ATTRIBUTES[0].0, first_row);
+        // One file: set the first row's attribute, then clear it again.
+        app.active_panel_mut().select_name("a.txt");
+        app.on_key(with_mods(KeyCode::Char('a'), KeyModifiers::ALT));
+        let Some(Dialog::Attributes { states, .. }) = &app.dialog else { panic!() };
+        let before = states[0];
+        // On Windows: make it hidden (row 1); elsewhere: take away "others may read" (row 6).
+        let row = if cfg!(windows) { 1 } else { 6 };
+        for _ in 0..row {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Enter));
+        let bit = platform::ATTRIBUTES[row].1;
+        let value = platform::attributes(&tmp.path().join("a.txt")).unwrap();
+        assert_eq!(value & bit != 0, cfg!(windows), "toggled");
+        assert_eq!(Some(platform::attributes(&tmp.path().join("a.txt")).unwrap() & platform::ATTRIBUTES[0].1 != 0), before);
+        // Both files: that row now differs.
+        app.on_key(ctrl('a'));
+        app.on_key(with_mods(KeyCode::Char('a'), KeyModifiers::ALT));
+        let Some(Dialog::Attributes { states, paths, .. }) = &app.dialog else { panic!() };
+        assert_eq!(paths.len(), 2);
+        assert_eq!(states[row], None, "differs between the two");
+        app.on_key(key(KeyCode::Esc));
+        platform::set_attributes(&tmp.path().join("a.txt"), value ^ bit).unwrap();
     }
 
     /// F12 lists the commands; typing narrows them, Enter runs one.
