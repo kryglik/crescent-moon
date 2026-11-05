@@ -1,6 +1,7 @@
 //! Drawing: two panels, the command line, the function-key bar, dialogs and job progress.
 //! Every frame also records where things are (`HitAreas`) so mouse clicks can find them.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use ratatui::Frame;
@@ -17,6 +18,7 @@ use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
 use crate::dialog::LineEdit;
 use crate::finder::{Field as FindField, Finder, Row};
+use crate::git::{Head, Mark, Repo, Status, Tracker, Worktree};
 use unicode_width::UnicodeWidthChar;
 use crate::options::{self, OptionsAutomatic};
 use crate::panel::{Entry, Panel, SortBy};
@@ -95,7 +97,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             continue;
         }
         let query = if side == active { search.as_deref() } else { None };
-        let (cursor, panel_hit) = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query);
+        let (cursor, panel_hit) = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query, &app.git);
         hit.panels[side] = panel_hit;
         search_cursor = search_cursor.or(cursor);
     }
@@ -128,6 +130,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let label_w = commands.iter().map(|c| util::width(c.label)).max().unwrap_or(0);
         let rows: Vec<String> = commands.iter().map(|c| format!("{}  {}", util::pad(c.label, label_w), c.keys)).collect();
         let (position, dialog_hit) = draw_filtered_list(frame, area, "Commands", &rows, filter, *cursor, COMMANDS_HINT);
+        frame.set_cursor_position(position);
+        hit.dialog = Some(dialog_hit);
+    } else if let Some(Dialog::Worktrees { filter, cursor, worktrees, here }) = &app.dialog {
+        let rows = worktree_rows(&dialog::worktree_rows(worktrees, filter.text()), here);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Git worktrees", &rows, filter, *cursor, WORKTREES_HINT);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(dialog) = &app.dialog {
@@ -287,6 +294,7 @@ fn draw_panel(
     panel: &mut Panel,
     active: bool,
     search: Option<&str>,
+    git: &Tracker,
 ) -> (Option<Position>, PanelHit) {
     let base = panel_style();
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -300,12 +308,36 @@ fn draw_panel(
         title.push(Span::styled(filter, base.fg(Color::Yellow)));
     }
     let mut block = Block::bordered().border_style(base).style(base).title(Line::from(title));
-    if let Some((free, total)) = panel.space {
+    // The bottom line: the git branch on the left (in a repository), free space on the right
+    // when there is room for both.
+    let repo = panel.repo.clone();
+    let status = repo.as_ref().and_then(|repo| git.status(&repo.root));
+    let space = panel.space.map(|(free, total)| {
         let percent = free.saturating_mul(100) / total.max(1);
-        let text = format!(" {} / {} ({percent}%) ", util::human_size(free), util::human_size(total));
-        if util::width(&text) + 2 < inner_w {
-            block = block.title_bottom(Line::from(text).right_aligned());
+        format!(" {} / {} ({percent}%) ", util::human_size(free), util::human_size(total))
+    });
+    let space_w = space.as_deref().map_or(0, util::width);
+    let mut space_fits = space_w + 2 < inner_w;
+    if let Some(repo) = &repo {
+        // Beside the free space when the counts fit there too (in words or signs); else the
+        // free space gives way, the git line counting for more in a repository.
+        let room = inner_w.saturating_sub(2);
+        let forms = git_label_forms(repo, status);
+        let beside_w = room.saturating_sub(space_w + 1);
+        let beside = forms[..2].iter().find(|line| space_fits && line.width() <= beside_w).cloned();
+        space_fits = beside.is_some();
+        let line = beside.or_else(|| forms.iter().find(|line| line.width() <= room).cloned()).unwrap_or_else(|| {
+            let branch = util::take_width(&branch_name(repo, status), room.saturating_sub(2)).to_string();
+            Line::from(Span::styled(format!(" {branch} "), base.fg(Color::White).add_modifier(Modifier::BOLD)))
+        });
+        if room >= 3 {
+            block = block.title_bottom(line.left_aligned());
         }
+    }
+    if let Some(text) = space
+        && space_fits
+    {
+        block = block.title_bottom(Line::from(text).right_aligned());
     }
     let inner = block.inner(area);
     block.render(area, buf);
@@ -318,6 +350,8 @@ fn draw_panel(
     let details = inner.width >= 34;
     let (size_w, time_w) = (7usize, 12usize);
     let name_w = if details { inner_w - size_w - time_w - 2 } else { inner_w };
+    // In a repository the name column's last place holds each file's git mark.
+    let mark_w = usize::from(repo.is_some() && git.enabled() && name_w > 8);
     let size_x = inner.x + name_w as u16 + 1;
     let time_x = size_x + size_w as u16 + 1;
     let hit = PanelHit {
@@ -352,7 +386,12 @@ fn draw_panel(
         let entry = panel.entries.get(index);
         let marked = entry.is_some_and(|e| panel.is_marked(e));
         let on_cursor = active && index == panel.cursor && entry.is_some();
-        let style = entry_style(entry, marked, on_cursor);
+        let git_mark = match (&repo, status, entry) {
+            (Some(repo), Some(status), Some(e)) if !e.is_parent => repo.relative(&e.path).and_then(|path| status.mark(&path)),
+            _ => None,
+        };
+        let ignored = matches!(git_mark, Some((Mark::Ignored, _)));
+        let style = entry_style(entry, marked, on_cursor, ignored);
         let (name, size, time) = match entry {
             Some(e) => (
                 format!("{}{}", prefix(e), e.name),
@@ -361,7 +400,15 @@ fn draw_panel(
             ),
             None => Default::default(),
         };
-        buf.set_string(inner.x, y, util::fit(&name, name_w), style);
+        buf.set_string(inner.x, y, util::fit(&name, name_w - mark_w), style);
+        if mark_w == 1 {
+            let (symbol, mark_style) = match git_mark {
+                Some((mark, inside)) if mark != Mark::Ignored => git_symbol(mark, inside),
+                _ => (" ", base),
+            };
+            let mark_style = if on_cursor { style } else { mark_style };
+            buf.set_string(inner.x + (name_w - 1) as u16, y, symbol, mark_style);
+        }
         if details {
             let separator = if on_cursor { style } else { base };
             buf.set_string(size_x - 1, y, "│", separator);
@@ -619,9 +666,98 @@ fn size_text(panel: &Panel, entry: &Entry) -> String {
     }
 }
 
-fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool) -> Style {
+/// The mark beside a name in a repository: what happened to the file (M changed, A added, R
+/// renamed, ? untracked, ! conflict), or `•` for a folder with changes inside; in its colour.
+fn git_symbol(mark: Mark, inside: bool) -> (&'static str, Style) {
+    let base = panel_style();
+    let style = match mark {
+        Mark::Conflict => base.fg(Color::LightRed).add_modifier(Modifier::BOLD),
+        Mark::Modified => base.fg(Color::Yellow),
+        Mark::Added | Mark::Renamed | Mark::Untracked => base.fg(Color::LightGreen),
+        Mark::Ignored => base.fg(Color::DarkGray),
+    };
+    let symbol = match mark {
+        _ if inside => "•",
+        Mark::Conflict => "!",
+        Mark::Modified => "M",
+        Mark::Added => "A",
+        Mark::Renamed => "R",
+        Mark::Untracked => "?",
+        Mark::Ignored => " ",
+    };
+    (symbol, style)
+}
+
+/// The branch: its name, `(1a2b3c4)` for a commit, or what git status said when HEAD can't be
+/// read from the files.
+fn branch_name(repo: &Repo, status: Option<&Status>) -> String {
+    match &repo.head {
+        Head::Unknown => status.and_then(|s| s.branch.clone()).unwrap_or_else(|| "git".into()),
+        head => head.label(),
+    }
+}
+
+/// The git part of a panel's bottom line, from the most words to the fewest: the branch, an
+/// operation under way, commits ahead/behind, "worktree", and how many files are changed,
+/// untracked or in conflict (` main ↑1 · 3 changed · 1 untracked `, then ` main ↑1 ~3 ?1 `);
+/// the last is the branch alone.
+fn git_label_forms(repo: &Repo, status: Option<&Status>) -> Vec<Line<'static>> {
+    let base = panel_style();
+    let branch = Span::styled(format!(" {}", branch_name(repo, status)), base.fg(Color::White).add_modifier(Modifier::BOLD));
+    let mut head = vec![branch.clone()];
+    if let Some(state) = &repo.state {
+        head.push(Span::styled(format!(" {state}"), base.fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    }
+    let mut arrows = String::new();
+    if let Some((ahead, behind)) = status.and_then(|s| s.ahead_behind) {
+        if ahead > 0 {
+            arrows.push_str(&format!("↑{ahead}"));
+        }
+        if behind > 0 {
+            arrows.push_str(&format!("↓{behind}"));
+        }
+    }
+    if !arrows.is_empty() {
+        head.push(Span::styled(format!(" {arrows}"), base.fg(Color::White)));
+    }
+    // How many, in words, as a sign, and in what colour.
+    let counts: Vec<(usize, String, &str, Style)> = status.map_or_else(Vec::new, |s| {
+        let plural = if s.conflicts == 1 { "" } else { "s" };
+        vec![
+            (s.changed, format!("{} changed", s.changed), "~", base.fg(Color::Yellow)),
+            (s.untracked, format!("{} untracked", s.untracked), "?", base.fg(Color::LightGreen)),
+            (s.conflicts, format!("{} conflict{plural}", s.conflicts), "!", base.fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+        ]
+    });
+    let end = Span::styled(" ", base);
+
+    let mut long = head.clone();
+    if repo.linked {
+        long.extend([Span::styled(" ·", base), Span::styled(" worktree", base.fg(Color::LightCyan))]);
+    }
+    for (n, words, _, style) in &counts {
+        if *n > 0 {
+            long.extend([Span::styled(" ·", base), Span::styled(format!(" {words}"), *style)]);
+        }
+    }
+    long.push(end.clone());
+    let mut short = head.clone();
+    for (n, _, sign, style) in &counts {
+        if *n > 0 {
+            short.push(Span::styled(format!(" {sign}{n}"), *style));
+        }
+    }
+    short.push(end.clone());
+    let mut bare = head[..1 + usize::from(repo.state.is_some())].to_vec();
+    bare.push(end.clone());
+    vec![Line::from(long), Line::from(short), Line::from(bare), Line::from(vec![branch, end])]
+}
+
+fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool, ignored: bool) -> Style {
     let fg = match entry {
         _ if marked => Color::Yellow,
+        // Ignored by git (target, .venv): dimmed, as editors show them.
+        _ if ignored => Color::DarkGray,
         Some(e) if e.is_dir => Color::White,
         Some(e) if e.is_exec => Color::LightGreen,
         _ => Color::Gray,
@@ -801,7 +937,7 @@ fn draw_dialog(
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
         // Drawn by `draw`, which has the rows.
-        Dialog::History { .. } | Dialog::Commands { .. } => (None, DialogHit::default()),
+        Dialog::History { .. } | Dialog::Commands { .. } | Dialog::Worktrees { .. } => (None, DialogHit::default()),
         Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor)),
         Dialog::Help { scroll } => {
             let height = help_height(area);
@@ -995,6 +1131,31 @@ fn draw_attributes(frame: &mut Frame, area: Rect, paths: &[std::path::PathBuf], 
 
 const HISTORY_HINT: &str = "type to narrow · Enter goes there · Del forgets · Esc";
 const COMMANDS_HINT: &str = "type to narrow · Enter runs it · Esc";
+const WORKTREES_HINT: &str = "type to narrow · Enter goes there (same subfolder) · Esc";
+
+/// The Alt+W list's rows: `*` on the one the panel is in, the branch, then the folder (which
+/// gives way from the left when the box is narrow) and what is unusual about it.
+fn worktree_rows(worktrees: &[&Worktree], here: &Path) -> Vec<String> {
+    let label = |w: &Worktree| match &w.state {
+        Some(state) => format!("{} {state}", w.head.label()),
+        None => w.head.label(),
+    };
+    let branch_w = worktrees.iter().map(|w| util::width(&label(w))).max().unwrap_or(0).min(40);
+    worktrees
+        .iter()
+        .map(|w| {
+            let mark = if util::same_path(&w.path, here) { "*" } else { " " };
+            let mut notes = String::new();
+            for (yes, note) in [(w.main, "main"), (w.locked, "locked"), (w.missing, "missing")] {
+                if yes {
+                    notes.push_str(&format!("  ({note})"));
+                }
+            }
+            let branch = util::pad(util::take_width(&label(w), 40), branch_w);
+            format!("{mark} {branch}  \t{}{notes}", w.path.display())
+        })
+        .collect()
+}
 
 /// A list narrowed by typing (Alt+H's folders, F12's commands): the filter line, then the
 /// rows. Returns the text cursor and where the rows are, for the mouse.
@@ -1008,7 +1169,7 @@ fn draw_filtered_list(
     hint: &str,
 ) -> (Position, DialogHit) {
     let height = (rows.len() as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
-    let widest = rows.iter().map(|r| util::width(r)).max().unwrap_or(0) as u16 + 4;
+    let widest = rows.iter().map(|r| util::width(&r.replace('\t', ""))).max().unwrap_or(0) as u16 + 4;
     let width = (area.width * 2 / 3).clamp(50, 100).max(widest.min(area.width)).min(area.width);
     let (outer, inner) = dialog_frame(frame, area, width, height, title, false);
     let style = dialog_style(false);
@@ -1026,7 +1187,11 @@ fn draw_filtered_list(
         lines.push(Line::from(Span::styled(empty, grey)));
     }
     for (i, row) in rows.iter().enumerate().skip(offset).take(list_h) {
-        let text = util::fit_left(row, field_w);
+        // A row "left\tright" keeps its left part whole and shortens the right one from the left.
+        let text = match row.split_once('\t') {
+            Some((left, right)) => format!("{left}{}", util::fit_left(right, field_w.saturating_sub(util::width(left)))),
+            None => util::fit_left(row, field_w),
+        };
         let row_style = if i == cursor { cursor_style() } else { style };
         lines.push(Line::from(Span::styled(util::pad(&text, field_w), row_style)));
     }
@@ -1125,6 +1290,75 @@ mod tests {
         assert!(screen.contains("*run.bat"));
         assert!(screen.contains("UP--DIR"));
         assert!(screen.contains("10Quit"));
+    }
+
+    /// In a repository: the branch and the counts on the bottom line (fewer words when
+    /// narrow), a mark beside each changed or new name, folders with changes inside marked
+    /// `•`, ignored ones dimmed; and the Alt+W list.
+    #[test]
+    fn renders_the_branch_and_git_marks() {
+        use crate::git::{Repo, Status, tests::{fake_repo, fake_worktree}};
+        let tmp = TempDir::new("ui-git");
+        let root = tmp.dir("app");
+        fake_repo(&root, "main");
+        tmp.file("app/changed.txt", "x");
+        tmp.file("app/new.txt", "x");
+        tmp.file("app/src/lib.rs", "x");
+        tmp.file("app/target/app.exe", "x");
+        // Git status on, but never run here (no ticks): the status is given.
+        let settings = crate::settings::Settings { git_status: true, ..crate::settings::Settings::default() };
+        let mut app = App::new(root.clone(), root.clone(), crate::app::Config { settings, ..crate::testutil::config() });
+        let output = [
+            "# branch.head main",
+            "# branch.ab +1 -0",
+            "1 .M N... 100644 100644 100644 a a changed.txt",
+            "1 .M N... 100644 100644 100644 a a src/lib.rs",
+            "? new.txt",
+            "! target/",
+            "",
+        ]
+        .join("\0");
+        app.git.set_status(&root, Status::parse(output.as_bytes()));
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> =
+            (0..16).map(|y| (0..140).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect();
+        let screen = lines.join("\n");
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("└ main ↑1 · 2 changed · 1 untracked ─"), "{screen}");
+        let row = |name: &str| lines.iter().position(|l| l.contains(name)).unwrap_or_else(|| panic!("no {name}: {screen}"));
+        let left = |y: usize| lines[y].chars().take(70).collect::<String>();
+        assert!(left(row(" changed.txt")).contains("M│"), "{screen}");
+        assert!(left(row(" new.txt")).contains("?│"), "{screen}");
+        assert!(left(row("/src")).contains("•│"), "{screen}");
+        assert!(!left(row("/target")).contains("•") && left(row("/target")).contains(" │"));
+        // Ignored: dimmed. (Columns counted in characters: the lines hold │ and ─.)
+        let column = |y: usize, name: &str| lines[y][..lines[y].find(name).unwrap()].chars().count() as u16;
+        let target = row("/target");
+        assert_eq!(buffer[(column(target, "/target") + 1, target as u16)].fg, Color::DarkGray);
+        let new = row(" new.txt");
+        assert_eq!(buffer[(column(new, "new.txt"), new as u16)].fg, Color::Gray);
+
+        // Narrow: the signs instead of words, and the free space gives way.
+        let screen = render(&mut app, 60, 16);
+        assert!(screen.contains("└ main ↑1 ~2 ?1 ─"), "{screen}");
+
+        // Alt+W's list: the main one marked as where the panel is.
+        let other = tmp.path().join("app-login");
+        fake_worktree(&root, "app-login", &other, "login");
+        let worktrees = Repo::find(&root).unwrap().worktrees();
+        app.dialog = Some(Dialog::Worktrees { filter: LineEdit::default(), cursor: 1, worktrees, here: root.clone() });
+        let screen = render(&mut app, 140, 16);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Git worktrees"), "{screen}");
+        assert!(screen.contains(&format!("* main   {}  (main)", root.display())), "{screen}");
+        assert!(screen.contains(&format!("  login  {}", other.display())), "{screen}");
     }
 
     #[test]

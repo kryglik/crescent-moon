@@ -15,6 +15,9 @@ What it does differently from the Windows port of mc:
 - Total Commander habits: Ctrl+Q quick view, Shift+F2 compare folders, Alt+F5 / Alt+F9 pack and
   unpack zips (and zips open as folders), folder tabs (Ctrl+T), back and forward (Alt+Left /
   Alt+Right), Ctrl+D hotlist, Alt+F7 find.
+- **Git** at a glance: each panel's bottom line shows the branch and what changed, a mark beside
+  every changed, new or conflicting file (ignored ones dimmed), and Alt+W jumps between the
+  repository's worktrees, into the same subfolder.
 - Copies and moves never put a file at risk: an overwrite only replaces the old file once the
   new one is complete, a move to another drive deletes each file only after its copy, and the
   same file under another name is recognised.
@@ -69,6 +72,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Alt+H or Alt+Down | folder history: the folders visited lately, newest first, kept between sessions; type part of a path to narrow it, Enter goes there, Del forgets one |
 | Alt+F1, Alt+F2 | drive picker for the left / right panel |
 | Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
+| Alt+W | the git repository's worktrees: Enter goes to one, into the same subfolder (see Git) |
 | Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
@@ -158,6 +162,37 @@ say so.
   out of the folder they are unpacked into (`../x`) are left out. Packing writes UTF-8 names,
   deflated, ZIP64 for files over 4 GB.
 
+### Git
+
+In a git repository the panel's bottom line shows the branch and how the working tree stands,
+in as many words as fit: `main ↑1 · 3 changed · 1 untracked`, or in a narrow panel
+`main ↑1 ~3 ?1`. ↑ and ↓ count the commits ahead of and behind the upstream branch. A rebase,
+merge, cherry-pick or bisect under way shows the way git's prompt shows it (`REBASE 2/5`,
+`MERGING`), a detached HEAD shows its commit (`(1a2b3c4)`), and a linked worktree says
+`worktree`.
+
+Beside each name is a mark, as in VS Code: **M** changed (staged or not), **A** added, **R**
+renamed, **?** untracked, **!** in conflict, and **•** on a folder with changes inside, in
+the colour of the weightiest one. What git ignores (`target`, `.venv`, `node_modules`) is
+dimmed.
+
+- The branch, the operation under way and the worktrees are read from the repository's own
+  files, so they show the moment a panel enters a repository, with or without git installed.
+- What changed comes from `git status`, run in the background: when the panels reload (after
+  a command, F4, Ctrl+R, a copy), when files in the working tree change, and now and then
+  anyway. On Windows one watch covers the whole working tree; on Linux the git folder is
+  watched and the rest looked at every few seconds. The status never takes locks or writes
+  the index (`--no-optional-locks`), so it can't get in the way of your own git commands.
+  Ignored files come from `--ignored=matching`, which doesn't look inside ignored folders
+  (git's default mode took a minute in a repository with a Python `.venv`). A repository
+  whose status takes over 20 seconds is left alone. The option "Git: mark changed and new
+  files" (Ctrl+P) turns all this off; the branch still shows.
+- **Alt+W** lists the repository's worktrees (`git worktree add`): the main one first, then
+  the others, the most recently used first, with `*` on the one the panel is in. Typing
+  narrows the list by branch or folder, and Enter goes there: into the same subfolder when the
+  other worktree has it (`src\ui` in one, `src\ui` in the other), else as near it as it has.
+  Handy with tools that work in worktrees of their own, such as Claude Code's sessions.
+
 ### Find
 
 Alt+F7 (or mc's Alt+?) searches below the active panel's folder the way
@@ -207,8 +242,8 @@ Click selects, double-click opens, right-click marks, the wheel scrolls the pane
 pointer. Click a column heading (Name, Size, Modify time) to sort by it, and again to flip
 the order; an arrow on the heading shows which way round it is (↑ A to Z, small to big, old
 to new). Click the F-key bar labels to run them; dialog buttons and the rows of the drive
-picker, hotlist, sort menu, folder history, F12 list and attributes are clickable too, as are
-the tabs. The wheel scrolls the quick view.
+picker, hotlist, sort menu, folder history, worktree list, F12 list and attributes are
+clickable too, as are the tabs. The wheel scrolls the quick view.
 
 While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
 `rmc --no-mouse` to leave the mouse to the terminal.
@@ -227,6 +262,7 @@ text row (it counts when you move off it). Everything takes effect at once and i
 | Mouse | on (`--no-mouse` turns it off for one run) |
 | Left/Right go up and into folders | on: with an empty command line, Left is the parent folder and Right the folder under the cursor |
 | Numbers in names by value | on: "day 2" sorts before "day 10", as in Explorer |
+| Git: mark changed and new files | on: in a repository `git status` runs in the background (see Git); off, only the branch shows |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
 
@@ -273,6 +309,7 @@ function rmc {
 | `src/panel.rs` | a panel: listing, sorting, cursor, marks, back/forward, filter, a zip shown as a folder |
 | `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |
 | `src/archive.rs` | zip archives: the index, names, times |
+| `src/git.rs` | git: the branch, operation under way and worktrees from the repository's files; `git status` in the background |
 | `src/watch.rs` | watching the panels' folders for changes (Windows change notifications, inotify) |
 | `src/history.rs` | folders visited and commands typed, kept in `history.txt` |
 | `src/compare.rs` | Shift+F2's comparison of two folders |
@@ -305,7 +342,9 @@ wsl -- bash -lc 'cd /mnt/e/devel/midnight-commander && CARGO_TARGET_DIR=~/rmc-ta
 ```
 
 To check rmc itself in a Windows Terminal window, the scripts in `tools/` attach to its
-console. That works for rmc inside WSL too: give them the pid of its `wsl.exe`.
+console. That works for rmc inside WSL too: give them the pid of its `wsl.exe`. A `NO_COLOR`
+variable in the environment the window inherits (some tools set it) turns rmc's colours off,
+as crossterm honours it.
 
 ```powershell
 wt -w new cmd /c rmc E:\some\dir          # then find its pid: Get-Process rmc

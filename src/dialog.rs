@@ -6,6 +6,7 @@ use std::sync::mpsc::Sender;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
+use crate::git::Worktree;
 use crate::ops::Answer;
 use crate::options::OptionsAutomatic;
 use crate::panel::SortBy;
@@ -53,6 +54,9 @@ pub enum Dialog {
     History { filter: LineEdit, cursor: usize },
     /// F12: every command with its key (`COMMANDS`), narrowed by what is typed.
     Commands { filter: LineEdit, cursor: usize },
+    /// Alt+W: the worktrees of the repository whose working tree at `here` the panel is in,
+    /// narrowed by what is typed (`worktree_rows`).
+    Worktrees { filter: LineEdit, cursor: usize, worktrees: Vec<Worktree>, here: PathBuf },
     /// Alt+A: what to set for each of `platform::ATTRIBUTES` on `paths`; None leaves it as each
     /// file has it (they differ).
     Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize },
@@ -313,6 +317,7 @@ pub const COMMANDS: &[Command] = &[
     command("Swap the panels", "Ctrl+U", KeyCode::Char('u'), CTRL),
     command("Other panel: this folder", "Alt+I", KeyCode::Char('i'), ALT),
     command("Other panel: the folder under the cursor", "Alt+O", KeyCode::Char('o'), ALT),
+    command("Git worktrees: go to another one", "Alt+W", KeyCode::Char('w'), ALT),
     command("Open with… (Windows asks which app)", "Shift+Enter", KeyCode::Enter, SHIFT),
     command("Attributes: read-only, hidden… (permissions)", "Alt+A", KeyCode::Char('a'), ALT),
     command("Shell (switch to it and back)", "Ctrl+O", KeyCode::Char('o'), CTRL),
@@ -321,14 +326,18 @@ pub const COMMANDS: &[Command] = &[
 
 /// The commands whose label or key holds every word of `filter` (any case).
 pub fn matching_commands(filter: &str) -> Vec<&'static Command> {
-    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
-    COMMANDS
-        .iter()
-        .filter(|c| {
-            let text = format!("{} {}", c.label, c.keys).to_lowercase();
-            words.iter().all(|w| text.contains(w.as_str()))
-        })
-        .collect()
+    COMMANDS.iter().filter(|c| matches_words(&format!("{} {}", c.label, c.keys), filter)).collect()
+}
+
+/// Whether `text` holds every word of `filter`, in any case.
+fn matches_words(text: &str, filter: &str) -> bool {
+    let text = text.to_lowercase();
+    filter.split_whitespace().all(|word| text.contains(&word.to_lowercase()))
+}
+
+/// The worktrees whose branch or folder holds every word of `filter`.
+pub fn worktree_rows<'a>(worktrees: &'a [Worktree], filter: &str) -> Vec<&'a Worktree> {
+    worktrees.iter().filter(|w| matches_words(&format!("{} {}", w.head.label(), w.path.display()), filter)).collect()
 }
 
 pub const HELP: &[&str] = &[
@@ -382,6 +391,14 @@ pub const HELP: &[&str] = &[
     "  Enter        open a zip as a folder (read-only); .. leaves it",
     "  F5           copy out of it    F3, Enter   view, open a file in it",
     "  Alt+F5       pack into a zip   Alt+F9      unpack the zip",
+    "",
+    "Git (in a repository)",
+    "  The panel's bottom line: branch, ↑↓ commits ahead/behind,",
+    "  how many files changed (~), untracked (?), in conflict (!)",
+    "  Beside names: M changed  A added  R renamed  ? untracked",
+    "  ! conflict  • changes inside a folder; ignored files are dim",
+    "  Alt+W        worktrees of the repository: Enter goes to one",
+    "               (to the same folder in it, when it has one)",
     "",
     "Mouse",
     "  click        select       double-click  open",

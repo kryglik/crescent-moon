@@ -8,6 +8,7 @@ mod compare;
 mod dialog;
 mod find;
 mod finder;
+mod git;
 mod history;
 mod hotlist;
 mod lnk;

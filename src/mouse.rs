@@ -273,12 +273,17 @@ impl App {
                 let list_len = match &self.dialog {
                     Some(Dialog::History { filter, .. }) => self.history_rows(filter.text()).len(),
                     Some(Dialog::Commands { filter, .. }) => crate::dialog::matching_commands(filter.text()).len(),
+                    Some(Dialog::Worktrees { filter, worktrees, .. }) => {
+                        crate::dialog::worktree_rows(worktrees, filter.text()).len()
+                    }
                     _ => 0,
                 };
                 match &mut self.dialog {
                     Some(Dialog::Drives { cursor, drives, .. }) if i < drives.len() => *cursor = i,
                     Some(Dialog::Hotlist { cursor }) if i < self.hotlist.dirs.len() => *cursor = i,
-                    Some(Dialog::History { cursor, .. } | Dialog::Commands { cursor, .. }) if i < list_len => *cursor = i,
+                    Some(
+                        Dialog::History { cursor, .. } | Dialog::Commands { cursor, .. } | Dialog::Worktrees { cursor, .. },
+                    ) if i < list_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
                     _ => return,
                 }
@@ -299,6 +304,7 @@ impl App {
                             | Dialog::Hotlist { .. }
                             | Dialog::History { .. }
                             | Dialog::Commands { .. }
+                            | Dialog::Worktrees { .. }
                             | Dialog::Attributes { .. }
                             | Dialog::Sort { .. }
                             | Dialog::Options { .. }

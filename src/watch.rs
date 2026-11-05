@@ -25,13 +25,26 @@ pub struct Watch {
 
 impl Watch {
     pub fn new(dir: &Path) -> Watch {
-        Watch { dir: dir.to_path_buf(), handle: sys::Handle::open(dir), due: None, last: None }
+        Watch { dir: dir.to_path_buf(), handle: sys::Handle::open(dir, false), due: None, last: None }
+    }
+
+    /// The folder and everything below it (a git working tree). Only on Windows, where one
+    /// handle covers a whole tree, and only on local drives; elsewhere the watch is inactive.
+    pub fn tree(dir: &Path) -> Watch {
+        Watch { dir: dir.to_path_buf(), handle: sys::Handle::open(dir, true), due: None, last: None }
     }
 
     /// Whether the folder is really being watched (not on a removable drive, say).
-    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// Drops the changes seen so far (ones rmc's own `git status` made, say).
+    pub fn forget(&mut self) {
+        if let Some(handle) = self.handle.as_mut() {
+            handle.changed();
+        }
+        self.due = None;
     }
 
     /// Whether the panel should reload now: something changed, things have settled, and the
@@ -67,14 +80,16 @@ mod sys {
         FindFirstChangeNotificationW, FindNextChangeNotification, GetDriveTypeW,
     };
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    use windows_sys::Win32::System::WindowsProgramming::{DRIVE_CDROM, DRIVE_REMOVABLE};
+    use windows_sys::Win32::System::WindowsProgramming::{DRIVE_CDROM, DRIVE_REMOTE, DRIVE_REMOVABLE};
 
     /// The change-notification handle (as an integer, so the panel stays `Send`).
     pub struct Handle(isize);
 
     impl Handle {
-        pub fn open(dir: &Path) -> Option<Handle> {
-            if !watchable(dir) {
+        /// `subtree`: everything below `dir` too; not on network drives, where the server
+        /// would have to report every change in the whole tree.
+        pub fn open(dir: &Path, subtree: bool) -> Option<Handle> {
+            if !watchable(dir, subtree) {
                 return None;
             }
             let filter = FILE_NOTIFY_CHANGE_FILE_NAME
@@ -83,7 +98,7 @@ mod sys {
                 | FILE_NOTIFY_CHANGE_LAST_WRITE
                 | FILE_NOTIFY_CHANGE_ATTRIBUTES;
             let path = crate::platform::long_wide(dir);
-            let handle = unsafe { FindFirstChangeNotificationW(path.as_ptr(), 0, filter) };
+            let handle = unsafe { FindFirstChangeNotificationW(path.as_ptr(), subtree as i32, filter) };
             (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Handle(handle as isize))
         }
 
@@ -104,15 +119,21 @@ mod sys {
         }
     }
 
-    /// Not on removable or optical drives, which a watch would keep from being ejected.
-    fn watchable(dir: &Path) -> bool {
+    /// Not on removable or optical drives, which a watch would keep from being ejected; a
+    /// whole tree only on local drives.
+    fn watchable(dir: &Path, subtree: bool) -> bool {
         let Some(Component::Prefix(prefix)) = dir.components().next() else { return true };
         let letter = match prefix.kind() {
             Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
-            _ => return true,
+            // A share (\\server\share).
+            _ => return !subtree,
         };
         let root: Vec<u16> = format!("{}:\\", letter as char).encode_utf16().chain([0]).collect();
-        !matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, DRIVE_REMOVABLE | DRIVE_CDROM)
+        match unsafe { GetDriveTypeW(root.as_ptr()) } {
+            DRIVE_REMOVABLE | DRIVE_CDROM => false,
+            DRIVE_REMOTE => !subtree,
+            _ => true,
+        }
     }
 }
 
@@ -126,7 +147,11 @@ mod sys {
     pub struct Handle(i32);
 
     impl Handle {
-        pub fn open(dir: &Path) -> Option<Handle> {
+        /// inotify watches one folder, not what is below it: no `subtree`.
+        pub fn open(dir: &Path, subtree: bool) -> Option<Handle> {
+            if subtree {
+                return None;
+            }
             let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
             let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
             if fd < 0 {
@@ -174,7 +199,7 @@ mod sys {
     pub struct Handle;
 
     impl Handle {
-        pub fn open(_dir: &Path) -> Option<Handle> {
+        pub fn open(_dir: &Path, _subtree: bool) -> Option<Handle> {
             None
         }
 
@@ -220,6 +245,25 @@ mod tests {
         assert!(wait_for_change(&mut watch, &mut clock), "a new file is noticed");
         std::fs::remove_file(&file).unwrap();
         assert!(wait_for_change(&mut watch, &mut clock), "a deleted file is noticed");
+    }
+
+    /// A git working tree is watched whole on Windows; what was seen can be dropped.
+    #[cfg(windows)]
+    #[test]
+    fn a_tree_watch_sees_changes_deep_down() {
+        let tmp = TempDir::new("watch-tree");
+        tmp.dir("src/ui");
+        let mut tree = Watch::tree(tmp.path());
+        assert!(tree.is_active());
+        let mut clock = Instant::now();
+        tmp.file("src/ui/panel.rs", "x");
+        assert!(wait_for_change(&mut tree, &mut clock), "a file two folders down is noticed");
+        // Seen, then forgotten: not due.
+        std::fs::write(tmp.path().join("src/ui/panel.rs"), "xy").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        tree.forget();
+        clock += Duration::from_secs(10);
+        assert!(!tree.due(clock));
     }
 
     #[test]

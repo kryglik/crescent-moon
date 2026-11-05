@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use crate::archive::{self, Archive};
 use crate::find::NameFilter;
+use crate::git::Repo;
 use crate::{platform, util};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +141,8 @@ pub struct Panel {
     /// A zip shown as a folder (Enter on it). `cwd` stays the real folder it is in, which
     /// the shell, Find and the drive memory go by.
     pub archive: Option<ArchiveView>,
+    /// The git repository the folder is in (not while in a zip), read again at each load.
+    pub repo: Option<Repo>,
 }
 
 /// The zip a panel shows, and where in it.
@@ -212,6 +215,7 @@ impl Panel {
             back: Vec::new(),
             forward: Vec::new(),
             archive: None,
+            repo: None,
         }
     }
 
@@ -259,6 +263,7 @@ impl Panel {
         }
         self.entries = entries;
         self.space = platform::disk_space(&self.cwd);
+        self.repo = if self.archive.is_none() { Repo::find(&self.cwd) } else { None };
         // Marks and sizes of entries that are gone go too (looked up by name: a folder of
         // 50,000 photos with all of them marked must not take seconds).
         let names: HashSet<&str> = self.entries.iter().filter(|e| !e.is_parent).map(|e| e.name.as_str()).collect();

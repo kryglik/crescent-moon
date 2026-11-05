@@ -19,6 +19,9 @@ pub struct Settings {
     pub arrows_navigate: bool,
     /// Numbers in names sort by value ("day 2" before "day 10"), as in Explorer.
     pub natural_sort: bool,
+    /// In a git repository, `git status` runs now and then so the panels mark changed, new and
+    /// ignored files. (The branch shows either way: it is read from the repository's files.)
+    pub git_status: bool,
     /// Files bigger than this many megabytes go to the pager, and the editor asks first.
     pub big_file_mb: u64,
     /// Commands; empty means automatic (environment variables, then what is installed).
@@ -36,6 +39,7 @@ impl Default for Settings {
             mouse: true,
             arrows_navigate: true,
             natural_sort: true,
+            git_status: true,
             big_file_mb: 10,
             editor: String::new(),
             viewer: String::new(),
@@ -88,6 +92,7 @@ impl Settings {
                 "mouse" => settings.mouse = flag(settings.mouse),
                 "arrows_navigate" => settings.arrows_navigate = flag(settings.arrows_navigate),
                 "natural_sort" => settings.natural_sort = flag(settings.natural_sort),
+                "git_status" => settings.git_status = flag(settings.git_status),
                 "big_file_mb" => {
                     if let Ok(mb) = value.parse::<u64>()
                         && mb > 0
@@ -114,6 +119,7 @@ impl Settings {
              mouse = {}\n\
              arrows_navigate = {}\n\
              natural_sort = {}\n\
+             git_status = {}\n\
              big_file_mb = {}\n\
              editor = {}\n\
              viewer = {}\n\
@@ -124,6 +130,7 @@ impl Settings {
             self.mouse,
             self.arrows_navigate,
             self.natural_sort,
+            self.git_status,
             self.big_file_mb,
             self.editor,
             self.viewer,
@@ -146,6 +153,7 @@ mod tests {
         let settings = Settings {
             confirm_quit: true,
             mouse: false,
+            git_status: false,
             big_file_mb: 25,
             editor: r#""C:\Program Files\Neovim\bin\nvim.exe" -p"#.into(),
             ..Settings::default()

@@ -9,7 +9,8 @@ use crate::platform::Shell;
 use crate::settings::Settings;
 
 /// nvim as editor and viewer, no pager, default settings, and no files on disk (so tests
-/// never touch the real hotlist or settings).
+/// never touch the real hotlist or settings). No `git status` either: a test's folder may be
+/// inside a repository (the ones under `target/`), and a test that wants git asks for it.
 pub fn config() -> Config {
     Config {
         editor: vec!["nvim".into()],
@@ -20,7 +21,7 @@ pub fn config() -> Config {
         hotlist_file: None,
         settings_file: None,
         history_file: None,
-        settings: Settings::default(),
+        settings: Settings { git_status: false, ..Settings::default() },
     }
 }
 

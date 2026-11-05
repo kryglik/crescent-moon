@@ -11,6 +11,7 @@ pub enum Row {
     Mouse,
     Arrows,
     NaturalSort,
+    GitStatus,
     BigFile,
     Editor,
     Viewer,
@@ -18,12 +19,13 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 10] = [
+pub const ROWS: [Row; 11] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
     Row::Arrows,
     Row::NaturalSort,
+    Row::GitStatus,
     Row::BigFile,
     Row::Editor,
     Row::Viewer,
@@ -39,6 +41,7 @@ impl Row {
             Row::Mouse => "Mouse",
             Row::Arrows => "Left/Right go up and into folders",
             Row::NaturalSort => "Numbers in names by value (2 before 10)",
+            Row::GitStatus => "Git: mark changed and new files",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
             Row::Viewer => "Viewer (F3)",
@@ -49,7 +52,7 @@ impl Row {
 
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
-        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort)
+        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus)
     }
 
     pub fn flag(self, settings: &Settings) -> bool {
@@ -59,6 +62,7 @@ impl Row {
             Row::Mouse => settings.mouse,
             Row::Arrows => settings.arrows_navigate,
             Row::NaturalSort => settings.natural_sort,
+            Row::GitStatus => settings.git_status,
             _ => false,
         }
     }
@@ -70,6 +74,7 @@ impl Row {
             Row::Mouse => settings.mouse = !settings.mouse,
             Row::Arrows => settings.arrows_navigate = !settings.arrows_navigate,
             Row::NaturalSort => settings.natural_sort = !settings.natural_sort,
+            Row::GitStatus => settings.git_status = !settings.git_status,
             _ => {}
         }
     }

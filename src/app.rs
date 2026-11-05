@@ -14,6 +14,7 @@ use crate::clipboard::{self, Clipboard, Effect};
 use crate::compare;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
 use crate::finder::{Field as FindField, Finder};
+use crate::git::{self, Tracker, Worktree};
 use crate::history::History;
 use crate::hotlist::Hotlist;
 use crate::lnk;
@@ -256,6 +257,8 @@ pub struct App {
     /// `tab_index[side]` among them.
     pub tabs: [Vec<Panel>; 2],
     pub tab_index: [usize; 2],
+    /// `git status` of the repositories the panels are in (see `git`).
+    pub git: Tracker,
 }
 
 impl App {
@@ -278,6 +281,7 @@ impl App {
             job: None,
             quicksearch: None,
             hotlist: Hotlist::load(config.hotlist_file.clone()),
+            git: Tracker::new(config.settings.git_status),
             config,
             external: None,
             quit: false,
@@ -374,7 +378,9 @@ impl App {
     /// Something will need a look soon (a folder changed and is settling, the quick view is
     /// reading a file), so the main loop should wake up sooner than when idle.
     pub fn wake_soon(&self) -> bool {
-        self.watches.iter().flatten().any(Watch::pending) || self.previewer.as_ref().is_some_and(Previewer::loading)
+        self.watches.iter().flatten().any(Watch::pending)
+            || self.previewer.as_ref().is_some_and(Previewer::loading)
+            || self.git.running()
     }
 
     /// Ctrl+Q: the quick view on or off.
@@ -435,10 +441,31 @@ impl App {
             let due = self.watches[side].as_mut().is_some_and(|w| w.due(now));
             if due && self.job.is_none() && !self.shell_shown {
                 self.panels[side].reload();
+                // Files changed in a repository: its status may have too.
+                if let Some(repo) = &self.panels[side].repo {
+                    self.git.nudge(&repo.root);
+                }
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Starts `git status` where the shown panels need it, and takes what arrived. A status
+    /// can follow a checkout, so the branch is read again with it.
+    fn tick_git(&mut self) -> bool {
+        let shown: Vec<&git::Repo> = (0..2)
+            .filter(|&side| !(self.quick_view && side != self.active))
+            .filter_map(|side| self.panels[side].repo.as_ref())
+            .collect();
+        let quiet = self.shell_shown || self.job.is_some();
+        let arrived = self.git.tick(&shown, Instant::now(), quiet);
+        for panel in &mut self.panels {
+            if let Some(repo) = panel.repo.as_mut().filter(|repo| arrived.contains(&repo.root)) {
+                repo.reload();
+            }
+        }
+        !arrived.is_empty()
     }
 
     /// Whether background work is running (the main loop then redraws more often).
@@ -477,6 +504,8 @@ impl App {
         for panel in &mut self.panels {
             panel.reload();
         }
+        // A command ran, or Ctrl+R: the repositories may have changed too.
+        self.git.refresh();
     }
 
     /// The shell commands are typed into: the running one, or the one the options name.
@@ -495,6 +524,7 @@ impl App {
             key.code = KeyCode::Char(c.to_ascii_lowercase());
         }
         self.notice = None;
+        self.git.touch();
         if self.shell_shown {
             self.on_shell_key(key);
         } else if self.dialog.is_some() {
@@ -589,7 +619,10 @@ impl App {
             KeyCode::Enter => self.open_current(),
             KeyCode::Backspace if cmd_empty => self.go_up(),
             KeyCode::Esc => self.cmdline.clear(),
-            KeyCode::Char('r') if ctrl && !alt => self.reload_panels(),
+            KeyCode::Char('r') if ctrl && !alt => {
+                self.reload_panels();
+                self.git.retry();
+            }
             KeyCode::Char('h') if ctrl && !alt => self.toggle_hidden(),
             KeyCode::Char('.') if alt && !ctrl => self.toggle_hidden(),
             KeyCode::Char('u') if ctrl && !alt => {
@@ -629,6 +662,7 @@ impl App {
             KeyCode::Char('*') if cmd_empty && plain => self.active_panel_mut().invert_marks(),
             KeyCode::Char('a') if ctrl && !alt && cmd_empty => self.active_panel_mut().mark_all(),
             KeyCode::Char('a') if alt && !ctrl => self.open_attributes(),
+            KeyCode::Char('w') if alt && !ctrl => self.open_worktrees(),
             KeyCode::Char('f') if ctrl && !alt => {
                 let current = self.active_panel().filter.clone().unwrap_or_default();
                 self.start_input("Filter", "Show only files matching (empty shows all):", &current, InputAction::Filter);
@@ -743,6 +777,9 @@ impl App {
             Dialog::Hotlist { cursor } => self.on_hotlist_key(&key, cursor),
             Dialog::History { filter, cursor } => self.on_history_key(&key, filter, cursor),
             Dialog::Commands { filter, cursor } => self.on_commands_key(&key, filter, cursor),
+            Dialog::Worktrees { filter, cursor, worktrees, here } => {
+                self.on_worktrees_key(&key, filter, cursor, worktrees, here)
+            }
             Dialog::Attributes { paths, states, cursor } => self.on_attributes_key(&key, paths, states, cursor),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
                 let buttons = dialog::delete_buttons(&survey.tally());
@@ -1083,6 +1120,7 @@ impl App {
             }
         }
         self.mouse = settings.mouse && self.mouse_allowed;
+        self.git.set_enabled(settings.git_status);
         let (hotlist_file, settings_file) = (self.config.hotlist_file.take(), self.config.settings_file.take());
         let history_file = self.config.history_file.take();
         self.config = Config::new(settings, hotlist_file, settings_file);
@@ -1375,6 +1413,7 @@ impl App {
             changed |= finder.tick();
         }
         changed |= self.follow_changes();
+        changed |= self.tick_git();
         if self.quick_view {
             let key = self.preview_key();
             if let Some(previewer) = &mut self.previewer {
@@ -1443,6 +1482,7 @@ impl App {
             panel.dir_sizes.clear();
             panel.reload();
         }
+        self.git.refresh();
         // Esc just stops the job: no "cancelled" box to dismiss as well. Failures from before
         // the stop are still worth knowing about.
         if !errors.is_empty() {
@@ -1743,6 +1783,70 @@ impl App {
             }
         }
         Some(Dialog::History { filter, cursor })
+    }
+
+    /// Alt+W: the worktrees of the repository the panel is in, to go to another one. The
+    /// cursor starts on the first one that isn't this one.
+    fn open_worktrees(&mut self) {
+        let Some(repo) = self.active_panel().repo.as_ref() else {
+            self.notice = Some("Not in a git repository (Alt+W lists its worktrees)".into());
+            return;
+        };
+        let worktrees = repo.worktrees();
+        let here = repo.root.clone();
+        let cursor = worktrees.iter().position(|w| !util::same_path(&w.path, &here)).unwrap_or(0);
+        self.dialog = Some(Dialog::Worktrees { filter: LineEdit::default(), cursor, worktrees, here });
+    }
+
+    fn on_worktrees_key(
+        &mut self,
+        key: &KeyEvent,
+        mut filter: LineEdit,
+        mut cursor: usize,
+        worktrees: Vec<Worktree>,
+        here: PathBuf,
+    ) -> Option<Dialog> {
+        let rows = dialog::worktree_rows(&worktrees, filter.text());
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => return None,
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => return None,
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(last),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+            KeyCode::PageDown => cursor = (cursor + 10).min(last),
+            KeyCode::Enter => {
+                if let Some(worktree) = rows.get(cursor) {
+                    let worktree = (*worktree).clone();
+                    self.go_to_worktree(&worktree, &here);
+                }
+                return None;
+            }
+            _ => {
+                let before = filter.text().to_string();
+                filter.handle_key(key);
+                if filter.text() != before {
+                    cursor = 0;
+                }
+            }
+        }
+        Some(Dialog::Worktrees { filter, cursor, worktrees, here })
+    }
+
+    /// Into `worktree`, to the folder the panel is in within the working tree at `here` when
+    /// it has that folder too (src\ui in one, src\ui in the other), else as near it as it has.
+    fn go_to_worktree(&mut self, worktree: &Worktree, here: &Path) {
+        if worktree.missing {
+            let path = worktree.path.display();
+            return self.error(format!("The worktree's folder is gone:\n{path}\n(git worktree prune forgets it)"));
+        }
+        let inside = self.active_panel().cwd.strip_prefix(here).map(Path::to_path_buf).unwrap_or_default();
+        let mut target = worktree.path.join(inside);
+        while !target.is_dir() && target.pop() && target.starts_with(&worktree.path) {}
+        if !target.starts_with(&worktree.path) {
+            target = worktree.path.clone();
+        }
+        self.change_dir(self.active, target);
     }
 
     /// Into the folder under the cursor (on `..`, up); nothing on a file.
@@ -2305,6 +2409,46 @@ mod tests {
         assert!(names(&app).contains(&"new.txt".to_string()) && app.panels[1].entries.iter().any(|e| e.name == "new.txt"));
         assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
         assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
+    }
+
+    /// Alt+W lists the repository's worktrees; Enter goes to the same subfolder in the one
+    /// chosen, or as near it as that one has. Outside a repository it says so.
+    #[test]
+    fn alt_w_goes_to_the_same_folder_in_another_worktree() {
+        use crate::git::tests::{fake_repo, fake_worktree};
+        let tmp = TempDir::new("app-worktrees");
+        let main = tmp.dir("app");
+        fake_repo(&main, "main");
+        tmp.dir("app/src/ui");
+        let login = tmp.path().join("app-login");
+        fake_worktree(&main, "app-login", &login, "login");
+        tmp.dir("app-login/src/ui");
+        let mut app = test_app(&main.join("src").join("ui"), tmp.path());
+        assert_eq!(app.active_panel().repo.as_ref().map(|r| r.head.label()).as_deref(), Some("main"));
+
+        app.on_key(alt(KeyCode::Char('w')));
+        let Some(Dialog::Worktrees { worktrees, cursor, .. }) = &app.dialog else { panic!("no worktree list") };
+        assert_eq!(worktrees.len(), 2);
+        assert_eq!(*cursor, 1, "the cursor starts on the other one");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.active_panel().cwd, login.join("src").join("ui"));
+        let repo = app.active_panel().repo.as_ref().unwrap();
+        assert_eq!((repo.linked, repo.head.label()), (true, "login".to_string()));
+
+        // From a folder only this worktree has, back to the main one by typing its branch.
+        let only_here = tmp.dir("app-login/src/ui/new-widget");
+        app.change_dir(0, only_here);
+        app.on_key(alt(KeyCode::Char('w')));
+        typing(&mut app, "main");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.active_panel().cwd, main.join("src").join("ui"));
+
+        // Outside a repository, a word on the command line.
+        app.active = 1;
+        app.on_key(alt(KeyCode::Char('w')));
+        assert!(app.dialog.is_none());
+        assert!(app.notice.as_deref().is_some_and(|n| n.starts_with("Not in a git repository")));
     }
 
     /// `cd` reads quotes as the shell does (Ctrl+Enter inserts names quoted that way), and
@@ -3003,6 +3147,12 @@ mod tests {
         assert!(!app.config.settings.natural_sort);
         app.on_key(key(KeyCode::Char(' ')));
         assert!(app.config.settings.natural_sort);
+        // Git status (off in tests): on, and off again.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.config.settings.git_status);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.git_status);
 
         // Text rows: type, and it counts when the cursor moves on.
         app.on_key(key(KeyCode::Down));
