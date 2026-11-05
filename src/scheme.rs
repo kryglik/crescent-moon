@@ -1194,17 +1194,20 @@ pub fn file_text(choice: &Choice) -> String {
 
 /// F4 in the picker: the file of a scheme to change. A built-in one is written out first, as
 /// `<name>.ini` in `dir` (which then takes its place); one already there is left as it is.
-pub fn file_for(choice: &Choice, dir: Option<&Path>) -> io::Result<PathBuf> {
+/// The text comes along when the file was written just now.
+pub fn file_for(choice: &Choice, dir: Option<&Path>) -> io::Result<(PathBuf, Option<String>)> {
     if let Some(file) = &choice.file {
-        return Ok(file.clone());
+        return Ok((file.clone(), None));
     }
     let dir = dir.ok_or_else(|| io::Error::other("there is no folder for settings (APPDATA, or HOME on Linux)"))?;
     fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.ini", choice.name));
-    if !path.exists() {
-        fs::write(&path, file_text(choice))?;
+    if path.exists() {
+        return Ok((path, None));
     }
-    Ok(path)
+    let text = file_text(choice);
+    fs::write(&path, &text)?;
+    Ok((path, Some(text)))
 }
 
 #[cfg(test)]
@@ -1273,9 +1276,10 @@ mod tests {
         let dir = tmp.path().join("schemes");
         assert_eq!(choices(Some(&dir)).len(), BUILT_IN.len(), "no folder yet");
         let nord = choices(None).into_iter().find(|c| c.name == "nord").unwrap();
-        let file = file_for(&nord, Some(&dir)).unwrap();
+        let (file, written) = file_for(&nord, Some(&dir)).unwrap();
         assert_eq!(file, dir.join("nord.ini"));
         let text = fs::read_to_string(&file).unwrap();
+        assert_eq!(written.as_deref(), Some(text.as_str()), "written just now");
         assert!(text.contains("base = nord\n") && text.contains("\n# Git\n"), "{text}");
         let line = format!("{:<13} = {:<28} ; {}", "panel", "#d8dee9 on #2e3440", "text and background of the panels");
         assert!(text.contains(&line), "{text}");
@@ -1293,7 +1297,7 @@ mod tests {
         assert_eq!(list[BUILT_IN.len() + 1].about, "your scheme");
         assert_eq!(find("ZEBRA", Some(&dir)).unwrap().scheme.heading, Style::new().white());
         // Written once: F4 again opens the file as it is.
-        assert_eq!(file_for(mine, Some(&dir)).unwrap(), file);
+        assert_eq!(file_for(mine, Some(&dir)).unwrap(), (file.clone(), None));
         assert!(fs::read_to_string(&file).unwrap().contains("panel = #ffffff"));
     }
 

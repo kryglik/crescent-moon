@@ -340,6 +340,8 @@ out as `<name>.ini` in the `schemes` folder beside the settings (`%APPDATA%\rmc\
 `~/.config/rmc/schemes`), every part spelled out with what it is, and from then on that file
 takes the built-in one's place (delete it to get the built-in one back). Back from the editor
 the list reads it again and shows it at once; a line it can't read is named under the list.
+A file closed without a change is removed again, so a look doesn't pin the scheme: the
+built-in one keeps getting rmc's updates.
 Any other `*.ini` file there is a scheme of its own, named after the file. A line gives a
 part of the screen its look:
 

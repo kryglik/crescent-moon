@@ -212,6 +212,10 @@ pub struct App {
     pub quicksearch: Option<String>,
     pub config: Config,
     pub external: Option<External>,
+    /// A built-in scheme F4 has just written out as a file, and the text written. If the file
+    /// is still only that when the editor closes, it goes again: a look mustn't leave a copy
+    /// that pins the scheme, as the built-in one keeps getting rmc's updates.
+    scheme_file_written: Option<(PathBuf, String)>,
     pub quit: bool,
     pub hotlist: Hotlist,
     /// Screen areas from the last frame, for the mouse.
@@ -302,6 +306,7 @@ impl App {
             git: Tracker::new(config.settings.git_status),
             config,
             external: None,
+            scheme_file_written: None,
             quit: false,
             hit: HitAreas::default(),
             last_click: None,
@@ -1217,7 +1222,10 @@ impl App {
             KeyCode::F(4) => {
                 if let Some(choice) = choices.get(cursor) {
                     match scheme::file_for(choice, self.config.schemes_dir.as_deref()) {
-                        Ok(file) => self.external = Some(External::Edit(file, None)),
+                        Ok((file, written)) => {
+                            self.scheme_file_written = written.map(|text| (file.clone(), text));
+                            self.external = Some(External::Edit(file, None));
+                        }
                         Err(e) => {
                             self.scheme = self.saved_scheme();
                             self.error(format!("Cannot write the scheme to a file:\n{e}"));
@@ -1253,8 +1261,14 @@ impl App {
     }
 
     /// Back from the editor with the scheme list open: the schemes are read again, and the
-    /// one under the cursor (the one edited) shown as it is now.
+    /// one under the cursor (the one edited) shown as it is now. A file F4 wrote out that
+    /// nothing was changed in is removed first, so the built-in scheme is back.
     fn reload_schemes(&mut self) {
+        if let Some((file, text)) = self.scheme_file_written.take()
+            && fs::read_to_string(&file).is_ok_and(|now| now == text)
+        {
+            let _ = fs::remove_file(&file);
+        }
         let Some(Dialog::Schemes { cursor, choices, .. }) = &mut self.dialog else { return };
         let name = choices.get(*cursor).map(|c| c.name.clone()).unwrap_or_default();
         *choices = scheme::choices(self.config.schemes_dir.as_deref());
@@ -1645,7 +1659,7 @@ impl App {
         {
             self.change_dir(self.active, dir);
         }
-        // F4 in the scheme list: the file edited counts at once.
+        // F4 in the scheme list: the file edited counts at once (one left as it was goes).
         self.reload_schemes();
         if let Err(e) = result {
             // The error takes the scheme list's place, so the scheme in use is back too.
@@ -3401,6 +3415,38 @@ mod tests {
         assert_eq!(app.scheme.marked, scheme::built_in("nord").unwrap().marked, "the line it couldn't read");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.config.settings.scheme, "nord");
+        assert_eq!(app.scheme.heading, ratatui::style::Style::new().red());
+    }
+
+    /// F4 just to look: the file F4 wrote, closed as it was, goes again, so it doesn't pin
+    /// the scheme. A changed one stays, and so does one that was there before F4.
+    #[test]
+    fn a_scheme_file_left_as_f4_wrote_it_goes_again() {
+        let tmp = TempDir::new("app-scheme-untouched");
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
+        let file = tmp.path().join("rmc").join("schemes").join("nord.ini");
+        app.on_key(alt(KeyCode::Char('c')));
+        typing(&mut app, "n");
+        app.on_key(key(KeyCode::F(4)));
+        assert_eq!(app.external.take(), Some(External::Edit(file.clone(), None)));
+        assert!(file.exists());
+        app.after_external(Ok(()), None);
+        assert!(!file.exists(), "nothing was changed in it");
+        let Some(Dialog::Schemes { cursor, choices, .. }) = &app.dialog else { panic!("the list is still open") };
+        assert_eq!((choices[*cursor].name.as_str(), choices[*cursor].file.as_deref()), ("nord", None));
+        assert_eq!(app.scheme, scheme::built_in("nord").unwrap());
+
+        // Changed in the editor: it stays.
+        app.on_key(key(KeyCode::F(4)));
+        app.external.take();
+        fs::write(&file, fs::read_to_string(&file).unwrap().replace("\nheading ", "\nheading = red ;")).unwrap();
+        app.after_external(Ok(()), None);
+        assert!(file.exists());
+        // There before F4: it stays even when nothing changes.
+        app.on_key(key(KeyCode::F(4)));
+        assert_eq!(app.external.take(), Some(External::Edit(file.clone(), None)));
+        app.after_external(Ok(()), None);
+        assert!(file.exists());
         assert_eq!(app.scheme.heading, ratatui::style::Style::new().red());
     }
 
