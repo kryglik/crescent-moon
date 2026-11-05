@@ -1805,7 +1805,7 @@ mod tests {
     /// Files take their kind's colour (classic: archives red, pictures cyan, sound and
     /// video green, leftovers dark grey); a true-colour scheme colours everything, the cursor
     /// too; mono names no colour at all, its cursor is reverse video; classic-v2's bar is
-    /// yellow, with red on it for a marked file.
+    /// yellow, with the panels' blue on it for a marked file.
     #[test]
     fn files_and_schemes_have_their_colours() {
         let tmp = TempDir::new("ui-kinds");
@@ -1847,13 +1847,13 @@ mod tests {
         app.scheme = scheme::built_in("classic-v2").unwrap();
         app.active_panel_mut_for_tests().mark_matching("*.zip", true);
         let [zip, jpg, _, _, txt] = colours(&mut app);
-        let (blue, yellow) = (Color::Rgb(0x14, 0x3d, 0xaa), Color::Rgb(0xff, 0xd7, 0x5f));
+        let (blue, yellow) = (Color::Rgb(0x14, 0x3d, 0xaa), Color::Rgb(0xff, 0xde, 0x5f));
         assert_eq!((jpg.fg, jpg.bg), (Color::Rgb(0x61, 0xd6, 0xd6), blue));
         assert_eq!((zip.fg, zip.bg), (yellow, blue), "marked");
         assert_eq!((txt.fg, txt.bg), (Color::Rgb(0x0c, 0x0c, 0x0c), yellow), "the cursor bar");
         app.active_panel_mut_for_tests().toggle_mark();
         let [.., txt] = colours(&mut app);
-        assert_eq!((txt.fg, txt.bg), (Color::Rgb(0xc0, 0x00, 0x00), yellow), "marked, under the cursor");
+        assert_eq!((txt.fg, txt.bg), (blue, yellow), "marked, under the cursor");
     }
 
     /// Scrolling help past its end doesn't build up a dead zone: Up moves at once.

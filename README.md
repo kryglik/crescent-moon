@@ -323,7 +323,7 @@ letter jumps to the next name starting with it. A click on a row keeps that one.
 | Scheme | Look |
 | --- | --- |
 | classic | mc's blue panels, rmc's look from the start |
-| classic-v2 | classic in exact colours on a darker, calmer blue, with a yellow cursor bar: marked files full yellow, red on the bar |
+| classic-v2 | classic in exact colours on a darker, calmer blue, with a yellow cursor bar: marked files full yellow, in the panels' blue on the bar |
 | dark | classic on black, with dimmer lines and hidden files |
 | terminal | the terminal's own background and palette, with `ls`'s colours for folders and files |
 | light | black on white, red marks (as Total Commander marks), Windows' blue cursor |

@@ -433,7 +433,7 @@ pub fn classic() -> Scheme {
 }
 
 /// Classic as Windows Terminal draws it, in exact colours, but on a darker, calmer blue and with
-/// a yellow cursor bar: marked files full yellow, and red on the bar.
+/// a yellow cursor bar: marked files full yellow, and in the panels' blue on the bar.
 fn classic_v2() -> Scheme {
     // Windows Terminal's default palette (Campbell), so the rest looks as classic does there.
     const BLACK: Color = rgb(0x0c0c0c);
@@ -450,8 +450,7 @@ fn classic_v2() -> Scheme {
     const WHITE: Color = rgb(0xf2f2f2);
     // Campbell's blue (#0037da) a little darker and less saturated, and the yellow of the bar.
     const BLUE: Color = rgb(0x143daa);
-    const YELLOW: Color = rgb(0xffd75f);
-    const RED_ON_YELLOW: Color = rgb(0xc00000);
+    const YELLOW: Color = rgb(0xffde5f);
     let s = Style::new;
     Scheme {
         panel: s().fg(GRAY).bg(BLUE),
@@ -461,7 +460,8 @@ fn classic_v2() -> Scheme {
         heading: s().fg(LIGHT_YELLOW).bold(),
         cursor: s().fg(BLACK).bg(YELLOW),
         marked: s().fg(YELLOW).bold(),
-        marked_cursor: s().fg(RED_ON_YELLOW).bg(YELLOW).bold(),
+        // The other way round from a marked file elsewhere.
+        marked_cursor: s().fg(BLUE).bg(YELLOW).bold(),
         dim: s().fg(GRAY).dim(),
         directory: s().fg(WHITE),
         executable: s().fg(LIGHT_GREEN),
