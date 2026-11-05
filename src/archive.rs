@@ -114,9 +114,9 @@ impl Archive {
     /// What to tell the user about names left out, if any.
     pub fn left_out_note(&self) -> Option<String> {
         let first = self.left_out.first()?;
-        let more = self.left_out.len() - 1;
-        let others = if more > 0 { format!(" and {more} more") } else { String::new() };
-        Some(format!("This zip has names that would land outside the folder: \"{first}\"{others}. They are left out."))
+        let count = self.left_out.len();
+        let names = if count == 1 { "name" } else { "names" };
+        Some(format!("Left out {count} {names} that would land outside the folder: {first}"))
     }
 
     /// Whether the zip on disk changed since it was read.

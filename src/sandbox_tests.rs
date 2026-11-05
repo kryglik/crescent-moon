@@ -646,7 +646,7 @@ fn a_crafted_zip_stays_inside_the_folder() {
     let archive = crate::archive::Archive::open(&zip_path).unwrap();
     assert!(archive.items.iter().all(|i| !i.path.split('/').any(|p| p == ".." || p.contains(':') || p.contains('\0'))), "{:?}", archive.items);
     assert_eq!(archive.left_out.len(), entries.len() - 2 + windows_names.len(), "{:?}", archive.left_out);
-    assert!(archive.left_out_note().is_some_and(|note| note.contains("left out")));
+    assert!(archive.left_out_note().is_some_and(|note| note.starts_with("Left out")));
 
     let dest = tmp.path().join("a").join("b").join("c");
     let items = archive.children("").map(|i| i.path.clone()).collect();
