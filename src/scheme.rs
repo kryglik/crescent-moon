@@ -432,6 +432,74 @@ pub fn classic() -> Scheme {
     }
 }
 
+/// Classic as Windows Terminal draws it, in exact colours, but on a darker, calmer blue and with
+/// a yellow cursor bar: marked files full yellow, and red on the bar.
+fn classic_v2() -> Scheme {
+    // Windows Terminal's default palette (Campbell), so the rest looks as classic does there.
+    const BLACK: Color = rgb(0x0c0c0c);
+    const RED: Color = rgb(0xc50f1f);
+    const GREEN: Color = rgb(0x13a10e);
+    const GOLD: Color = rgb(0xc19c00);
+    const CYAN: Color = rgb(0x3a96dd);
+    const GRAY: Color = rgb(0xcccccc);
+    const DARK_GRAY: Color = rgb(0x767676);
+    const LIGHT_RED: Color = rgb(0xe74856);
+    const LIGHT_GREEN: Color = rgb(0x16c60c);
+    const LIGHT_YELLOW: Color = rgb(0xf9f1a5);
+    const LIGHT_CYAN: Color = rgb(0x61d6d6);
+    const WHITE: Color = rgb(0xf2f2f2);
+    // Campbell's blue (#0037da) a little darker and less saturated, and the yellow of the bar.
+    const BLUE: Color = rgb(0x143daa);
+    const YELLOW: Color = rgb(0xffd75f);
+    const RED_ON_YELLOW: Color = rgb(0xc00000);
+    let s = Style::new;
+    Scheme {
+        panel: s().fg(GRAY).bg(BLUE),
+        frame: s(),
+        title: s(),
+        title_active: s().fg(BLACK).bg(YELLOW),
+        heading: s().fg(LIGHT_YELLOW).bold(),
+        cursor: s().fg(BLACK).bg(YELLOW),
+        marked: s().fg(YELLOW).bold(),
+        marked_cursor: s().fg(RED_ON_YELLOW).bg(YELLOW).bold(),
+        dim: s().fg(GRAY).dim(),
+        directory: s().fg(WHITE),
+        executable: s().fg(LIGHT_GREEN),
+        hidden: s(),
+        archive: s().fg(LIGHT_RED),
+        image: s().fg(LIGHT_CYAN),
+        media: s().fg(GREEN),
+        source: s(),
+        document: s(),
+        temp: s().fg(DARK_GRAY),
+        git_branch: s().fg(WHITE).bold(),
+        git_worktree: s().fg(LIGHT_CYAN).bold(),
+        git_state: s().fg(LIGHT_YELLOW).bold(),
+        git_changed: s().fg(GOLD),
+        git_new: s().fg(LIGHT_GREEN),
+        git_conflict: s().fg(LIGHT_RED).bold(),
+        git_ignored: s().fg(DARK_GRAY),
+        found_file: s().fg(LIGHT_CYAN).bold(),
+        // Not yellow: Find's matches have to show on the cursor bar too.
+        found_text: s().fg(BLACK).bg(LIGHT_CYAN),
+        command_line: s(),
+        notice: s().fg(GOLD),
+        key_number: s().fg(WHITE),
+        key_label: s().fg(BLACK).bg(CYAN),
+        tab_bar: s().bg(BLACK),
+        tab: s().fg(GRAY).bg(DARK_GRAY),
+        tab_shown: s().fg(WHITE).bg(BLUE),
+        dialog: s().fg(BLACK).bg(GRAY),
+        dialog_title: s().fg(BLUE),
+        dialog_focus: s().fg(BLACK).bg(YELLOW),
+        dialog_dim: s().fg(DARK_GRAY),
+        input: s().fg(BLACK).bg(CYAN),
+        error: s().fg(WHITE).bg(RED),
+        error_title: s().bold(),
+        gauge: s().fg(CYAN).bg(BLACK),
+    }
+}
+
 /// Classic on black, with dimmer lines and hidden files.
 fn dark() -> Scheme {
     let s = Style::new;
@@ -865,6 +933,7 @@ fn solarized_light() -> Scheme {
 /// The built-in schemes, in the picker's order: name, what it is, the scheme.
 const BUILT_IN: &[(&str, &str, fn() -> Scheme)] = &[
     ("classic", "mc's blue panels", classic),
+    ("classic-v2", "classic on a darker blue, yellow cursor bar", classic_v2),
     ("dark", "classic on black", dark),
     ("terminal", "the terminal's own background and palette", terminal),
     ("light", "black on white, red marks", light),

@@ -3341,7 +3341,7 @@ mod tests {
         app.on_key(alt(KeyCode::Char('c')));
         assert!(matches!(&app.dialog, Some(Dialog::Schemes { cursor: 0, back: None, .. })));
         app.on_key(key(KeyCode::Down));
-        assert_eq!(app.scheme, scheme::built_in("dark").unwrap(), "shown at once");
+        assert_eq!(app.scheme, scheme::built_in("classic-v2").unwrap(), "shown at once");
         assert_eq!(app.config.settings.scheme, "classic", "but not kept yet");
         app.on_key(key(KeyCode::Esc));
         assert!(app.dialog.is_none());
@@ -3420,12 +3420,12 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Enter));
         let Some(Dialog::Options { cursor, settings, .. }) = &app.dialog else { panic!("not back in the options") };
-        assert_eq!((*cursor, settings.scheme.as_str()), (row, "dark"));
+        assert_eq!((*cursor, settings.scheme.as_str()), (row, "classic-v2"));
         // Toggling something else there keeps the scheme.
         app.on_key(key(KeyCode::PageUp));
         app.on_key(key(KeyCode::Char(' ')));
-        assert_eq!(app.config.settings.scheme, "dark");
-        assert_eq!(app.scheme, scheme::built_in("dark").unwrap());
+        assert_eq!(app.config.settings.scheme, "classic-v2");
+        assert_eq!(app.scheme, scheme::built_in("classic-v2").unwrap());
         // Esc in the list goes back to the options too, with nothing changed.
         for _ in 0..row {
             app.on_key(key(KeyCode::Down));
@@ -3434,7 +3434,7 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(&app.dialog, Some(Dialog::Options { .. })));
-        assert_eq!(app.scheme, scheme::built_in("dark").unwrap());
+        assert_eq!(app.scheme, scheme::built_in("classic-v2").unwrap());
     }
 
     /// A scheme that isn't there (a file deleted): classic, and a word about it. NO_COLOR:

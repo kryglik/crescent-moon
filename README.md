@@ -19,8 +19,8 @@ What it does differently from the Windows port of mc:
   worktree and what changed, a mark beside every changed, new or conflicting file (ignored
   ones dimmed), and Alt+W jumps between the repository's worktrees, into the same subfolder.
 - **Colour schemes**: Alt+C shows each one on the whole screen as you move through the list:
-  mc's classic blue, dark, the terminal's own colours, light, Nord, Gruvbox, Dracula, Tokyo
-  Night, Catppuccin, One Dark, Solarized, mono. F4 there turns one into a file of your own to
+  mc's classic blue (and classic-v2: a darker blue, a yellow cursor bar), dark, the terminal's
+  own colours, light, Nord, Gruvbox, Dracula, Tokyo Night, Catppuccin, One Dark, Solarized, mono. F4 there turns one into a file of your own to
   change. Archives, pictures, sound and video, leftovers and hidden files have colours of their own.
 - Copies and moves never put a file at risk: an overwrite only replaces the old file once the
   new one is complete, a move to another drive deletes each file only after its copy, and the
@@ -323,6 +323,7 @@ letter jumps to the next name starting with it. A click on a row keeps that one.
 | Scheme | Look |
 | --- | --- |
 | classic | mc's blue panels, rmc's look from the start |
+| classic-v2 | classic in exact colours on a darker, calmer blue, with a yellow cursor bar: marked files full yellow, red on the bar |
 | dark | classic on black, with dimmer lines and hidden files |
 | terminal | the terminal's own background and palette, with `ls`'s colours for folders and files |
 | light | black on white, red marks (as Total Commander marks), Windows' blue cursor |
