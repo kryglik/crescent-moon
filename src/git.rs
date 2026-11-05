@@ -575,11 +575,12 @@ impl Tracked {
         }
     }
 
-    /// How long until a look anyway, for changes no watch sees (in a subfolder, where only the
-    /// git folder can be watched).
+    /// How long until a look anyway, for changes no watch sees: on Linux, where only the git
+    /// folder is watched, the way edits in subfolders show (within about 10 s in a small
+    /// repository, twice the base once nothing changes); on Windows a safety net.
     fn every(&self) -> Duration {
         let base = if self.tree_watched { Duration::from_secs(60) } else { (self.took * 20).max(Duration::from_secs(5)) };
-        (base * 2u32.pow(self.calm.min(4))).min(Duration::from_secs(300))
+        (base * 2u32.pow(self.calm.min(1))).min(Duration::from_secs(300))
     }
 }
 
