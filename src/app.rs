@@ -216,6 +216,17 @@ pub struct App {
     /// is still only that when the editor closes, it goes again: a look mustn't leave a copy
     /// that pins the scheme, as the built-in one keeps getting rmc's updates.
     scheme_file_written: Option<(PathBuf, String)>,
+    /// The folder of a file taken out of an archive for the viewer, removed when it closes.
+    viewed_copy: Option<PathBuf>,
+    /// The panel the running job started from: its marks are the ones the job uses up.
+    job_side: usize,
+    /// When an overwrite question opened, and how long it takes no answer (see `on_key`).
+    overwrite_asked: Option<Instant>,
+    answer_delay: std::time::Duration,
+    /// When a key last came too early for such a question.
+    stray_key: Option<Instant>,
+    /// Where the cursor goes when the running job ends.
+    select_after: Option<PathBuf>,
     pub quit: bool,
     pub hotlist: Hotlist,
     /// Screen areas from the last frame, for the mouse.
@@ -261,7 +272,7 @@ pub struct App {
     /// Text for the terminal to put on its clipboard (OSC 52); the main loop sends it.
     pub terminal_clipboard: Option<String>,
     /// The running job pastes files that were cut: when it is done, the clipboard is emptied.
-    pasting_cut: bool,
+    pasting_cut: Option<Vec<PathBuf>>,
     /// What to do with a file the running job takes out of an archive, once it is out.
     after_job: Option<(AfterJob, PathBuf)>,
     /// Each panel's folder, watched for changes other programs make (see `watch`).
@@ -307,6 +318,13 @@ impl App {
             config,
             external: None,
             scheme_file_written: None,
+            viewed_copy: None,
+            job_side: 0,
+            overwrite_asked: None,
+            // Longer than a key takes to start repeating when it is held (0.5 s by default).
+            answer_delay: std::time::Duration::from_millis(if cfg!(test) { 0 } else { 550 }),
+            stray_key: None,
+            select_after: None,
             quit: false,
             hit: HitAreas::default(),
             last_click: None,
@@ -328,7 +346,7 @@ impl App {
             preview_rows: 20,
             clipboard: Clipboard::default(),
             terminal_clipboard: None,
-            pasting_cut: false,
+            pasting_cut: None,
             after_job: None,
             watches: [None, None],
             tabs: [Vec::new(), Vec::new()],
@@ -455,6 +473,10 @@ impl App {
     /// Reloads a panel whose folder another program changed. Not while a job runs or the
     /// shell is shown: both reload the panels when they end.
     fn follow_changes(&mut self) -> bool {
+        // No watches while a job runs (see `start_job`).
+        if self.job.is_some() {
+            return false;
+        }
         let now = Instant::now();
         let mut changed = false;
         for side in 0..2 {
@@ -463,7 +485,7 @@ impl App {
                 self.watches[side] = Some(Watch::new(cwd));
             }
             let due = self.watches[side].as_mut().is_some_and(|w| w.due(now));
-            if due && self.job.is_none() && !self.shell_shown {
+            if due && !self.shell_shown {
                 self.panels[side].reload();
                 // Files changed in a repository: its status may have too.
                 if let Some(repo) = &self.panels[side].repo {
@@ -478,11 +500,13 @@ impl App {
     /// Starts `git status` where the shown panels need it, and takes what arrived. A status
     /// can follow a checkout, so the branch is read again with it.
     fn tick_git(&mut self) -> bool {
+        let job_running = self.job.is_some();
         let shown: Vec<&git::Repo> = (0..2)
-            .filter(|&side| !(self.quick_view && side != self.active))
+            // No watches while a job runs (see `start_job`).
+            .filter(|&side| !job_running && !(self.quick_view && side != self.active))
             .filter_map(|side| self.panels[side].repo.as_ref())
             .collect();
-        let quiet = self.shell_shown || self.job.is_some();
+        let quiet = self.shell_shown || job_running;
         let arrived = self.git.tick(&shown, Instant::now(), quiet);
         for panel in &mut self.panels {
             if let Some(repo) = panel.repo.as_mut().filter(|repo| arrived.contains(&repo.root)) {
@@ -547,6 +571,17 @@ impl App {
         {
             key.code = KeyCode::Char(c.to_ascii_lowercase());
         }
+        // An overwrite question that has only just opened: this key was on its way before it
+        // could be read (Enter pressed twice, or held down), and would answer Yes. A key that
+        // repeats (held down) puts the wait back; a deliberate second press gets through.
+        if self.overwrite_asked.is_some_and(|at| at.elapsed() < self.answer_delay) {
+            if self.stray_key.is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(120)) {
+                self.overwrite_asked = Some(Instant::now());
+            }
+            self.stray_key = Some(Instant::now());
+            return;
+        }
+        self.overwrite_asked = None;
         self.notice = None;
         self.git.touch();
         if self.shell_shown {
@@ -555,9 +590,12 @@ impl App {
             self.on_dialog_key(key);
         } else if self.find_shown {
             self.on_find_key(key);
-        } else if let Some(job) = &self.job {
-            if key.code == KeyCode::Esc {
-                job.cancel.store(true, Ordering::Relaxed);
+        } else if let Some(job) = &mut self.job {
+            match key.code {
+                KeyCode::Esc => job.stop(),
+                // Nothing else gets out of a job caught in a system call that doesn't return.
+                KeyCode::F(10) if job.stuck() => self.quit = true,
+                _ => {}
             }
         } else if self.quick_view && self.preview_focus && self.on_preview_key(&key) {
         } else if !self.on_quicksearch_key(&key) {
@@ -1437,6 +1475,7 @@ impl App {
             Ok(zip) => zip,
             Err(e) => return self.error(format!("Cannot open \"{}\":\n{e}", entry.path.display())),
         };
+        self.notice = zip.left_out_note();
         let items: Vec<String> = zip.children("").map(|item| item.path.clone()).collect();
         let other = self.panels[1 - self.active].cwd.clone();
         let stem = entry.path.file_stem().map_or_else(|| "unpacked".into(), |s| s.to_string_lossy().into_owned());
@@ -1454,7 +1493,14 @@ impl App {
                 Err(e) => self.error(e),
             },
             InputAction::Move(sources) => match ops::plan_move(&sources, &text, &cwd) {
-                Ok(pairs) => self.start_job(Job::Move(pairs)),
+                Ok(pairs) => {
+                    if let [(from, to)] = pairs.as_slice()
+                        && from.parent().zip(to.parent()).is_some_and(|(a, b)| util::same_path(a, b))
+                    {
+                        self.select_after = Some(to.clone());
+                    }
+                    self.start_job(Job::Move(pairs));
+                }
                 Err(e) => self.error(e),
             },
             InputAction::Rename(from) => self.rename(&from, &text),
@@ -1478,13 +1524,14 @@ impl App {
                     return;
                 }
                 let mut dest = util::resolve(&cwd, &text);
-                if dest.is_dir() {
+                // A folder, also one typed with a slash at the end that isn't there yet.
+                if dest.is_dir() || text.trim_end().ends_with(['/', '\\']) {
                     let name = sources[0].file_name().map_or_else(|| "archive".into(), |n| n.to_string_lossy().into_owned());
                     dest = dest.join(format!("{name}.zip"));
                 } else if dest.extension().is_none() {
                     dest.set_extension("zip");
                 }
-                if let Some(inside) = sources.iter().find(|s| s.is_dir() && util::is_inside(&dest, s)) {
+                if let Some(inside) = sources.iter().find(|s| s.is_dir() && (util::is_inside(&dest, s) || util::really_inside(&dest, s))) {
                     return self.error(format!("\"{}\" can't hold a zip of itself.", inside.display()));
                 }
                 if dest.exists() {
@@ -1522,6 +1569,11 @@ impl App {
     }
 
     fn start_job(&mut self, job: Job) {
+        self.job_side = self.active;
+        // An open watch keeps Windows from moving a folder above it (the other panel inside
+        // what is moved). A job reloads the panels at its end, so none is needed until then.
+        self.watches = [None, None];
+        self.git.close_watches();
         self.job = Some(ops::start(job));
     }
 
@@ -1600,12 +1652,21 @@ impl App {
             changed = true;
             match msg {
                 Msg::Progress(progress) => job.update(progress),
-                Msg::Ask(question, reply) => self.dialog = Some(question_dialog(question, reply)),
+                Msg::Ask(question, reply) => {
+                    if matches!(question, Question::Overwrite { .. }) {
+                        self.overwrite_asked = Some(Instant::now());
+                    }
+                    self.dialog = Some(question_dialog(question, reply));
+                }
                 Msg::Done { errors, cancelled, as_admin } => {
                     finished = Some((errors, cancelled, as_admin));
                     break;
                 }
             }
+        }
+        if job.stuck() && !job.stuck_shown {
+            job.stuck_shown = true;
+            changed = true;
         }
         let Some((errors, cancelled, as_admin)) = finished else { return changed };
         // "As admin": the rest goes to the elevated helper, shown as the same kind of job.
@@ -1614,25 +1675,43 @@ impl App {
             return true;
         }
         self.job = None;
-        // Cut files pasted: the clipboard no longer says where they are (Explorer empties it too).
-        if std::mem::take(&mut self.pasting_cut) && errors.is_empty() && !cancelled {
+        // Cut files pasted: the clipboard no longer says where they are (Explorer empties it
+        // too). Not if some stayed (answered No), or something else was copied meanwhile.
+        if let Some(pasted) = self.pasting_cut.take()
+            && errors.is_empty()
+            && !cancelled
+            && pasted.iter().all(|path| crate::lfs::symlink_metadata(path).is_err())
+            && self.clipboard.files().is_some_and(|files| files.paths == pasted)
+        {
             self.clipboard.moved();
         }
-        // A file taken out of an archive: now it can be opened.
-        if let Some((then, path)) = self.after_job.take()
+        // A file taken out of an archive: now it can be opened. That changes nothing in the
+        // panels, so what is marked and measured there stays.
+        let taken_out = self.after_job.take();
+        let touched_files = taken_out.is_none();
+        if let Some((then, path)) = taken_out
             && errors.is_empty()
             && !cancelled
         {
             self.after_taking_out(then, path);
         }
-        for panel in &mut self.panels {
-            // Done: the marks have served. Stopped or partly failed: they stay, to try again.
-            if errors.is_empty() && !cancelled {
+        let job_side = self.job_side;
+        for (side, panel) in self.panels.iter_mut().enumerate() {
+            // Done: the marks of the panel it started from have served (the other side's are
+            // for another job, as after Shift+F2). Stopped or partly failed: they stay, to try
+            // again.
+            if touched_files && side == job_side && errors.is_empty() && !cancelled {
                 panel.clear_marks();
             }
             // Sizes may be out of date after copying, moving or deleting.
-            panel.dir_sizes.clear();
+            if touched_files {
+                panel.dir_sizes.clear();
+            }
             panel.reload();
+        }
+        // A rename by F6: the cursor goes along, as with Shift+F6.
+        if let Some(target) = self.select_after.take() {
+            self.select_in_active(&target);
         }
         self.git.refresh();
         // Esc just stops the job: no "cancelled" box to dismiss as well. Failures from before
@@ -1662,6 +1741,10 @@ impl App {
         }
         // F4 in the scheme list: the file edited counts at once (one left as it was goes).
         self.reload_schemes();
+        // A file taken out of an archive to look at: looked at.
+        if let Some(copy) = self.viewed_copy.take() {
+            let _ = fs::remove_dir_all(copy);
+        }
         if let Err(e) = result {
             // The error takes the scheme list's place, so the scheme in use is back too.
             if matches!(self.dialog, Some(Dialog::Schemes { .. })) {
@@ -1715,6 +1798,10 @@ impl App {
                 self.terminal_clipboard = text;
                 let what = describe(&paths);
                 self.notice = Some(match effect {
+                    // Explorer would read `foo.` as `foo`, and act on that file instead.
+                    _ if paths.iter().any(|path| crate::lfs::needs_literal(path)) => {
+                        format!("{what} on the clipboard: paste with Alt+V only, other programs would take another file for it")
+                    }
                     Effect::Copy => format!("{what} copied to the clipboard (Alt+V pastes here)"),
                     Effect::Move => format!("{what} cut to the clipboard (Alt+V moves it here)"),
                 });
@@ -1759,13 +1846,15 @@ impl App {
         let dir = self.active_panel().cwd.clone();
         let mut pairs = Vec::new();
         for source in &files.paths {
-            let here = source.parent().is_some_and(|parent| util::same_path(parent, &dir));
+            // This folder, by any of its names (a junction, a mapped drive and its share).
+            let here = source.parent().is_some_and(|parent| util::same_path(parent, &dir) || util::same_file(parent, &dir));
             if here && files.effect == Effect::Move {
                 continue;
             }
             let Some(target) = clipboard::paste_target(source, &dir) else { continue };
-            if source.is_dir() && util::is_inside(&target, source) {
-                return self.error(format!("\"{}\" cannot be put inside itself.", source.display()));
+            // The checks F5 and F6 make: a link to a folder doesn't get a folder into itself.
+            if let Err(e) = ops::check_pair(source, &target) {
+                return self.error(e);
             }
             pairs.push((source.clone(), target));
         }
@@ -1773,7 +1862,7 @@ impl App {
             return;
         }
         if files.effect == Effect::Move {
-            self.pasting_cut = true;
+            self.pasting_cut = Some(files.paths);
             self.start_job(Job::Move(pairs));
         } else {
             self.start_job(Job::Copy(pairs));
@@ -1876,7 +1965,8 @@ impl App {
     /// Shift+F2 (Total Commander's key): marks in each panel what the other one lacks or has
     /// an older copy of, so F5 then brings the other side up to date.
     fn compare_dirs(&mut self) {
-        if util::same_path(&self.panels[0].cwd, &self.panels[1].cwd) {
+        // By what they show: a zip and the folder it sits in are two places to compare.
+        if util::same_path(&self.panels[0].location(), &self.panels[1].location()) {
             self.notice = Some("Both panels show the same folder".into());
             return;
         }
@@ -2062,12 +2152,10 @@ impl App {
             self.change_dir(self.active, entry.path);
         } else if crate::lfs::needs_literal(&entry.path) {
             // `foo.` would open as `foo` in any program it was given to.
-            self.error(crate::lfs::unopenable(&entry.path));
+            self.error(crate::lfs::UNOPENABLE);
         } else if archive::is_archive(&entry.path) {
             // A zip opens as a folder, as in Total Commander and mc.
-            if let Err(e) = self.panels[self.active].open_archive(&entry.path, entry.path.clone()) {
-                self.error(e);
-            }
+            self.open_zip_here(&entry.path, entry.path.clone());
         } else if let Some(folder) = lnk::is_shortcut(&entry.path).then(|| lnk::target(&entry.path)).flatten().filter(|t| t.is_dir()) {
             // A Windows shortcut to a folder: the panel goes there (not an Explorer window).
             self.change_dir(self.active, folder);
@@ -2083,11 +2171,23 @@ impl App {
         }
     }
 
+    /// `path`, a zip, opens in the active panel as `shown`; names in it that aren't safe to
+    /// unpack are left out, and said so.
+    fn open_zip_here(&mut self, path: &Path, shown: PathBuf) {
+        match self.panels[self.active].open_archive(path, shown) {
+            Ok(()) => self.notice = self.active_panel().archive.as_ref().and_then(|view| view.archive.left_out_note()),
+            Err(e) => self.error(e),
+        }
+    }
+
     /// Shift+Enter: Windows' "How do you want to open this file?" for the file under the cursor.
     fn open_with(&mut self) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent && !e.is_dir).cloned() else { return };
         if crate::lfs::needs_literal(&entry.path) {
-            return self.error(crate::lfs::unopenable(&entry.path));
+            return self.error(crate::lfs::UNOPENABLE);
         }
         if let Err(e) = platform::open_with(&entry.path) {
             self.error(e);
@@ -2128,17 +2228,26 @@ impl App {
     fn after_taking_out(&mut self, then: AfterJob, path: PathBuf) {
         let size = fs::metadata(&path).map_or(0, |m| m.len());
         match then {
-            AfterJob::Open { shown } if archive::is_archive(&path) => {
-                if let Err(e) = self.panels[self.active].open_archive(&path, shown) {
-                    self.error(e);
+            AfterJob::Open { shown } if archive::is_archive(&path) => self.open_zip_here(&path, shown),
+            AfterJob::Open { .. } => {
+                // Only a copy, gone when rmc ends: read-only, so that its app says so when
+                // something is saved, instead of the work being lost with the copy.
+                if let Ok(meta) = fs::metadata(&path) {
+                    let mut permissions = meta.permissions();
+                    permissions.set_readonly(true);
+                    let _ = fs::set_permissions(&path, permissions);
+                }
+                self.notice = Some("Opened a read-only copy: changes have to be saved somewhere else".into());
+                match platform::open_default(&path) {
+                    Ok(()) => {}
+                    Err(OpenError::NoOpener) => self.view(path, size, None),
+                    Err(OpenError::Failed(e)) => self.error(e),
                 }
             }
-            AfterJob::Open { .. } => match platform::open_default(&path) {
-                Ok(()) => {}
-                Err(OpenError::NoOpener) => self.view(path, size, None),
-                Err(OpenError::Failed(e)) => self.error(e),
-            },
-            AfterJob::View => self.view(path, size, None),
+            AfterJob::View => {
+                self.viewed_copy = path.parent().map(Path::to_path_buf);
+                self.view(path, size, None);
+            }
         }
     }
 
@@ -2258,10 +2367,11 @@ impl App {
         }
         let dir = from.parent().unwrap_or(from);
         let target = util::resolve(dir, input);
-        // Another letter case is fine where both names are the one file (Windows, Linux's
-        // /mnt/c); where they are two files (as in a folder WSL made), the other one stays.
-        // A rename replaces what it lands on, so anything there (a broken link too) counts.
-        if fs::symlink_metadata(&target).is_ok() && !util::same_file(from, &target) {
+        // Another letter case is fine where both names are the one entry (Windows, Linux's
+        // /mnt/c); where they are two files (as in a folder WSL made), or one is a link to the
+        // other, the other one stays. A rename replaces what it lands on, so anything there
+        // (a broken link too) counts.
+        if fs::symlink_metadata(&target).is_ok() && !util::same_entry(from, &target) {
             self.error(format!("\"{}\" already exists.", target.display()));
             return;
         }
@@ -3545,6 +3655,161 @@ mod tests {
             assert!(app.dialog.is_none(), "renamed: {:?}", app.dialog.is_some());
             assert!(fs::read_dir(tmp.path()).unwrap().flatten().any(|e| e.file_name() == "PLAIN.txt"));
         }
+    }
+
+    /// Enter pressed twice, or held: the overwrite question that opens under it isn't answered
+    /// by a key that was on its way. Each such key puts the wait back; then Enter counts.
+    #[test]
+    fn an_overwrite_question_isnt_answered_by_a_stray_key() {
+        let tmp = TempDir::new("app-stray-enter");
+        let dir_a = tmp.dir("a");
+        let dir_b = tmp.dir("b");
+        tmp.file("a/x.txt", "new");
+        let old = tmp.file("b/x.txt", "old");
+        let mut app = test_app(&dir_a, &dir_b);
+        app.answer_delay = std::time::Duration::from_secs(60);
+        app.active_panel_mut().select_name("x.txt");
+        app.start_job(Job::Copy(vec![(dir_a.join("x.txt"), old.clone())]));
+        while !matches!(app.dialog, Some(Dialog::Question { .. })) {
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Enter));
+        }
+        assert!(matches!(app.dialog, Some(Dialog::Question { .. })), "still asking");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "old");
+        app.overwrite_asked = None;
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        assert_eq!(fs::read_to_string(&old).unwrap(), "new");
+    }
+
+    /// A job caught in a system call that doesn't return: Esc can't reach it, so after a while
+    /// F10 leaves rmc. Before that F10 does nothing, as during any job.
+    #[test]
+    fn a_job_that_doesnt_stop_can_be_left() {
+        let tmp = TempDir::new("app-stuck");
+        let mut app = test_app(tmp.path(), tmp.path());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.job = Some(Running::new("Copy", ops::Progress::default(), rx, cancel));
+        app.on_key(key(KeyCode::F(10)));
+        assert!(!app.quit);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.job.as_ref().is_some_and(|job| job.stopping.is_some() && !job.stuck()));
+        app.on_key(key(KeyCode::F(10)));
+        assert!(!app.quit, "it has only just been asked to stop");
+        let long_ago = Instant::now() - std::time::Duration::from_secs(60);
+        app.job.as_mut().unwrap().stopping = Some(long_ago);
+        assert!(app.tick(), "the screen says so");
+        app.on_key(key(KeyCode::F(10)));
+        assert!(app.quit);
+    }
+
+    /// A job uses up the marks of the panel it started from. After Shift+F2 the other side's
+    /// marks wait for their own F5; looking at a file in a zip touches none of them.
+    #[test]
+    fn marks_stay_until_their_own_job() {
+        let tmp = TempDir::new("app-marks");
+        let (left, right) = (tmp.dir("left"), tmp.dir("right"));
+        tmp.file("left/only-left.txt", "l");
+        tmp.file("right/only-right.txt", "r");
+        let mut app = test_app(&left, &right);
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT));
+        assert!(!app.panels[0].marked.is_empty() && !app.panels[1].marked.is_empty());
+        app.on_key(key(KeyCode::F(5)));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        assert!(right.join("only-left.txt").exists());
+        assert!(app.panels[0].marked.is_empty(), "these went");
+        assert!(!app.panels[1].marked.is_empty(), "those wait for F5 on their side");
+    }
+
+    /// F3 on a file in a zip: its copy is gone when the viewer closes, and the marks stay.
+    #[test]
+    fn a_file_viewed_from_a_zip_leaves_nothing_behind() {
+        let tmp = TempDir::new("app-zip-view");
+        let zip = tmp.path().join("box.zip");
+        crate::archive::tests::sample_zip(&zip);
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("box.zip");
+        app.open_current();
+        app.active_panel_mut().select_name("top.txt");
+        app.on_key(key(KeyCode::Insert));
+        assert!(!app.active_panel().marked.is_empty());
+        app.active_panel_mut().select_name("top.txt");
+        app.on_key(key(KeyCode::F(3)));
+        wait_for_job(&mut app);
+        assert!(!app.active_panel().marked.is_empty(), "the marks stay");
+        let Some(External::View(copy, _)) = app.external.take() else { panic!("the viewer opens") };
+        assert!(copy.exists());
+        app.after_external(Ok(()), None);
+        assert!(!copy.exists() && !copy.parent().unwrap().exists());
+    }
+
+    /// Alt+V goes through the checks of F5, links seen through: pasting a folder into itself
+    /// by way of a link to it is refused.
+    #[test]
+    fn a_paste_sees_through_links() {
+        let tmp = TempDir::new("app-paste-alias");
+        let project = tmp.dir("project");
+        let backup = tmp.dir("project/backup");
+        let alias = tmp.path().join("alias");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&alias).arg(&project).output().unwrap();
+            assert!(made.status.success());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let mut app = test_app(&alias.join("backup"), &backup);
+        app.clipboard.put(std::slice::from_ref(&project), Effect::Copy).unwrap();
+        app.paste();
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "refused");
+        assert!(app.job.is_none());
+        #[cfg(windows)]
+        fs::remove_dir(&alias).unwrap();
+    }
+
+    /// Cut, pasted, answered No: the files are still where they were, so they stay on the
+    /// clipboard. Moved: it is emptied.
+    #[test]
+    fn the_clipboard_is_emptied_only_when_the_cut_files_moved() {
+        let tmp = TempDir::new("app-cut-no");
+        let (from, to) = (tmp.dir("from"), tmp.dir("to"));
+        let file = tmp.file("from/x.txt", "new");
+        tmp.file("to/x.txt", "old");
+        let mut app = test_app(&to, &from);
+        app.clipboard.put(std::slice::from_ref(&file), Effect::Move).unwrap();
+        app.paste();
+        while !matches!(app.dialog, Some(Dialog::Question { .. })) {
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        app.on_key(key(KeyCode::Char('n')));
+        wait_for_job(&mut app);
+        assert!(file.exists());
+        assert!(app.clipboard.files().is_some(), "still cut");
+
+        fs::remove_file(to.join("x.txt")).unwrap();
+        app.paste();
+        wait_for_job(&mut app);
+        assert!(!file.exists());
+        assert!(app.clipboard.files().is_none(), "moved");
+    }
+
+    /// F6 to a new name in the same folder: the cursor goes along with the file.
+    #[test]
+    fn a_rename_by_f6_keeps_the_cursor_on_the_file() {
+        let tmp = TempDir::new("app-f6-cursor");
+        tmp.file("a.txt", "a");
+        tmp.file("m.txt", "m");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("a.txt");
+        app.on_input(InputAction::Move(vec![tmp.path().join("a.txt")]), "z.txt".into());
+        wait_for_job(&mut app);
+        assert_eq!(app.active_panel().current().map(|e| e.name.as_str()), Some("z.txt"));
     }
 
     /// Hidden files shown or not: the tabs in the background follow too.

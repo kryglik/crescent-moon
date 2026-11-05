@@ -589,6 +589,16 @@ impl Tracker {
         Tracker { runner: None, repos: HashMap::new(), off: !enabled }
     }
 
+    /// A job starts: everything counts as out of view, so the watches close at once (an
+    /// open one keeps Windows from moving a folder above it, as the repository's `.git` is
+    /// below the repository). They open again when the panels show it again.
+    pub fn close_watches(&mut self) {
+        for tracked in self.repos.values_mut() {
+            tracked.shown = false;
+            tracked.watches.clear();
+        }
+    }
+
     /// The option was changed.
     pub fn set_enabled(&mut self, on: bool) {
         self.off = !on;

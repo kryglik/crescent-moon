@@ -186,8 +186,17 @@ fn main() -> ExitCode {
     platform::init();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dirs: Vec<PathBuf> = args.dirs.iter().map(|d| util::resolve(&cwd, &d.to_string_lossy())).collect();
+    let cwd_file = args.cwd_file.as_ref().map(|file| cwd.join(file));
     let left = dirs.first().cloned().unwrap_or_else(|| cwd.clone());
     let right = dirs.get(1).cloned().unwrap_or_else(|| left.clone());
+    // A Windows process holds its working folder: as long as rmc runs, the folder it was
+    // started in couldn't be moved or deleted, even from rmc. Nothing here depends on it:
+    // every path is absolute, and programs are started in the panel's folder.
+    #[cfg(windows)]
+    if let Some(home) = util::home_dir() {
+        let _ = std::env::set_current_dir(home);
+    }
+    util::sweep_temp();
     let mut app = App::new(left, right, Config::load());
     app.mouse &= args.mouse;
     app.mouse_allowed = args.mouse;
@@ -219,7 +228,7 @@ fn main() -> ExitCode {
     // Files taken out of archives to be viewed (one still open in an app stays).
     util::remove_session_dir();
 
-    if let Some(file) = args.cwd_file {
+    if let Some(file) = cwd_file {
         let _ = std::fs::write(file, app.active_panel().cwd.to_string_lossy().as_bytes());
     }
     match result {
@@ -418,12 +427,12 @@ fn run_external(
     if let External::Edit(path, _) | External::View(path, _) | External::Page(path, _) = &external
         && lfs::needs_literal(path)
     {
-        return Ok((Err(lfs::unopenable(path)), None));
+        return Ok((Err(lfs::UNOPENABLE.to_string()), None));
     }
     let cwd = app.active_panel().cwd.clone();
     // In rmc's private folder: in a shared /tmp another user could put a folder of their own
     // choosing there, or a link.
-    let cwd_file = util::session_dir()?.join("cwd.txt");
+    let cwd_file = util::session_dir().unwrap_or_else(|_| std::env::temp_dir()).join("cwd.txt");
     let _ = std::fs::remove_file(&cwd_file);
     let config = &app.config;
     let (mut command, name) = match &external {

@@ -162,6 +162,11 @@ pub fn run_helper(dir: &Path) -> i32 {
         let _ = fs::write(dir.join("result.txt"), result_text(&["The job file could not be read.".into()], true));
         return 2;
     };
+    // Stopped while Windows was still asking for permission: nothing is touched.
+    if dir.join("stop").exists() {
+        let _ = fs::write(dir.join("result.txt"), result_text(&[], true));
+        return 0;
+    }
     let running = ops::start_privileged(Job::Delete { paths, to_trash: false, admin_when_refused: false });
     let (mut errors, stopped) = loop {
         match running.rx.recv_timeout(Duration::from_millis(100)) {

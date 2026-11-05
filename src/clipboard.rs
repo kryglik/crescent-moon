@@ -108,11 +108,11 @@ fn base64(bytes: &[u8]) -> String {
 pub fn paste_target(source: &Path, dir: &Path) -> Option<PathBuf> {
     let name = source.file_name()?;
     let target = dir.join(name);
-    if !crate::util::same_path(source, &target) {
+    if !crate::util::same_path(source, &target) && !crate::util::same_file(source, &target) {
         return Some(target);
     }
     let name = Path::new(name);
-    let is_dir = source.is_dir();
+    let is_dir = crate::lfs::is_dir(source);
     let stem = if is_dir { name.as_os_str() } else { name.file_stem().unwrap_or(name.as_os_str()) };
     let stem = stem.to_string_lossy();
     let ext = if is_dir { None } else { name.extension().map(|e| e.to_string_lossy()) };
@@ -123,7 +123,7 @@ pub fn paste_target(source: &Path, dir: &Path) -> Option<PathBuf> {
             None => copy,
         })
     })
-    .find(|candidate| !candidate.exists())
+    .find(|candidate| crate::lfs::symlink_metadata(candidate).is_err())
 }
 
 #[cfg(windows)]

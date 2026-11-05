@@ -23,8 +23,10 @@ What it does differently from the Windows port of mc:
   own colours, light, Nord, Gruvbox, Dracula, Tokyo Night, Catppuccin, One Dark, Solarized, mono. F4 there turns one into a file of your own to
   change. Archives, pictures, sound and video, leftovers and hidden files have colours of their own.
 - Copies and moves never put a file at risk: an overwrite only replaces the old file once the
-  new one is complete, a move to another drive deletes each file only after its copy, and the
-  same file under another name is recognised.
+  new one is complete and on the disk, a move to another drive deletes each file only after
+  that, and the same file under another name is recognised. Two names that land on one (from
+  a disk that respects case to one that doesn't) never replace each other.
+- Deleting never reaches through a link or junction, nor on Linux into a mounted file system.
 - Long paths (over 260 characters) work, as do Czech and other non-ASCII names everywhere. So
   do names Windows itself reads as something else: `foo.` and `foo ` (from WSL, Linux or a Mac)
   are copied, moved and deleted as themselves and never taken for `foo`, and a file called
@@ -161,11 +163,16 @@ say so.
   default, with the usual progress, overwrite questions and Esc.
 - **F3** and **Enter** take a file out into rmc's temp folder and view it or open it in its
   app (a zip in the zip opens as a folder too); quick view (Ctrl+Q) reads files straight from
-  the zip. Ctrl+Space sizes its folders at once.
+  the zip. Ctrl+Space sizes its folders at once. What Enter opens is a read-only copy: save
+  changes somewhere else, as it goes when rmc ends. What F3 shows goes when the viewer closes.
 - **Alt+F5** packs the marked files (folders with what they hold) into a new zip, in the
   other panel's folder by default; **Alt+F9** unpacks the zip under the cursor into the other
   panel's folder, and one with several things at its top into a folder of its own name, as
   7-Zip's "Extract to name\" does. Both are Total Commander's keys.
+- A zip that is there is only replaced by a complete one: if a file can't be read (and is
+  skipped), the new zip goes beside it as `name (incomplete).zip`.
+- Names in a zip that would land outside the folder it is unpacked to (`../x`, `C:x`) are left
+  out, and rmc says so.
 - Names are UTF-8 when the zip says so or when they read as UTF-8; older zips made by Windows
   use its OEM code page (852 on a Czech Windows), which rmc reads too. Names that would climb
   out of the folder they are unpacked into (`../x`) are left out. Packing writes UTF-8 names,
@@ -380,7 +387,9 @@ rmc shows the mono scheme.
 | `src/app.rs` | application state and all key handling |
 | `src/panel.rs` | a panel: listing, sorting, cursor, marks, back/forward, filter, a zip shown as a folder |
 | `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |
-| `src/archive.rs` | zip archives: the index, names, times |
+| `src/lfs.rs` | file calls that give Windows a path literally when it has to be (`foo.`, `nul`), and keeping a copy's flags and mode |
+| `src/sandbox_tests.rs` | the jobs at the edges, on real files: links, odd names, long paths, locked files, crafted zips |
+| `src/archive.rs` | zip archives: the index, names (none that would land outside the folder), times |
 | `src/git.rs` | git: the branch, operation under way and worktrees from the repository's files; `git status` in the background |
 | `src/watch.rs` | watching the panels' folders for changes (Windows change notifications, inotify) |
 | `src/history.rs` | folders visited and commands typed, kept in `history.txt` |

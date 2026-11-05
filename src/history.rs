@@ -86,7 +86,7 @@ impl History {
             text.push_str(command);
             text.push('\n');
         }
-        util::write_atomically(file, &text)?;
+        util::write_atomically(file, &text, false)?;
         self.unsaved.clear();
         Ok(())
     }

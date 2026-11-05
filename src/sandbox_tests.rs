@@ -216,6 +216,44 @@ fn moving_a_name_ending_in_a_dot_moves_that_file() {
     assert!(!dir.exists());
 }
 
+/// The Linux kernel has an `aux.c`: names that are devices on older Windows only are plain
+/// files here, which other programs open as usual, so nothing refuses them.
+#[cfg(windows)]
+#[test]
+fn only_what_windows_really_misreads_counts() {
+    let tmp = TempDir::new("edge-misread");
+    let file = tmp.file("aux.c", "int main;");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "int main;", "this Windows takes it as a file");
+    assert!(!crate::lfs::needs_literal(&file));
+    assert!(crate::lfs::needs_literal(&tmp.path().join("nul")));
+    assert!(crate::lfs::needs_literal(&tmp.path().join("foo.")));
+}
+
+/// A settings file that is a link into a dotfiles repository stays a link when it is saved.
+#[cfg(unix)]
+#[test]
+fn saving_keeps_a_link_to_the_settings() {
+    let tmp = TempDir::new("edge-save-link");
+    let real = tmp.file("dotfiles/settings.ini", "old");
+    let link = tmp.path().join("settings.ini");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    crate::util::write_atomically(&link, "new", true).unwrap();
+    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+    assert_eq!(names(&tmp.path().join("dotfiles")), ["settings.ini"], "nothing left aside");
+}
+
+/// What an rmc that was killed left in the temp folder is recognised by its name; other
+/// folders aren't touched.
+#[test]
+fn only_rmc_private_folders_are_swept() {
+    assert_eq!(crate::util::private_dir_owner("rmc-1234-session-0123456789abcdef"), Some(1234));
+    assert_eq!(crate::util::private_dir_owner("rmc-1234-shell-0123456789abcdef"), Some(1234));
+    for other in ["rmc-edge-dots-140564-5", "rmc-1234-admin-0123456789abcdef", "rmc-1234-session-xyz", "rmc-panic.txt", "other"] {
+        assert_eq!(crate::util::private_dir_owner(other), None, "{other}");
+    }
+}
+
 /// `con.txt`, `nul` and the like are device names to Windows, but files of these names exist
 /// (made by WSL, Linux, or archives): they are copied and deleted as files, without hanging.
 #[cfg(windows)]
@@ -583,6 +621,293 @@ fn packing_into_a_folder_that_isnt_there_yet() {
     let (errors, _, _) = run(Job::Pack { sources: vec![src], dest: dest.clone() }, Answer::Skip);
     assert!(errors.is_empty(), "{errors:?}");
     assert!(fs::metadata(&dest).unwrap().len() > 0);
+}
+
+/// A zip made to reach outside: `..` hidden behind a NUL, a drive-relative `C:x`, a stream
+/// `a:b`. None of it is listed or written; the honest names around them are.
+#[test]
+fn a_crafted_zip_stays_inside_the_folder() {
+    use std::io::Write;
+    let tmp = TempDir::new("edge-zip-slip");
+    let zip_path = tmp.path().join("evil.zip");
+    let entries = ["fine.txt", "..\0/..\0/escaped.txt", "x/..\0/..\0/escaped2.txt", "../plain.txt", "sub/ok.txt"];
+    let mut windows_names = vec!["C:evil.txt", "docs/E:run.bat", "a/G:/photos/x.jpg", "note.txt:hidden"];
+    if cfg!(unix) {
+        windows_names.clear();
+    }
+    let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for name in entries.iter().chain(&windows_names) {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(b"x").unwrap();
+    }
+    zip.finish().unwrap();
+
+    let archive = crate::archive::Archive::open(&zip_path).unwrap();
+    assert!(archive.items.iter().all(|i| !i.path.split('/').any(|p| p == ".." || p.contains(':') || p.contains('\0'))), "{:?}", archive.items);
+    assert_eq!(archive.left_out.len(), entries.len() - 2 + windows_names.len(), "{:?}", archive.left_out);
+    assert!(archive.left_out_note().is_some_and(|note| note.contains("left out")));
+
+    let dest = tmp.path().join("a").join("b").join("c");
+    let items = archive.children("").map(|i| i.path.clone()).collect();
+    let (errors, _, _) = run(Job::Extract { archive: zip_path.clone(), items, dest: dest.clone() }, Answer::Skip);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(snapshot(&dest).get("fine.txt").map(String::as_str), Some("file x"));
+    assert_eq!(snapshot(&dest).get("sub/ok.txt").map(String::as_str), Some("file x"));
+    assert_eq!(names(tmp.path()), ["a", "evil.zip"], "nothing beside the folder");
+    assert_eq!(names(&tmp.path().join("a")), ["b"]);
+    assert_eq!(names(&tmp.path().join("a").join("b")), ["c"]);
+    #[cfg(windows)]
+    assert!(!Path::new(r"C:evil.txt").exists());
+}
+
+/// Packing with a file that can't be read: it alone is missing. The file packed just before
+/// it stays in the zip (the zip crate's abort removes the last finished entry if none is
+/// under way), however often it is retried.
+#[cfg(windows)]
+#[test]
+fn a_locked_file_costs_a_zip_only_itself() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let tmp = TempDir::new("edge-pack-locked");
+    let first = tmp.file("src/1-first.txt", "first");
+    let locked = tmp.file("src/2-locked.txt", "locked");
+    let third = tmp.file("src/3-third.txt", "third");
+    let open = fs::File::options().read(true).share_mode(0).open(&locked).unwrap();
+    let dest = tmp.path().join("out.zip");
+    let running = ops::start(Job::Pack { sources: vec![first, locked, third], dest: dest.clone() });
+    let mut retries = 3;
+    loop {
+        match running.rx.recv_timeout(Duration::from_secs(30)).expect("job hung") {
+            Msg::Progress(_) => {}
+            Msg::Ask(_, reply) => {
+                reply.send(if retries > 0 { Answer::Retry } else { Answer::Skip }).unwrap();
+                retries -= 1;
+            }
+            Msg::Done { .. } => break,
+        }
+    }
+    drop(open);
+    let archive = crate::archive::Archive::open(&dest).unwrap();
+    let packed: Vec<&str> = archive.items.iter().map(|i| i.path.as_str()).collect();
+    assert_eq!(packed, ["1-first.txt", "3-third.txt"]);
+}
+
+/// A zip that is there is only replaced by a complete one: with something left out the new
+/// one goes beside it, and with nothing packed there is no new zip at all.
+#[cfg(windows)]
+#[test]
+fn an_incomplete_pack_never_replaces_a_zip() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let tmp = TempDir::new("edge-pack-keep");
+    let good = tmp.file("good.txt", "good");
+    let locked = tmp.file("locked.txt", "locked");
+    let dest = tmp.path().join("data.zip");
+    fs::write(&dest, "the old zip").unwrap();
+    let open = fs::File::options().read(true).share_mode(0).open(&locked).unwrap();
+
+    let (errors, _, _) = run(Job::Pack { sources: vec![locked.clone()], dest: dest.clone() }, Answer::Skip);
+    assert!(errors.iter().any(|e| e.contains("nothing could be packed")), "{errors:?}");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "the old zip");
+
+    let (errors, _, _) = run(Job::Pack { sources: vec![good, locked], dest: dest.clone() }, Answer::Skip);
+    assert!(errors.iter().any(|e| e.contains("stays as it was")), "{errors:?}");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "the old zip");
+    let beside = tmp.path().join("data (incomplete).zip");
+    assert_eq!(crate::archive::Archive::open(&beside).unwrap().items.len(), 1);
+    drop(open);
+    assert_eq!(names(tmp.path()).iter().filter(|n| n.ends_with(".part")).count(), 0);
+}
+
+/// Links stay links in a zip, and a script stays runnable through a pack and an unpack.
+#[cfg(unix)]
+#[test]
+fn packing_keeps_links_and_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("edge-pack-unix");
+    let script = tmp.file("src/run.sh", "#!/bin/sh\n");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    std::os::unix::fs::symlink("run.sh", tmp.path().join("src/link")).unwrap();
+    let dest = tmp.path().join("out.zip");
+    let (errors, _, _) = run(Job::Pack { sources: vec![tmp.path().join("src")], dest: dest.clone() }, Answer::Skip);
+    assert!(errors.is_empty(), "{errors:?}");
+    let archive = crate::archive::Archive::open(&dest).unwrap();
+    assert!(archive.items.iter().any(|i| i.path == "src/link"), "{:?}", archive.items);
+    let out = tmp.path().join("out");
+    let items = vec!["src".to_string()];
+    let (errors, _, _) = run(Job::Extract { archive: dest, items, dest: out.clone() }, Answer::Skip);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(fs::metadata(out.join("src/run.sh")).unwrap().permissions().mode() & 0o777, 0o750);
+}
+
+/// `Makefile` and `makefile` going to a disk that ignores case, or files of one name from two
+/// folders pasted into one: the second never replaces the first, whose source is gone.
+#[test]
+fn two_sources_landing_on_one_name_lose_neither() {
+    let tmp = TempDir::new("edge-clash");
+    let first = tmp.file("one/same.txt", "first");
+    let second = tmp.file("two/same.txt", "second");
+    tmp.dir("to");
+    let target = tmp.path().join("to").join("same.txt");
+    let job = Job::Move(vec![(first.clone(), target.clone()), (second.clone(), target.clone())]);
+    let (errors, _, questions) = run(job, Answer::All);
+    assert_eq!((errors.len(), questions), (1, 0), "{errors:?}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second", "still at its source");
+}
+
+/// F5 of a link onto the very file it leads to: that file would be gone, with the question
+/// showing 0 bytes. Skipped instead.
+#[cfg(unix)]
+#[test]
+fn a_copy_never_puts_a_link_over_what_it_leads_to() {
+    let tmp = TempDir::new("edge-copy-link");
+    let target = tmp.file("b/f.txt", "precious");
+    tmp.dir("a");
+    let link = tmp.path().join("a/f.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (errors, _, questions) = run(Job::Copy(vec![(link, target.clone())]), Answer::All);
+    assert_eq!((errors.len(), questions), (1, 0), "{errors:?}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+    assert!(fs::symlink_metadata(&target).unwrap().is_file());
+}
+
+/// On a case-sensitive disk `Notes.txt`, a link to `notes.txt`, isn't that file in other
+/// letter case: F6 mustn't take it for a rename and put the link over the file.
+#[cfg(unix)]
+#[test]
+fn a_link_isnt_a_case_rename_of_its_target() {
+    let tmp = TempDir::new("edge-case-link");
+    let target = tmp.file("notes.txt", "precious");
+    std::os::unix::fs::symlink("notes.txt", tmp.path().join("Notes.txt")).unwrap();
+    let link = tmp.path().join("Notes.txt");
+    assert!(ops::plan_move(std::slice::from_ref(&link), "notes.txt", tmp.path()).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+    // And a slash at the end means a new folder, not a rename.
+    let folder = tmp.dir("Photos");
+    let pairs = ops::plan_move(std::slice::from_ref(&folder), "photos/", tmp.path()).unwrap();
+    assert_eq!(pairs[0].1, tmp.path().join("photos").join("Photos"));
+}
+
+/// Mode and contents on Linux: a private key stays private in its copy, from the start; a
+/// private folder too, also when it arrives by a move to another file system.
+#[cfg(unix)]
+#[test]
+fn private_files_and_folders_stay_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let tmp = TempDir::new("edge-modes");
+    let other = TempDir::in_target("edge-modes-dst");
+    let key = tmp.file("secret/id_rsa", "key");
+    let folder = tmp.path().join("secret");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    let copy = tmp.path().join("copy");
+    let (errors, _, _) = run(Job::Copy(vec![(folder.clone(), copy.clone())]), Answer::Skip);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!((mode(&copy), mode(&copy.join("id_rsa"))), (0o700, 0o600));
+    // Read-only folders are copied too, their files written first.
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+    let again = tmp.path().join("again");
+    let (errors, _, _) = run(Job::Copy(vec![(folder.clone(), again.clone())]), Answer::Skip);
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(mode(&again), 0o500);
+    fs::set_permissions(&again, fs::Permissions::from_mode(0o700)).unwrap();
+    if crate::util::same_file(tmp.path(), other.path()) || util::same_volume(tmp.path(), other.path()) {
+        return;
+    }
+    let moved = other.path().join("moved");
+    let (errors, _, _) = run(Job::Move(vec![(folder.clone(), moved.clone())]), Answer::Skip);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(!folder.exists());
+    assert_eq!(fs::read_to_string(moved.join("id_rsa")).unwrap(), "key");
+}
+
+/// On Windows the hidden and read-only flags come along, on files and on folders; folders keep
+/// their time on both systems.
+#[test]
+fn flags_and_folder_times_come_along() {
+    let tmp = TempDir::new("edge-looks");
+    let inner = tmp.file("src/inner/file.txt", "x");
+    let folder = tmp.path().join("src").join("inner");
+    let old = std::time::SystemTime::now() - Duration::from_secs(86_400 * 30);
+    crate::lfs::set_folder_time(&folder, old).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        for path in [&inner, &folder] {
+            let hidden = std::process::Command::new("attrib").arg("+h").arg(path).status().unwrap();
+            assert!(hidden.success());
+        }
+        let copy = tmp.path().join("copy");
+        let (errors, _, _) = run(Job::Copy(vec![(tmp.path().join("src"), copy.clone())]), Answer::Skip);
+        assert!(errors.is_empty(), "{errors:?}");
+        for path in [copy.join("inner"), copy.join("inner").join("file.txt")] {
+            assert_eq!(fs::metadata(&path).unwrap().file_attributes() & 2, 2, "{}", path.display());
+        }
+        assert_eq!(fs::metadata(copy.join("inner")).unwrap().modified().unwrap(), old);
+    }
+    #[cfg(unix)]
+    {
+        let _ = &inner;
+        let copy = tmp.path().join("copy");
+        let (errors, _, _) = run(Job::Copy(vec![(tmp.path().join("src"), copy.clone())]), Answer::Skip);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(fs::metadata(copy.join("inner")).unwrap().modified().unwrap(), old);
+    }
+}
+
+/// Several items onto one file: said at once, not as a string of system errors.
+#[test]
+fn several_items_cant_go_onto_a_file() {
+    let tmp = TempDir::new("edge-onto-file");
+    let (a, b) = (tmp.file("a.txt", "a"), tmp.file("b.txt", "b"));
+    let error = ops::plan(&[a, b], "c.txt", tmp.path()).err();
+    assert_eq!(error, None, "c.txt isn't there: a folder of that name is made");
+    tmp.file("c.txt", "c");
+    let (a, b) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
+    let error = ops::plan(&[a, b], "c.txt", tmp.path()).unwrap_err();
+    assert!(error.contains("is a file"), "{error}");
+}
+
+/// `"D:\New folder\"` in quotes means a folder as it does without them.
+#[test]
+fn a_quoted_folder_with_a_slash_at_the_end() {
+    let tmp = TempDir::new("edge-quoted");
+    let a = tmp.file("a.txt", "a");
+    let typed = format!("\"{}\"", tmp.path().join("New folder").join("").display());
+    let pairs = ops::plan(std::slice::from_ref(&a), &typed, tmp.path()).unwrap();
+    assert_eq!(pairs[0].1, tmp.path().join("New folder").join("a.txt"));
+}
+
+/// F5 of a folder holding a junction to the place it is copied to: not copied into itself.
+#[cfg(windows)]
+#[test]
+fn a_junction_to_the_destination_isnt_followed_round() {
+    let tmp = TempDir::new("edge-junction-dest");
+    tmp.file("src/own.txt", "own");
+    let backup = tmp.dir("backup");
+    junction(&tmp.path().join("src").join("to-backup"), &backup);
+    let dst = backup.join("src");
+    let (errors, cancelled, _) = run(Job::Copy(vec![(tmp.path().join("src"), dst.clone())]), Answer::Skip);
+    assert!(!cancelled);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(names(&dst), ["own.txt"]);
+    fs::remove_dir(tmp.path().join("src").join("to-backup")).unwrap();
+}
+
+/// A permanent delete keeps out of what is mounted in a folder (here told by the mount list,
+/// as a bind mount is), and goes on with the rest.
+#[cfg(unix)]
+#[test]
+fn deleting_keeps_out_of_a_mounted_file_system() {
+    let tmp = TempDir::new("edge-mount");
+    tmp.file("victim/own.txt", "own");
+    let inside = tmp.file("victim/mnt/server-file.txt", "on the server");
+    let mount = fs::canonicalize(tmp.path().join("victim/mnt")).unwrap();
+    assert!(ops::deleted_with_mounts(&tmp.path().join("victim"), vec![mount]));
+    assert_eq!(fs::read_to_string(&inside).unwrap(), "on the server");
+    assert_eq!(names(&tmp.path().join("victim")), ["mnt"]);
 }
 
 /// F6 that only changes the letter case of a name renames it (Windows ignores case, so the

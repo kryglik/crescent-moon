@@ -127,7 +127,7 @@ pub fn as_windows_makes_it(path: PathBuf) -> PathBuf {
     if trimmed.is_empty() || trimmed == name { path } else { path.with_file_name(trimmed) }
 }
 
-fn strip_quotes(s: &str) -> &str {
+pub fn strip_quotes(s: &str) -> &str {
     s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
 }
 
@@ -214,22 +214,27 @@ pub fn private_dir(tag: &str) -> std::io::Result<PathBuf> {
     Err(std::io::Error::other("no private folder could be made in the temp folder"))
 }
 
-/// Writes `text` to `file` aside first, flushed to the disk, and renames it over the old one:
-/// a crash or a full disk never leaves half a file (or an empty one). The name aside is
-/// unique, so two rmc windows saving at once don't trip over each other.
-pub fn write_atomically(file: &Path, text: &str) -> std::io::Result<()> {
+/// Writes `text` to `file` aside first and renames it over the old one: a crash or a full
+/// disk never leaves half a file. `flush` puts it on the disk first, which can take a second
+/// on a busy one: for what the user just changed, not what is saved in passing. The name
+/// aside is unique, so two rmc windows saving at once don't trip over each other.
+pub fn write_atomically(file: &Path, text: &str, flush: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let name = file.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
-    let temp = file.with_file_name(format!(".{name}.{}-{:08x}.tmp", std::process::id(), random() as u32));
+    // The file a link leads to (settings kept in a dotfiles repository): the link stays.
+    let real = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let name = real.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let temp = real.with_file_name(format!(".{name}.{}-{:08x}.tmp", std::process::id(), random() as u32));
     let written = (|| {
         let mut out = std::fs::File::create_new(&temp)?;
         out.write_all(text.as_bytes())?;
-        out.sync_all()?;
+        if flush {
+            out.sync_all()?;
+        }
         drop(out);
-        std::fs::rename(&temp, file)
+        std::fs::rename(&temp, &real)
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -256,6 +261,34 @@ pub fn remove_session_dir() {
     if let Some(dir) = SESSION_DIR.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Clears, in the background, what an rmc that ended without tidying up (a closed terminal
+/// tab, a lost ssh connection) left in the temp folder: private folders of processes that are
+/// gone. Files taken out of archives could otherwise pile up for good.
+pub fn sweep_temp() {
+    std::thread::spawn(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(pid) = name.to_str().and_then(private_dir_owner)
+                && !crate::platform::process_alive(pid)
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
+}
+
+/// The process a folder name of `private_dir` belongs to: `rmc-<pid>-<tag>-<16 hex digits>`.
+pub fn private_dir_owner(name: &str) -> Option<u32> {
+    let mut parts = name.strip_prefix("rmc-")?.split('-');
+    let (pid, tag, random) = (parts.next()?, parts.next()?, parts.next()?);
+    let valid = parts.next().is_none()
+        && matches!(tag, "session" | "shell")
+        && random.len() == 16
+        && random.chars().all(|c| c.is_ascii_hexdigit());
+    if valid { pid.parse().ok() } else { None }
 }
 
 /// Where an internal error on a background thread is written: the per-user temp folder on
@@ -331,14 +364,22 @@ pub fn file_id(path: &Path) -> Option<(u64, u128)> {
     let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<FILE_ID_INFO>() as u32;
     if unsafe { GetFileInformationByHandleEx(handle, FileIdInfo, (&raw mut info).cast(), size) } != 0 {
-        return Some((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)));
+        return known_id(info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier));
     }
     // FAT and other file systems without it: the 64-bit index.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
         return None;
     }
-    Some((info.dwVolumeSerialNumber as u64, u128::from((info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64)))
+    let index = (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64;
+    known_id(info.dwVolumeSerialNumber as u64, if index == u64::MAX { 0 } else { u128::from(index) })
+}
+
+/// Some file systems (network and virtual ones) give every file the id 0 or all ones: that
+/// says nothing, and taken at its word any two files would be one.
+#[cfg(windows)]
+fn known_id(volume: u64, id: u128) -> Option<(u64, u128)> {
+    (id != 0 && id != u128::MAX).then_some((volume, id))
 }
 
 #[cfg(not(windows))]
@@ -379,7 +420,7 @@ fn entry_id(path: &Path) -> Option<(u64, u128)> {
     let size = std::mem::size_of::<FILE_ID_INFO>() as u32;
     let ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle() as _, FileIdInfo, (&raw mut info).cast(), size) };
     // Without the id (FAT has no links): the file's own identity.
-    if ok == 0 { file_id(path) } else { Some((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier))) }
+    if ok == 0 { file_id(path) } else { known_id(info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)) }
 }
 
 #[cfg(not(windows))]

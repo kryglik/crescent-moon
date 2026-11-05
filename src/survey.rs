@@ -2,13 +2,12 @@
 //! files, folders and bytes, and whether any folder may not be deleted without
 //! administrator rights. It stops as soon as the question is answered.
 
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::platform;
+use crate::{lfs, platform};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tally {
@@ -58,11 +57,12 @@ fn walk(paths: Vec<PathBuf>, tally: &Mutex<Tally>, stop: &AtomicBool) {
     let mut local = Tally::default();
     let mut pending: Vec<(PathBuf, bool)> = paths.into_iter().map(|p| (p, true)).collect();
     let mut since_update = 0;
+    let mounts = platform::mount_dirs();
     while let Some((path, top)) = pending.pop() {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        let Ok(meta) = lfs::symlink_metadata(&path) else { continue };
         let is_dir = meta.is_dir();
         if local.denied.is_none()
             && (top || is_dir)
@@ -73,8 +73,11 @@ fn walk(paths: Vec<PathBuf>, tally: &Mutex<Tally>, stop: &AtomicBool) {
         }
         if is_dir {
             local.folders += 1;
-            if let Ok(entries) = fs::read_dir(&path) {
-                pending.extend(entries.flatten().map(|e| (e.path(), false)));
+            // What's mounted in a folder isn't deleted with it.
+            if !platform::is_mount(&path, &meta, &mounts)
+                && let Ok(entries) = lfs::read_dir(&path)
+            {
+                pending.extend(entries.flatten().map(|e| (path.join(e.file_name()), false)));
             }
         } else {
             local.files += 1;

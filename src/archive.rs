@@ -15,6 +15,8 @@ use std::time::SystemTime;
 
 use zip::ZipArchive;
 
+use crate::lfs;
+
 #[derive(Clone, Debug)]
 pub struct Item {
     /// The path inside the archive, `/`-separated, without a leading or trailing slash.
@@ -36,6 +38,8 @@ pub struct Archive {
     /// The zip on disk.
     pub file: PathBuf,
     pub items: Vec<Item>,
+    /// Names in the zip that aren't safe to unpack (`../x`, `C:x`): never listed or written.
+    pub left_out: Vec<String>,
     /// When the zip was read: its size and time, to notice it changing.
     pub stamp: (u64, Option<SystemTime>),
 }
@@ -57,14 +61,30 @@ pub fn to_io(error: zip::result::ZipError) -> io::Error {
 
 impl Archive {
     pub fn open(file: &Path) -> io::Result<Archive> {
+        Self::open_for_reading(file).map(|(archive, _)| archive)
+    }
+
+    /// The list of what's in the zip and the open zip itself, the same one: the numbers in the
+    /// list are its entries, even if the file on disk is replaced a moment later.
+    pub fn open_for_reading(file: &Path) -> io::Result<(Archive, ZipArchive<File>)> {
+        // A named pipe called x.zip would block here for good.
+        if !lfs::metadata(file)?.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
         let stamp = stamp(file);
-        let mut zip = ZipArchive::new(File::open(file)?).map_err(to_io)?;
+        let zip = ZipArchive::new(lfs::open(file)?).map_err(to_io)?;
         let mut items = Vec::new();
+        let mut left_out = Vec::new();
         let mut dirs = HashSet::new();
         for i in 0..zip.len() {
-            let entry = zip.by_index_raw(i).map_err(to_io)?;
+            // From the zip's directory alone: quick on a network drive, and a damaged file
+            // further on doesn't cost the whole list.
+            let entry = zip.by_index_data(i).map_err(to_io)?;
             let raw = decode_name(entry.name_raw());
-            let Some(path) = clean_path(&raw) else { continue };
+            let Some(path) = clean_path(&raw) else {
+                left_out.push(raw.replace('\0', "\u{fffd}"));
+                continue;
+            };
             let modified = entry.last_modified().and_then(to_system_time);
             let is_dir = entry.is_dir() || raw.ends_with(['/', '\\']);
             // Folders above it, which zips often leave out.
@@ -88,7 +108,15 @@ impl Archive {
                 items.push(Item { path, is_dir: false, size: entry.size(), modified, index: Some(i) });
             }
         }
-        Ok(Archive { file: file.to_path_buf(), items, stamp })
+        Ok((Archive { file: file.to_path_buf(), items, left_out, stamp }, zip))
+    }
+
+    /// What to tell the user about names left out, if any.
+    pub fn left_out_note(&self) -> Option<String> {
+        let first = self.left_out.first()?;
+        let more = self.left_out.len() - 1;
+        let others = if more > 0 { format!(" and {more} more") } else { String::new() };
+        Some(format!("This zip has names that would land outside the folder: \"{first}\"{others}. They are left out."))
     }
 
     /// Whether the zip on disk changed since it was read.
@@ -129,18 +157,31 @@ pub fn join(inner: &str, name: &str) -> String {
 }
 
 /// A name from the zip as a safe relative path: `/`-separated, without `.` or empty parts,
-/// a drive or a leading slash. None for a name that climbs out (`..`) or is empty.
+/// a leading drive or a leading slash. None for one that is empty or would land elsewhere
+/// than in the folder it is unpacked to: every part must be one plain name.
 fn clean_path(name: &str) -> Option<String> {
     let mut parts = Vec::new();
-    for part in name.split(['/', '\\']) {
+    // Padding after the name, as some tools write it. A NUL anywhere else hides what the part
+    // really is (`..\0` is `..` to the system).
+    for part in name.trim_end_matches('\0').split(['/', '\\']) {
         match part {
             "" | "." => {}
-            ".." => return None,
             part if parts.is_empty() && part.len() == 2 && part.ends_with(':') => {}
-            part => parts.push(part.trim_end_matches('\0')),
+            part if is_plain_name(part) => parts.push(part),
+            _ => return None,
         }
     }
     (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// One name and nothing else, whatever the system: joined to a folder it stays below it. Not
+/// `..`; on Windows not `C:x`, which replaces the whole path when joined, nor `a:b`, a hidden
+/// stream of the file `a`.
+fn is_plain_name(part: &str) -> bool {
+    let mut components = Path::new(part).components();
+    matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None))
+        && !part.contains('\0')
+        && !(cfg!(windows) && part.contains(':'))
 }
 
 fn decode_name(raw: &[u8]) -> String {
@@ -171,13 +212,15 @@ fn to_system_time(time: zip::DateTime) -> Option<SystemTime> {
     use chrono::{Local, NaiveDate};
     let date = NaiveDate::from_ymd_opt(time.year().into(), time.month().into(), time.day().into())?;
     let local = date.and_hms_opt(time.hour().into(), time.minute().into(), time.second().into())?;
-    Some(local.and_local_timezone(Local).earliest()?.into())
+    // A time in the hour skipped when the clocks go forward counts as the hour after.
+    let exact = local.and_local_timezone(Local).earliest();
+    Some(exact.or_else(|| (local + chrono::Duration::hours(1)).and_local_timezone(Local).earliest())?.into())
 }
 
 /// A point in time as a zip time (1980 to 2107; outside that, None).
 pub fn to_zip_time(time: SystemTime) -> Option<zip::DateTime> {
-    use chrono::{Datelike, Local, Timelike};
-    let local: chrono::DateTime<Local> = time.into();
+    use chrono::{Datelike, Timelike};
+    let local = crate::util::local_time(time)?;
     zip::DateTime::from_date_and_time(
         u16::try_from(local.year()).ok()?,
         local.month() as u8,
@@ -277,6 +320,11 @@ pub mod tests {
     #[test]
     fn names_are_made_safe() {
         assert_eq!(clean_path("a/b/../c"), None);
+        assert_eq!(clean_path("..\0/..\0/x"), None, "a NUL doesn't hide ..");
+        assert_eq!(clean_path("name.txt\0\0"), Some("name.txt".into()), "padding after the name");
+        // Past what a zip can say; on Linux a file's time can even be past any calendar.
+        let far = if cfg!(unix) { 1 << 55 } else { 1 << 38 };
+        assert_eq!(to_zip_time(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(far)), None);
         assert_eq!(clean_path("/abs/./x//y"), Some("abs/x/y".into()));
         assert_eq!(clean_path(r"C:\Windows\x.dll"), Some("Windows/x.dll".into()));
         assert_eq!(clean_path("dir/"), Some("dir".into()));

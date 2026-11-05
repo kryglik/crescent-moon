@@ -1314,7 +1314,12 @@ fn draw_progress(frame: &mut Frame, area: Rect, job: &Running, t: &Scheme) {
         let text = format!("{}/s   {left} left", util::human_size(speed as u64));
         frame.render_widget(Paragraph::new(text).style(style), row(4));
     }
-    frame.render_widget(Paragraph::new(Line::from("Esc = cancel").right_aligned()).style(t.on_dialog(t.dialog_dim)), row(5));
+    let hint = match (job.stuck(), job.stopping.is_some()) {
+        (true, _) => "It doesn't stop: the system isn't answering. F10 leaves rmc",
+        (_, true) => "Stopping…",
+        _ => "Esc = cancel",
+    };
+    frame.render_widget(Paragraph::new(Line::from(hint).right_aligned()).style(t.on_dialog(t.dialog_dim)), row(5));
 }
 
 #[cfg(test)]

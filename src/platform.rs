@@ -149,7 +149,8 @@ pub const ATTRIBUTES: &[(&str, u32)] = &[
 #[cfg(windows)]
 pub fn attributes(path: &Path) -> std::io::Result<u32> {
     use std::os::windows::fs::MetadataExt;
-    Ok(std::fs::metadata(path)?.file_attributes())
+    // The link's own, as those are the ones `set_attributes` changes.
+    Ok(crate::lfs::symlink_metadata(path)?.file_attributes())
 }
 
 #[cfg(not(windows))]
@@ -164,15 +165,19 @@ pub fn attributes(path: &Path) -> std::io::Result<u32> {
 pub fn set_attributes(path: &Path, value: u32) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
-        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY, SetFileAttributesW,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+        FILE_ATTRIBUTE_TEMPORARY, FILE_ATTRIBUTE_UNPINNED, SetFileAttributesW,
     };
+    // Pinned and unpinned too: OneDrive's "always keep on this device" stays as it was.
     let settable = FILE_ATTRIBUTE_ARCHIVE
         | FILE_ATTRIBUTE_HIDDEN
         | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
         | FILE_ATTRIBUTE_OFFLINE
+        | FILE_ATTRIBUTE_PINNED
         | FILE_ATTRIBUTE_READONLY
         | FILE_ATTRIBUTE_SYSTEM
-        | FILE_ATTRIBUTE_TEMPORARY;
+        | FILE_ATTRIBUTE_TEMPORARY
+        | FILE_ATTRIBUTE_UNPINNED;
     let value = match value & settable {
         0 => FILE_ATTRIBUTE_NORMAL,
         bits => bits,
@@ -197,6 +202,43 @@ pub struct Elevated(isize);
 #[cfg(windows)]
 pub fn mount_point(_path: &Path) -> Option<PathBuf> {
     None
+}
+
+/// Where file systems are mounted (see the Linux one). On Windows a mounted folder is a
+/// reparse point, which deleting treats as a link anyway.
+#[cfg(windows)]
+pub fn mount_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub fn is_mount(_path: &Path, _meta: &Metadata, _mounts: &[PathBuf]) -> bool {
+    false
+}
+
+/// On Windows the Recycle Bin says for itself what it won't take.
+#[cfg(windows)]
+pub fn trash_refusal(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Whether a process with this id exists (one we may not look at does too).
+#[cfg(windows)]
+pub fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+    }
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+#[cfg(not(windows))]
+pub fn process_alive(pid: u32) -> bool {
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
@@ -624,8 +666,9 @@ mod win {
 
 #[cfg(not(windows))]
 pub use unix::{
-    delete_denied, delete_privileged, disk_space, drives, exec_bits_mean_something, init, mount_point, open_default,
-    runs_as_program, same_device,
+    delete_denied, delete_privileged, disk_space, drives, exec_bits_mean_something, init, is_mount, mount_dirs, mount_point,
+    open_default,
+    runs_as_program, same_device, trash_refusal,
 };
 
 /// On Windows a program is known by its extension (see `is_executable`).
@@ -741,6 +784,52 @@ mod unix {
     /// The mount point that holds `path`: the longest one it is inside.
     pub fn mount_point(path: &Path) -> Option<PathBuf> {
         mount_of(path).map(|m| m.dir)
+    }
+
+    /// Where file systems are mounted.
+    pub fn mount_dirs() -> Vec<PathBuf> {
+        mounts().into_iter().map(|m| m.dir).collect()
+    }
+
+    /// Whether another file system is mounted at folder `path`, which has `meta`: deleting
+    /// must never go down into one (a chroot's /dev and /home, an sshfs of a server). A
+    /// device of its own shows that, a bind mount of the same disk only in the mount list.
+    pub fn is_mount(path: &Path, meta: &std::fs::Metadata, mounts: &[PathBuf]) -> bool {
+        let parent = path.parent().and_then(|parent| std::fs::metadata(parent).ok());
+        parent.is_some_and(|parent| parent.dev() != meta.dev())
+            || std::fs::canonicalize(path).is_ok_and(|real| mounts.contains(&real))
+    }
+
+    /// Why the trash shouldn't be given `path`, if so. The trash crate moves things by a
+    /// rename; where that can't work it falls back on copying everything to the home trash
+    /// and then deleting it, with no progress, no way to stop it, hanging on a pipe in the
+    /// tree, and leaving things half deleted when the folder may not be changed.
+    pub fn trash_refusal(path: &Path) -> Option<String> {
+        if let Some(denied) = delete_denied(path) {
+            return Some(denied.to_string());
+        }
+        let device = |path: &Path| path.ancestors().find_map(|p| std::fs::symlink_metadata(p).ok()).map(|m| m.dev());
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| util::home_dir().map(|home| home.join(".local").join("share")))?;
+        if device(path) == device(&data.join("Trash")) {
+            return None;
+        }
+        // Another file system: a trash folder there will do, if it can be used or made.
+        let real = std::fs::canonicalize(path.parent()?).ok()?;
+        let top = mount_point(&real)?;
+        let uid = unsafe { libc::geteuid() };
+        let writable = |dir: &Path| {
+            CString::new(dir.as_os_str().as_bytes())
+                .is_ok_and(|dir| unsafe { libc::access(dir.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
+        };
+        let usable = [top.join(format!(".Trash-{uid}")), top.join(".Trash").join(uid.to_string()), top];
+        (!usable.iter().any(|dir| writable(dir))).then(|| {
+            "It is on another drive than your home, with no trash of its own you may use.\n\
+             Shift+F8 deletes it permanently instead."
+                .to_string()
+        })
     }
 
     fn mount_of(path: &Path) -> Option<Mount> {
@@ -948,6 +1037,8 @@ pub const FOLLOW_KEY: &str = "\x1b[24;8~";
 /// - Ctrl+O at the prompt exits, only in the one-off shell used when the persistent one can't
 ///   start (`RMC_ONE_OFF`). In the persistent shell rmc keeps Ctrl+O to itself, and a Ctrl+O
 ///   that slips through (Caps Lock) mustn't end the session.
+/// - It goes to `$env:RMC_START_DIR` last: the process itself started elsewhere, so as not to
+///   hold that folder (see `Subshell::start`).
 const PWSH_SHELL_INIT: &str = r#"
 $global:__rmc_seq = 0
 $global:__rmc_follow = '-'
@@ -981,6 +1072,10 @@ if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
         }
     }
     $global:__rmc_follow = 'f'
+}
+if ($env:RMC_START_DIR) {
+    Set-Location -LiteralPath $env:RMC_START_DIR
+    $env:RMC_START_DIR = $null
 }
 "#;
 

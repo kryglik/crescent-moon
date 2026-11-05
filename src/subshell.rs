@@ -192,7 +192,16 @@ impl Subshell {
         if cfg!(unix) {
             command.env("TERM", "xterm-256color");
         }
-        command.cwd(cwd);
+        // A Windows process keeps the folder it starts in from being moved or deleted for as
+        // long as it runs, and PowerShell's `cd` doesn't let go of it: so it starts elsewhere
+        // and goes there itself (see PWSH_SHELL_INIT).
+        match (shell, util::home_dir()) {
+            (Shell::PowerShell(_), Some(home)) if cfg!(windows) => {
+                command.cwd(home);
+                command.env("RMC_START_DIR", cwd);
+            }
+            _ => command.cwd(cwd),
+        }
         command.env("RMC_CWD_FILE", &report_file);
         command.env("RMC_REQUEST_FILE", &request_file);
         command.env(crate::platform::RMC_PID, std::process::id().to_string());
@@ -549,6 +558,25 @@ mod tests {
 
     fn screen_text(shell: &Subshell) -> String {
         shell.with_screen(|screen| screen.contents()).unwrap_or_default()
+    }
+
+    /// The shell starts in the panel's folder without holding it: on Windows the folder a
+    /// process started in can't be renamed or deleted while it runs, even from rmc.
+    #[test]
+    fn the_shell_doesnt_hold_the_folder_it_started_in() {
+        let shell_kind = Shell::detect();
+        if !matches!(shell_kind, Shell::PowerShell(_)) {
+            eprintln!("no PowerShell here; skipped");
+            return;
+        }
+        let tmp = TempDir::new("subshell-start");
+        let dir = tmp.dir("Start here");
+        let mut shell = Subshell::start(&shell_kind, &dir, 30, 100).unwrap();
+        wait_for("the first prompt", || shell.report().is_some());
+        assert!(shell.report().is_some_and(|r| util::same_path(&r.dir, &dir)), "it is in the panel's folder");
+        fs::rename(&dir, tmp.path().join("Moved")).unwrap();
+        shell.send_text("exit\r");
+        wait_for("exit", || shell.has_exited());
     }
 
     #[test]

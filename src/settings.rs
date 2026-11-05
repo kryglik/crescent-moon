@@ -70,7 +70,7 @@ impl Settings {
 
     pub fn save(&self, file: &Path) -> io::Result<()> {
         // Never half a settings file, whatever happens while it is written.
-        util::write_atomically(file, &self.to_text())
+        util::write_atomically(file, &self.to_text(), true)
     }
 
     pub fn big_file_bytes(&self) -> u64 {

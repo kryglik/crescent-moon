@@ -20,6 +20,12 @@ use crate::{platform, util};
 /// Guards against link loops when copying through directory links.
 const MAX_DEPTH: usize = 64;
 const BUFFER_SIZE: usize = 1 << 20;
+const STACK_SIZE: usize = 64 << 20;
+/// From this size a copy is flushed to the disk before the file it replaces, or the source of
+/// a move, goes. Not for every file: on a busy disk a flush takes a second, however small the
+/// file, which a thousand small files would feel, and a big file barely.
+const FLUSH_FROM: u64 = 16 << 20;
+const STUCK_AFTER: Duration = Duration::from_secs(3);
 
 pub enum Job {
     Copy(Vec<(PathBuf, PathBuf)>),
@@ -68,9 +74,14 @@ fn plan_for(sources: &[PathBuf], input: &str, base: &Path, moving: bool) -> Resu
         return Err("No destination given.".into());
     }
     let dest = util::as_windows_makes_it(util::resolve(base, input));
+    // A slash at the end means a folder, in quotes too (`"D:\New folder\"`).
+    let as_folder = util::strip_quotes(input).ends_with(['/', '\\']);
     // `Folder` to `folder`: the "existing" folder is the item itself, not a place to put it.
-    let recase = moving && sources.len() == 1 && changes_only_case(&sources[0], &dest);
-    let into_dir = !recase && (sources.len() > 1 || fs::is_dir(&dest) || input.ends_with(['/', '\\']));
+    let recase = moving && !as_folder && sources.len() == 1 && changes_only_case(&sources[0], &dest);
+    let into_dir = !recase && (sources.len() > 1 || fs::is_dir(&dest) || as_folder);
+    if into_dir && fs::exists(&dest) && !fs::is_dir(&dest) {
+        return Err(format!("\"{}\" is a file, not a folder to put them in.", dest.display()));
+    }
     let mut pairs = Vec::new();
     for source in sources {
         let target = if into_dir {
@@ -81,23 +92,32 @@ fn plan_for(sources: &[PathBuf], input: &str, base: &Path, moving: bool) -> Resu
         } else {
             dest.clone()
         };
-        // The same path, or the same file under another name (another letter case on a
-        // drive that ignores case, a link): copying would empty it, moving would delete it.
-        // (Not merely the same path in other letter case: in a folder that respects case, as
-        // WSL makes them, `readme.md` and `README.md` are two files.)
-        if !recase && (source == &target || util::same_file(source, &target)) {
-            return Err(format!("\"{}\" is the same as its destination.", source.display()));
-        }
-        if !recase && fs::is_dir(source) && (util::is_inside(&target, source) || util::really_inside(&target, source)) {
-            return Err(format!("\"{}\" cannot be put inside itself.", source.display()));
+        if !recase {
+            check_pair(source, &target)?;
         }
         pairs.push((source.clone(), target));
     }
     Ok(pairs)
 }
 
+/// Whether `source` may go to `target`: not onto itself, not a folder into itself. Links and
+/// other names of a place are seen through, as an alias is how such a pair comes about.
+pub fn check_pair(source: &Path, target: &Path) -> Result<(), String> {
+    // The same path, or the same file under another name (another letter case on a drive
+    // that ignores case, a link): copying would empty it, moving would delete it. (Not merely
+    // the same path in other letter case: in a folder that respects case, as WSL makes them,
+    // `readme.md` and `README.md` are two files.)
+    if source == target || util::same_file(source, target) {
+        return Err(format!("\"{}\" is the same as its destination.", source.display()));
+    }
+    if fs::is_dir(source) && (util::is_inside(target, source) || util::really_inside(target, source)) {
+        return Err(format!("\"{}\" cannot be put inside itself.", source.display()));
+    }
+    Ok(())
+}
+
 /// Whether `target` is `source` in the same folder with its name in other letter case, and
-/// is either free or the very same file (on a disk that respects case, `Folder` and an
+/// is either free or the very same entry (on a disk that respects case, `Folder` and an
 /// existing, different `folder` are two folders, and a move puts one into the other).
 fn changes_only_case(source: &Path, target: &Path) -> bool {
     let (Some(a), Some(b)) = (source.file_name(), target.file_name()) else { return false };
@@ -106,7 +126,7 @@ fn changes_only_case(source: &Path, target: &Path) -> bool {
     a != b
         && a.to_lowercase() == b.to_lowercase()
         && same_folder
-        && (fs::symlink_metadata(target).is_err() || util::same_file(source, target))
+        && (fs::symlink_metadata(target).is_err() || util::same_entry(source, target))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,11 +187,27 @@ pub struct Running {
     /// When the bytes started to move (after the scan) and how many were done then: the
     /// speed and the time left are measured from there.
     pub measured_from: Option<(Instant, u64)>,
+    /// When Esc asked it to stop.
+    pub stopping: Option<Instant>,
+    /// The screen has been told it doesn't stop.
+    pub stuck_shown: bool,
 }
 
 impl Running {
     pub fn new(title: &'static str, progress: Progress, rx: Receiver<Msg>, cancel: Arc<AtomicBool>) -> Running {
-        Running { title, progress, rx, cancel, measured_from: None }
+        Running { title, progress, rx, cancel, measured_from: None, stopping: None, stuck_shown: false }
+    }
+
+    /// Esc: the job stops at its next look at the flag.
+    pub fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.stopping.get_or_insert_with(Instant::now);
+    }
+
+    /// Asked to stop a while ago and still going: caught in a system call that doesn't return
+    /// (a dead network drive).
+    pub fn stuck(&self) -> bool {
+        self.stopping.is_some_and(|since| since.elapsed() >= STUCK_AFTER)
     }
 
     /// Takes the job's latest progress.
@@ -211,7 +247,8 @@ fn run_job(job: Job, privileged: bool) -> Running {
     let cancel = Arc::new(AtomicBool::new(false));
     let title = job.title();
     let flag = cancel.clone();
-    thread::spawn(move || {
+    // A tree can go very deep, and walking it recurses: room for that, used only if needed.
+    let worker = thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
         let mut worker = Worker::new(tx.clone(), flag);
         worker.privileged = privileged;
         let result = worker.run(job);
@@ -221,6 +258,8 @@ fn run_job(job: Job, privileged: bool) -> Running {
         let as_admin = worker.as_admin.take().filter(|paths| !cancelled && !paths.is_empty());
         let _ = tx.send(Msg::Done { errors: worker.errors, cancelled, as_admin });
     });
+    // Without a thread the job just ends: `tick_job` reports a worker that is gone.
+    drop(worker);
     Running::new(title, Progress::default(), rx, cancel)
 }
 
@@ -251,6 +290,17 @@ struct Worker {
     admin_when_refused: bool,
     /// An overwrite the user already agreed to (a move to another drive asks once, then copies).
     confirmed: Option<PathBuf>,
+    /// While packing: the name of the zip being written, and how many entries are in it.
+    packing: Option<std::ffi::OsString>,
+    packed: u64,
+    /// A move: sources get deleted, so each copy must be safely on the disk first.
+    moving: bool,
+    /// Where file systems are mounted: deleting and moving keep out of them.
+    mounts: Vec<PathBuf>,
+    /// Where the items of this job go.
+    targets: Vec<PathBuf>,
+    /// The names this job has put in place (see `name_key`).
+    written: std::collections::HashSet<u64>,
 }
 
 impl Worker {
@@ -269,6 +319,12 @@ impl Worker {
             as_admin: None,
             admin_when_refused: false,
             confirmed: None,
+            packing: None,
+            packed: 0,
+            moving: false,
+            mounts: Vec::new(),
+            targets: Vec::new(),
+            written: std::collections::HashSet::new(),
         }
     }
 
@@ -276,6 +332,7 @@ impl Worker {
         match job {
             Job::Copy(pairs) => {
                 self.scan_all(pairs.iter().map(|(src, _)| src.as_path()), true)?;
+                self.targets = pairs.iter().map(|(_, dst)| dst.clone()).collect();
                 for (src, dst) in &pairs {
                     if self.prepare_parent(dst)? {
                         self.copy_tree(src, dst, &mut Vec::new())?;
@@ -283,6 +340,9 @@ impl Worker {
                 }
             }
             Job::Move(pairs) => {
+                self.moving = true;
+                self.mounts = platform::mount_dirs();
+                self.targets = pairs.iter().map(|(_, dst)| dst.clone()).collect();
                 // Within one drive a move is a rename and needs no scan; across drives it is a copy.
                 let cross = pairs.iter().any(|(src, dst)| !util::same_volume(src, dst));
                 let totals = if cross {
@@ -304,12 +364,13 @@ impl Worker {
             Job::Delete { paths, to_trash, admin_when_refused } => {
                 if cfg!(windows) && !self.privileged {
                     self.admin_offer = Some(if to_trash {
-                        "As admin: deletes it permanently, as administrator (Windows asks first)."
+                        "As admin: deletes it, and whatever else the bin refuses, permanently (Windows asks first)."
                     } else {
                         "As admin: deletes the rest as administrator (Windows asks first)."
                     });
                 }
                 self.admin_when_refused = admin_when_refused;
+                self.mounts = platform::mount_dirs();
                 if to_trash {
                     self.progress.files_total = paths.len() as u64;
                 } else {
@@ -343,12 +404,9 @@ impl Worker {
 
     /// Out of a zip: each item with what is below it, into `dest` (made if missing), with
     /// the usual questions for files that are there already. Files in the zip whose names
-    /// would climb out of `dest` were left out when it was read.
+    /// would land outside `dest` were left out when it was read.
     fn extract(&mut self, file: &Path, items: &[String], dest: &Path) -> Flow<()> {
-        let Some(archive) = self.attempt(file, |_| Archive::open(file))? else { return Ok(()) };
-        let Some(mut zip) = self.attempt(file, |_| ZipArchive::new(fs::open(file)?).map_err(archive::to_io))? else {
-            return Ok(());
-        };
+        let Some((archive, mut zip)) = self.attempt(file, |_| Archive::open_for_reading(file))? else { return Ok(()) };
         // What goes where: paths relative to each item's folder in the zip.
         let mut work: Vec<(archive::Item, PathBuf)> = Vec::new();
         for item in items {
@@ -358,6 +416,10 @@ impl Worker {
                 let target = relative.split('/').fold(dest.to_path_buf(), |path, part| path.join(part));
                 work.push((entry.clone(), target));
             }
+        }
+        // The zip changed since the panel read it.
+        if work.is_empty() {
+            self.errors.push(format!("{}: {} is not in it any more", file.display(), items.join(", ")));
         }
         self.progress.files_total = work.iter().filter(|(item, _)| !item.is_dir).count() as u64;
         self.progress.bytes_total = work.iter().filter(|(item, _)| !item.is_dir).map(|(item, _)| item.size).sum();
@@ -390,6 +452,7 @@ impl Worker {
             let done = self.attempt(target, |worker| worker.extract_file(&mut zip, index, item.modified, target))?;
             if done.is_some() {
                 self.progress.files_done += 1;
+                self.written.insert(name_key(target));
             } else {
                 self.skip_file(item.size);
             }
@@ -413,6 +476,9 @@ impl Worker {
         buffer.resize(BUFFER_SIZE, 0);
         let result = (|| {
             let mut input = zip.by_index(index).map_err(archive::to_io)?;
+            #[cfg(unix)]
+            let mode = input.unix_mode().filter(|_| !input.is_symlink());
+            let size = input.size();
             let mut output = fs::create_new(&temp)?;
             loop {
                 if self.cancel.load(Ordering::Relaxed) {
@@ -431,7 +497,17 @@ impl Worker {
             if let Some(time) = modified {
                 let _ = output.set_modified(time);
             }
-            drop(output);
+            // As in `copy_contents`: the old file goes on the strength of this one.
+            if size >= FLUSH_FROM && fs::symlink_metadata(target).is_ok() {
+                output.sync_all()?;
+            }
+            fs::close(output)?;
+            // Scripts stay runnable; set-uid and the like are no business of a zip's.
+            #[cfg(unix)]
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode & 0o777));
+            }
             replace_with(&temp, target)
         })();
         self.buffer = buffer;
@@ -443,8 +519,10 @@ impl Worker {
     }
 
     /// Into a new zip: each source by its name, folders with what is below them (links
-    /// followed, as copies do on Windows). It is written aside and renamed at the end, so a
-    /// failed or stopped pack leaves no half zip (and an older zip of that name as it was).
+    /// followed on Windows, as copies do; kept as links elsewhere). It is written aside and
+    /// renamed at the end, so a failed or stopped pack leaves no half zip. A zip already there
+    /// is only replaced by a complete one: if something had to be left out, the new zip goes
+    /// beside it, and with nothing packed there is no new zip at all.
     fn pack(&mut self, sources: &[PathBuf], dest: &Path) -> Flow<()> {
         self.scan_all(sources.iter().map(PathBuf::as_path), true)?;
         // Into a folder that isn't there yet (typed in the question), as copies do.
@@ -454,6 +532,9 @@ impl Worker {
         let temp = temp_name(dest);
         let Some(file) = self.attempt(dest, |_| fs::create_new(&temp))? else { return Ok(()) };
         let mut zip = ZipWriter::new(file);
+        let errors_before = self.errors.len();
+        self.packing = temp.file_name().map(|name| name.to_os_string());
+        self.packed = 0;
         let result = (|| {
             for source in sources {
                 let Some(name) = source.file_name() else { continue };
@@ -461,32 +542,79 @@ impl Worker {
             }
             Ok(())
         })();
+        self.packing = None;
         if let Err(stop) = result {
             drop(zip);
             let _ = fs::remove_file(&temp);
             return Err(stop);
         }
-        let finished = zip.finish().map(drop).map_err(archive::to_io).and_then(|()| replace_with(&temp, dest));
-        if let Err(e) = finished {
+        // A zip it is to replace goes for good: the new one must really be on the disk first.
+        let replacing = fs::symlink_metadata(dest).is_ok();
+        let finished = zip.finish().map_err(archive::to_io);
+        if let Err(e) = finished.and_then(|file| if replacing { file.sync_all() } else { Ok(()) }) {
             let _ = fs::remove_file(&temp);
             self.errors.push(format!("{}: {e}", dest.display()));
+            return Ok(());
+        }
+        if self.packed == 0 {
+            let _ = fs::remove_file(&temp);
+            self.errors.push(format!("{}: nothing could be packed, so no zip was made", dest.display()));
+            return Ok(());
+        }
+        let incomplete = self.errors.len() > errors_before;
+        let target = if incomplete && fs::symlink_metadata(dest).is_ok() { incomplete_name(dest) } else { dest.to_path_buf() };
+        match replace_with(&temp, &target) {
+            Ok(()) if target != dest => self.errors.push(format!(
+                "{}: stays as it was, as some files could not be packed; the others are in {}",
+                dest.display(),
+                target.display()
+            )),
+            Ok(()) => {}
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                self.errors.push(format!("{}: {e}", dest.display()));
+            }
         }
         Ok(())
     }
 
     fn pack_tree(&mut self, zip: &mut ZipWriter<File>, path: &Path, name: &str, ancestors: &mut Vec<PathBuf>) -> Flow<()> {
         self.check_cancel()?;
+        // The zip being written, met on the way (through a junction, or a drive and its
+        // share): read into itself, it would grow until the disk is full.
+        if path.file_name().is_some_and(|n| Some(n) == self.packing.as_deref()) {
+            return Ok(());
+        }
         let Some(meta) = self.attempt(path, |_| followed_metadata(path))? else { return Ok(()) };
+        // 2 GiB, not 4: past 4 GiB without the flag the crate gives up on the file, and a file
+        // can grow while it is packed.
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
             .last_modified_time(meta.modified().ok().and_then(archive::to_zip_time).unwrap_or_default())
-            .large_file(meta.len() >= u32::MAX as u64);
+            .large_file(meta.len() >= 1 << 31);
+        #[cfg(unix)]
+        let options = {
+            use std::os::unix::fs::PermissionsExt;
+            options.unix_permissions(meta.permissions().mode() & 0o777)
+        };
+        #[cfg(unix)]
+        if meta.file_type().is_symlink() {
+            self.progress.current = path.display().to_string();
+            let stored = self.attempt(path, |_| {
+                let target = fs::read_link(path)?;
+                zip.add_symlink(name, target.to_string_lossy(), options.clone()).map_err(archive::to_io)
+            })?;
+            self.packed += u64::from(stored.is_some());
+            self.skip_file(meta.len());
+            return Ok(());
+        }
         if meta.is_dir() {
             if ancestors.len() >= MAX_DEPTH || (is_link(path) && loops_back(path, ancestors)) {
                 self.errors.push(format!("{}: nested too deeply or a link back up, skipped", path.display()));
                 return Ok(());
             }
-            self.attempt(path, |_| zip.add_directory(format!("{name}/"), options.clone()).map_err(archive::to_io))?;
+            let added = self.attempt(path, |_| zip.add_directory(format!("{name}/"), options.clone()).map_err(archive::to_io))?;
+            self.packed += u64::from(added.is_some());
             let Some(children) = self.attempt(path, |_| child_names(path))? else { return Ok(()) };
             ancestors.push(path.to_path_buf());
             for child in children {
@@ -505,7 +633,12 @@ impl Worker {
         let start = self.progress.bytes_done;
         let packed = self.attempt(path, |worker| {
             worker.progress.bytes_done = start;
-            let result = worker.pack_file(zip, path, name, options.clone());
+            // Opened first: a file that can't be read (locked, say) stops here, zip untouched.
+            let mut input = fs::open(path)?;
+            zip.start_file(name, options.clone()).map_err(archive::to_io)?;
+            let result = worker.pack_file(zip, &mut input);
+            // Only now, with an entry under way: with none, abort_file would remove the last
+            // finished one instead.
             if result.is_err() {
                 let _ = zip.abort_file();
             }
@@ -513,6 +646,7 @@ impl Worker {
         })?;
         if packed.is_some() {
             self.progress.files_done += 1;
+            self.packed += 1;
         } else {
             self.progress.bytes_done = start;
             self.skip_file(meta.len());
@@ -521,9 +655,7 @@ impl Worker {
         Ok(())
     }
 
-    fn pack_file(&mut self, zip: &mut ZipWriter<File>, path: &Path, name: &str, options: SimpleFileOptions) -> io::Result<()> {
-        let mut input = fs::open(path)?;
-        zip.start_file(name, options).map_err(archive::to_io)?;
+    fn pack_file(&mut self, zip: &mut ZipWriter<File>, input: &mut File) -> io::Result<()> {
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.resize(BUFFER_SIZE, 0);
         let result = (|| loop {
@@ -622,8 +754,11 @@ impl Worker {
         match meta {
             Ok(meta) if meta.is_dir() => {
                 let looped = copying && is_link(path) && loops_back(path, ancestors);
+                // What's mounted in a folder isn't part of deleting it.
+                let mounted = !copying && platform::is_mount(path, &meta, &self.mounts);
                 if ancestors.len() < MAX_DEPTH
                     && !looped
+                    && !mounted
                     && let Ok(children) = fs::read_dir(path)
                 {
                     ancestors.push(path.to_path_buf());
@@ -657,6 +792,13 @@ impl Worker {
     }
 
     fn confirm_overwrite(&mut self, target: &Path, source: FileInfo, existing: &Metadata) -> Flow<bool> {
+        // This job put it there: two of its names come out as one here (`Makefile` and
+        // `makefile` on a disk that ignores case, files of one name from two folders).
+        // Replacing it would lose a file whose source may be gone already.
+        if self.written.contains(&name_key(target)) {
+            self.errors.push(format!("{}: another item of this job already took this name here, skipped", target.display()));
+            return Ok(false);
+        }
         if self.confirmed.as_deref() == Some(target) {
             self.confirmed = None;
             return Ok(true);
@@ -702,13 +844,16 @@ impl Worker {
                 self.errors.push(format!("{}: a link back to a folder above it, skipped", src.display()));
                 return Ok(false);
             }
+            // A link leading to where this goes: it would be copied into itself, ever deeper.
+            if is_link(src) && self.targets.iter().any(|target| util::really_inside(target, src)) {
+                self.errors.push(format!("{}: a link to the place this is copied to, skipped", src.display()));
+                return Ok(false);
+            }
             if fs::symlink_metadata(dst).is_ok_and(|m| !m.is_dir()) {
                 self.errors.push(format!("{}: a file with this name already exists", dst.display()));
                 return Ok(false);
             }
-            if self.attempt(dst, |_| fs::create_dir_all(dst))?.is_none() {
-                return Ok(false);
-            }
+            let Some(created) = self.make_folder(dst, &meta)? else { return Ok(false) };
             let Some(children) = self.attempt(src, |_| child_names(src))? else { return Ok(false) };
             ancestors.push(src.to_path_buf());
             let mut complete = true;
@@ -716,6 +861,9 @@ impl Worker {
                 complete &= self.copy_tree(&src.join(&name), &dst.join(&name), ancestors)?;
             }
             ancestors.pop();
+            if created {
+                finish_folder(dst, &meta);
+            }
             return Ok(complete);
         }
 
@@ -745,6 +893,7 @@ impl Worker {
         let copied = self.attempt(src, |worker| worker.copy_file(src, dst, &meta))?.is_some();
         if copied {
             self.progress.files_done += 1;
+            self.written.insert(name_key(dst));
         } else {
             self.skip_file(meta.len());
         }
@@ -752,11 +901,36 @@ impl Worker {
         Ok(copied)
     }
 
+    /// Makes folder `dst` for a copy of one with `meta` if needed. Some(whether it is new),
+    /// None if that was skipped. On Linux a new one is no more open to others than the
+    /// original from the start, and writable by its owner until `finish_folder`.
+    fn make_folder(&mut self, dst: &Path, meta: &Metadata) -> Flow<Option<bool>> {
+        let created = fs::symlink_metadata(dst).is_err();
+        if self.attempt(dst, |_| fs::create_dir_all(dst))?.is_none() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        if created {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o777 | 0o700;
+            let _ = fs::set_permissions(dst, std::fs::Permissions::from_mode(mode));
+        }
+        #[cfg(not(unix))]
+        let _ = meta;
+        Ok(Some(created))
+    }
+
     /// A symbolic link is copied as a link (as `cp -a` and mc do), even a broken one.
     #[cfg(unix)]
     fn copy_link(&mut self, src: &Path, dst: &Path) -> Flow<bool> {
         self.progress.current = src.display().to_string();
         if let Ok(existing) = fs::symlink_metadata(dst) {
+            // A link to the very file it would replace: that file would be gone.
+            if util::same_file(src, dst) && !util::same_entry(src, dst) {
+                self.errors.push(format!("{}: a link to its destination, skipped", src.display()));
+                self.skip_file(0);
+                return Ok(false);
+            }
             if existing.is_dir() {
                 self.errors.push(format!("{}: a directory with this name already exists", dst.display()));
                 self.skip_file(0);
@@ -781,6 +955,10 @@ impl Worker {
             .is_some();
         if made {
             self.progress.files_done += 1;
+            self.written.insert(name_key(dst));
+            if let Ok(meta) = fs::symlink_metadata(src) {
+                fs::keep_looks(dst, &meta);
+            }
         } else {
             self.skip_file(0);
         }
@@ -788,28 +966,30 @@ impl Worker {
     }
 
     /// Copies one file in chunks (so progress and cancelling work), keeping its time and
-    /// read-only flag. It is written under a temporary name beside the target and renamed over
-    /// it at the end, so a failed or cancelled copy leaves an existing target as it was.
+    /// flags. It is written under a temporary name beside the target and renamed over it at
+    /// the end, so a failed or cancelled copy leaves an existing target as it was.
     fn copy_file(&mut self, src: &Path, dst: &Path, meta: &Metadata) -> io::Result<()> {
         let start = self.progress.bytes_done;
         let temp = temp_name(dst);
+        let flush = meta.len() >= FLUSH_FROM && (self.moving || fs::symlink_metadata(dst).is_ok());
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.resize(BUFFER_SIZE, 0);
-        let result = self.copy_contents(src, &temp, meta, &mut buffer).and_then(|()| replace_with(&temp, dst));
+        let result = self.copy_contents(src, &temp, meta, &mut buffer, flush).and_then(|()| replace_with(&temp, dst));
         self.buffer = buffer;
         if result.is_err() {
             self.progress.bytes_done = start;
             let _ = fs::remove_file(&temp);
             return result;
         }
-        // The read-only flag (and on Linux the mode) goes on last: the rename needed it off.
-        let _ = fs::set_permissions(dst, meta.permissions());
+        // The flags (on Linux also the owner) go on last: the rename needs them off.
+        fs::keep_looks(dst, meta);
         result
     }
 
-    fn copy_contents(&mut self, src: &Path, dst: &Path, meta: &Metadata, buffer: &mut [u8]) -> io::Result<()> {
+    fn copy_contents(&mut self, src: &Path, dst: &Path, meta: &Metadata, buffer: &mut [u8], flush: bool) -> io::Result<()> {
         let mut input = fs::open(src)?;
-        let mut output = fs::create_new(dst)?;
+        let mut output = fs::create_new_like(dst, meta).map_err(writing)?;
+        let mut written = 0;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -820,7 +1000,8 @@ impl Worker {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            output.write_all(&buffer[..n])?;
+            output.write_all(&buffer[..n]).map_err(writing)?;
+            written += n as u64;
             self.progress.bytes_done += n as u64;
             self.send_progress(false);
         }
@@ -828,6 +1009,15 @@ impl Worker {
         // 1980, and a share may not let a non-owner set times.
         if let Ok(modified) = meta.modified() {
             let _ = output.set_modified(modified);
+        }
+        if flush {
+            output.sync_all().map_err(writing)?;
+        }
+        // A file goes for good on the strength of this copy: a full or lost network drive may
+        // only say so when the file is closed, or by what is there afterwards.
+        fs::close(output).map_err(writing)?;
+        if fs::symlink_metadata(dst).map_err(writing)?.len() != written {
+            return Err(writing(io::Error::other("it came out shorter than the original")));
         }
         Ok(())
     }
@@ -872,6 +1062,7 @@ impl Worker {
                 if still_listed(src) && util::same_entry(src, dst) {
                     return Ok(self.attempt(src, |_| fs::remove_file(src))?.is_some());
                 }
+                self.written.insert(name_key(dst));
                 Ok(true)
             }
             Some(false) => {
@@ -913,7 +1104,18 @@ impl Worker {
             if !self.copy_tree(src, dst, ancestors)? {
                 return Ok(false);
             }
+            // The one file through two mounts of a share, which look like two disks: "the
+            // source" would be the only copy.
+            #[cfg(unix)]
+            if same_inode(src, dst) {
+                self.errors.push(format!("{}: looks like the same file as {}, left in place", src.display(), dst.display()));
+                return Ok(false);
+            }
             return Ok(self.attempt(src, |_| remove_file_or_link(src))?.is_some());
+        }
+        if platform::is_mount(src, &meta, &self.mounts) {
+            self.errors.push(format!("{}: a file system is mounted here, skipped", src.display()));
+            return Ok(false);
         }
         if ancestors.len() >= MAX_DEPTH {
             self.errors.push(format!("{}: nested too deeply, skipped", src.display()));
@@ -923,9 +1125,7 @@ impl Worker {
             self.errors.push(format!("{}: a file with this name already exists", dst.display()));
             return Ok(false);
         }
-        if self.attempt(dst, |_| fs::create_dir_all(dst))?.is_none() {
-            return Ok(false);
-        }
+        let Some(created) = self.make_folder(dst, &meta)? else { return Ok(false) };
         let Some(children) = self.attempt(src, |_| child_names(src))? else { return Ok(false) };
         ancestors.push(src.to_path_buf());
         let mut complete = true;
@@ -933,6 +1133,9 @@ impl Worker {
             complete &= self.move_across(&src.join(&name), &dst.join(&name), ancestors)?;
         }
         ancestors.pop();
+        if created {
+            finish_folder(dst, &meta);
+        }
         Ok(complete && self.attempt(src, |_| remove_dir(src))?.is_some())
     }
 
@@ -946,6 +1149,12 @@ impl Worker {
     fn remove_tree(&mut self, path: &Path, count: bool) -> Flow<bool> {
         self.check_cancel()?;
         let Some(meta) = self.attempt(path, |_| fs::symlink_metadata(path))? else { return Ok(false) };
+        // Another file system (a server by sshfs, a chroot's /dev and /home) isn't this
+        // folder's to delete, as a link's target isn't.
+        if meta.is_dir() && platform::is_mount(path, &meta, &self.mounts) {
+            self.errors.push(format!("{}: a file system is mounted here, skipped", path.display()));
+            return Ok(false);
+        }
         let removed = if meta.is_dir() {
             let Some(children) = self.attempt(path, |_| child_names(path))? else { return Ok(false) };
             let mut complete = true;
@@ -972,16 +1181,24 @@ impl Worker {
     fn trash(&mut self, path: &Path) -> Flow<()> {
         self.progress.current = path.display().to_string();
         self.send_progress(true);
+        let mounts = self.mounts.clone();
         self.attempt(path, |_| {
             // The Recycle Bin reads paths the usual way, which would make `foo.` into `foo`
             // and put the wrong file in the bin.
             if fs::needs_literal(path) {
                 return Err(io::Error::other(format!(
-                    "The {} can't take a name that ends in a dot or a space, or is a device name \
-                     (NUL, CON, COM1…): Windows would take another file for it.\n\
-                     Shift+F8 deletes it permanently instead.",
+                    "The {} can't take this name: it ends in a dot or a space,\n\
+                     or is a device name (NUL, CON, COM1…), so Windows would take\n\
+                     another file for it. Shift+F8 deletes it permanently instead.",
                     platform::TRASH_NAME
                 )));
+            }
+            // Thrown away, what's mounted in it would be deleted with it some day.
+            if holds_mount(path, &mounts) {
+                return Err(io::Error::other("A file system is mounted inside it: unmount that first."));
+            }
+            if let Some(reason) = platform::trash_refusal(path) {
+                return Err(io::Error::other(reason));
             }
             trash::delete(path).map_err(|e| trash_error(path, &e))
         })?;
@@ -1042,6 +1259,67 @@ fn loops_back(dir: &Path, ancestors: &[PathBuf]) -> bool {
     ancestors.iter().any(|a| util::file_id(a) == Some(id))
 }
 
+/// A permanent delete of `path` with these file systems mounted; whether an error said so.
+#[cfg(all(test, unix))]
+pub fn deleted_with_mounts(path: &Path, mounts: Vec<PathBuf>) -> bool {
+    let (tx, _rx) = mpsc::channel();
+    let mut worker = Worker::new(tx, Arc::new(AtomicBool::new(false)));
+    worker.mounts = mounts;
+    let _ = worker.remove_tree(path, true);
+    worker.errors.iter().any(|error| error.contains("mounted"))
+}
+
+/// A failure on the destination's side, said as such: errors are shown with the source's path.
+fn writing(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("writing the copy: {error}"))
+}
+
+/// A number for `path` as a disk that ignores case reads it: two names of a job that land on
+/// one. (Compact, as a big job has many; 64 bits make a false match out of the question.)
+fn name_key(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().to_lowercase().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A new folder's last touches, once what goes in it is there: its time, then its flags.
+fn finish_folder(dst: &Path, meta: &Metadata) {
+    if let Ok(time) = meta.modified() {
+        let _ = fs::set_folder_time(dst, time);
+    }
+    fs::keep_looks(dst, meta);
+}
+
+/// Whether a file system is mounted at or below `path`.
+fn holds_mount(path: &Path, mounts: &[PathBuf]) -> bool {
+    !mounts.is_empty() && fs::canonicalize(path).is_ok_and(|real| mounts.iter().any(|mount| mount.starts_with(&real)))
+}
+
+/// The same inode on what looks like another device, with the same size: a share mounted
+/// twice. (By chance on two disks it only leaves a source in place.)
+#[cfg(unix)]
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.file_type().is_file() && a.ino() == b.ino() && a.len() == b.len(),
+        _ => false,
+    }
+}
+
+/// A free name beside `dest` for a zip that couldn't take everything: `data (incomplete).zip`.
+fn incomplete_name(dest: &Path) -> PathBuf {
+    let stem = dest.file_stem().map_or_else(|| "archive".into(), |s| s.to_string_lossy().into_owned());
+    let extension = dest.extension().map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+    (1..)
+        .map(|n| {
+            let tag = if n == 1 { "incomplete".to_string() } else { format!("incomplete {n}") };
+            dest.with_file_name(format!("{stem} ({tag}){extension}"))
+        })
+        .find(|path| fs::symlink_metadata(path).is_err())
+        .unwrap_or_else(|| dest.to_path_buf())
+}
+
 /// A name beside `target` to write a copy under before it replaces the target.
 fn temp_name(target: &Path) -> PathBuf {
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1055,8 +1333,7 @@ fn replace_with(temp: &Path, target: &Path) -> io::Result<()> {
     match fs::rename(temp, target) {
         // Windows won't replace a read-only file.
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && fs::exists(target) => {
-            make_writable(target);
-            fs::rename(temp, target)
+            without_read_only(target, || fs::rename(temp, target))
         }
         other => other,
     }
@@ -1069,26 +1346,28 @@ fn rename_over(src: &Path, dst: &Path, overwrite: bool) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if is_cross_device(&e) => Ok(false),
         Err(e) if overwrite && e.kind() == io::ErrorKind::PermissionDenied => {
-            make_writable(dst);
-            fs::rename(src, dst).map(|()| true)
+            without_read_only(dst, || fs::rename(src, dst)).map(|()| true)
         }
         Err(e) => Err(e),
     }
 }
 
-/// Clears the read-only attribute, which on Windows stops a file being deleted or replaced.
-/// Elsewhere that depends on the folder, so a file's mode is left alone.
+/// Runs `op` with the read-only attribute of `path` off, which on Windows stops a file being
+/// deleted or replaced, and puts it back if `op` failed. Elsewhere that depends on the folder,
+/// so a file's mode is left alone.
 #[allow(clippy::permissions_set_readonly_false)]
-fn make_writable(path: &Path) {
-    if cfg!(windows)
-        && let Ok(meta) = fs::symlink_metadata(path)
-    {
-        let mut permissions = meta.permissions();
-        if permissions.readonly() {
-            permissions.set_readonly(false);
-            let _ = fs::set_permissions(path, permissions);
-        }
+fn without_read_only<T>(path: &Path, op: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let original = fs::symlink_metadata(path).ok().map(|meta| meta.permissions()).filter(|p| cfg!(windows) && p.readonly());
+    if let Some(original) = &original {
+        let mut writable = original.clone();
+        writable.set_readonly(false);
+        let _ = fs::set_permissions(path, writable);
     }
+    let result = op();
+    if let (Err(_), Some(original)) = (&result, original) {
+        let _ = fs::set_permissions(path, original);
+    }
+    result
 }
 
 fn remove_dir(path: &Path) -> io::Result<()> {
@@ -1096,8 +1375,7 @@ fn remove_dir(path: &Path) -> io::Result<()> {
         if e.kind() != io::ErrorKind::PermissionDenied || !cfg!(windows) {
             return Err(e);
         }
-        make_writable(path);
-        fs::remove_dir(path)
+        without_read_only(path, || fs::remove_dir(path))
     })
 }
 
@@ -1108,8 +1386,7 @@ fn remove_file_or_link(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     if error.kind() == io::ErrorKind::PermissionDenied && cfg!(windows) {
-        make_writable(path);
-        return fs::remove_file(path);
+        return without_read_only(path, || fs::remove_file(path));
     }
     Err(error)
 }

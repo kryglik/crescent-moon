@@ -39,7 +39,7 @@ impl Hotlist {
         let Some(file) = &self.file else { return Ok(()) };
         let text: String = self.dirs.iter().map(|d| format!("{}\n", d.display())).collect();
         // Never half a hotlist, whatever happens while it is written.
-        util::write_atomically(file, &text)
+        util::write_atomically(file, &text, true)
     }
 
     /// Adds `dir` unless it is already listed; returns its position.
