@@ -22,6 +22,8 @@ pub struct Settings {
     /// In a git repository, `git status` runs now and then so the panels mark changed, new and
     /// ignored files. (The branch shows either way: it is read from the repository's files.)
     pub git_status: bool,
+    /// The colour scheme's name (see `scheme`): a built-in one, or a file in `schemes`.
+    pub scheme: String,
     /// Files bigger than this many megabytes go to the pager, and the editor asks first.
     pub big_file_mb: u64,
     /// Commands; empty means automatic (environment variables, then what is installed).
@@ -40,6 +42,7 @@ impl Default for Settings {
             arrows_navigate: true,
             natural_sort: true,
             git_status: true,
+            scheme: "classic".into(),
             big_file_mb: 10,
             editor: String::new(),
             viewer: String::new(),
@@ -93,6 +96,7 @@ impl Settings {
                 "arrows_navigate" => settings.arrows_navigate = flag(settings.arrows_navigate),
                 "natural_sort" => settings.natural_sort = flag(settings.natural_sort),
                 "git_status" => settings.git_status = flag(settings.git_status),
+                "scheme" if !value.is_empty() => settings.scheme = value.to_string(),
                 "big_file_mb" => {
                     if let Ok(mb) = value.parse::<u64>()
                         && mb > 0
@@ -120,6 +124,7 @@ impl Settings {
              arrows_navigate = {}\n\
              natural_sort = {}\n\
              git_status = {}\n\
+             scheme = {}\n\
              big_file_mb = {}\n\
              editor = {}\n\
              viewer = {}\n\
@@ -131,6 +136,7 @@ impl Settings {
             self.arrows_navigate,
             self.natural_sort,
             self.git_status,
+            self.scheme,
             self.big_file_mb,
             self.editor,
             self.viewer,
@@ -154,6 +160,7 @@ mod tests {
             confirm_quit: true,
             mouse: false,
             git_status: false,
+            scheme: "nord".into(),
             big_file_mb: 25,
             editor: r#""C:\Program Files\Neovim\bin\nvim.exe" -p"#.into(),
             ..Settings::default()
@@ -167,8 +174,10 @@ mod tests {
 
     #[test]
     fn odd_lines_are_ignored() {
-        let settings = Settings::parse("# comment\nmouse = maybe\nbig_file_mb = 0\nunknown = 1\nconfirm_quit=YES\nno equals sign\n");
+        let settings =
+            Settings::parse("# comment\nmouse = maybe\nbig_file_mb = 0\nunknown = 1\nconfirm_quit=YES\nno equals sign\nscheme =\n");
         assert!(settings.mouse, "an unreadable value keeps the default");
+        assert_eq!(settings.scheme, "classic", "an empty scheme is the default one");
         assert_eq!(settings.big_file_mb, 10, "zero is not a limit");
         assert!(settings.confirm_quit);
     }

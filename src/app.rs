@@ -24,6 +24,7 @@ use crate::options::{self, OptionsAutomatic};
 use crate::panel::{DirSize, Entry, Panel, SortBy};
 use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
+use crate::scheme::{self, Choice, Colours, Scheme};
 use crate::settings::Settings;
 use crate::sizes::Sizer;
 use crate::subshell::Subshell;
@@ -70,6 +71,10 @@ pub struct Config {
     pub settings_file: Option<PathBuf>,
     /// Folders visited and commands typed, kept between sessions; None in tests.
     pub history_file: Option<PathBuf>,
+    /// The user's colour schemes (`schemes` beside the settings); None in tests.
+    pub schemes_dir: Option<PathBuf>,
+    /// What the terminal does with colours.
+    pub colours: Colours,
     pub settings: Settings,
 }
 
@@ -83,6 +88,8 @@ impl Config {
             Err(_) => Config::new(Settings::default(), Hotlist::default_file(), None),
         };
         config.history_file = History::default_file();
+        config.schemes_dir = scheme::default_dir();
+        config.colours = Colours::detect();
         config
     }
 
@@ -107,6 +114,8 @@ impl Config {
             hotlist_file,
             settings_file,
             history_file: None,
+            schemes_dir: None,
+            colours: Colours::default(),
             settings,
         }
     }
@@ -259,6 +268,9 @@ pub struct App {
     pub tab_index: [usize; 2],
     /// `git status` of the repositories the panels are in (see `git`).
     pub git: Tracker,
+    /// The colour scheme on screen, as the terminal shows it: the one the settings name, or
+    /// while Alt+C's list is open the one under its cursor.
+    pub scheme: Scheme,
 }
 
 impl App {
@@ -269,6 +281,12 @@ impl App {
         let panels = [Panel::new(left, show_hidden), Panel::new(right, show_hidden)];
         history.visit(&panels[1].cwd);
         history.visit(&panels[0].cwd);
+        let wanted = &config.settings.scheme;
+        let (scheme, notice) = match scheme::find(wanted, config.schemes_dir.as_deref()) {
+            Some(choice) => (choice.scheme, None),
+            None => (scheme::classic(), Some(format!("There is no colour scheme \"{wanted}\"; classic for now (Alt+C picks one)"))),
+        };
+        let scheme = scheme.for_terminal(config.colours);
         App {
             mouse: config.settings.mouse,
             mouse_allowed: true,
@@ -298,7 +316,7 @@ impl App {
             history_changed: false,
             history_saved: Instant::now(),
             history_pos: None,
-            notice: None,
+            notice,
             quick_view: false,
             preview_focus: false,
             previewer: None,
@@ -310,6 +328,7 @@ impl App {
             watches: [None, None],
             tabs: [Vec::new(), Vec::new()],
             tab_index: [0, 0],
+            scheme,
         }
     }
 
@@ -662,6 +681,7 @@ impl App {
             KeyCode::Char('*') if cmd_empty && plain => self.active_panel_mut().invert_marks(),
             KeyCode::Char('a') if ctrl && !alt && cmd_empty => self.active_panel_mut().mark_all(),
             KeyCode::Char('a') if alt && !ctrl => self.open_attributes(),
+            KeyCode::Char('c') if alt && !ctrl => self.open_schemes(None),
             KeyCode::Char('w') if alt && !ctrl => self.open_worktrees(),
             KeyCode::Char('f') if ctrl && !alt => {
                 let current = self.active_panel().filter.clone().unwrap_or_default();
@@ -807,6 +827,7 @@ impl App {
             Dialog::Options { cursor, edit, settings, automatic } => {
                 self.on_options_key(&key, cursor, edit, settings, automatic)
             }
+            Dialog::Schemes { cursor, choices, back } => self.on_schemes_key(&key, cursor, choices, back),
             Dialog::Sort { side, mut cursor, current, reverse } => {
                 let last = SortBy::ALL.len() - 1;
                 let chosen = match key.code {
@@ -1051,6 +1072,12 @@ impl App {
     ) -> Option<Dialog> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let row = options::ROWS[cursor];
+        // The colour scheme is picked from Alt+C's list, which comes back here.
+        if row.is_choice() && matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+            self.open_schemes(Some(Box::new(Dialog::Options { cursor, edit, settings, automatic })));
+            return None;
+        }
+        let typed = !row.is_flag() && !row.is_choice();
         let last = options::ROWS.len() - 1;
         let close = matches!(key.code, KeyCode::Esc | KeyCode::F(10)) || (ctrl && key.code == KeyCode::Char('p'));
         let target = match key.code {
@@ -1064,10 +1091,10 @@ impl App {
         if row.is_flag() && matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
             row.toggle(&mut settings);
             self.apply_settings(settings.clone());
-        } else if !row.is_flag() && target.is_none() && !close {
+        } else if typed && target.is_none() && !close {
             edit.handle_key(key);
         }
-        if (close || target.is_some()) && !row.is_flag() {
+        if (close || target.is_some()) && typed {
             row.set_text(&mut settings, edit.text());
             self.apply_settings(settings.clone());
         }
@@ -1097,16 +1124,22 @@ impl App {
         self.apply_settings(settings.clone());
         let edit = LineEdit::new(to.text(&settings));
         if self.dialog.is_none() {
-            self.dialog = Some(Dialog::Options { cursor: i, edit, settings, automatic });
+            let options = Dialog::Options { cursor: i, edit, settings, automatic };
+            if to.is_choice() {
+                self.open_schemes(Some(Box::new(options)));
+            } else {
+                self.dialog = Some(options);
+            }
         }
     }
 
     /// Takes changed settings: saves them, and applies what can change while running
-    /// (hidden files, the mouse, commands, the big-file limit).
+    /// (hidden files, the mouse, commands, the big-file limit, the colour scheme).
     fn apply_settings(&mut self, settings: Settings) {
         if settings == self.config.settings {
             return;
         }
+        let scheme_changed = settings.scheme != self.config.settings.scheme;
         if let Some(file) = &self.config.settings_file
             && let Err(e) = settings.save(file)
         {
@@ -1123,8 +1156,112 @@ impl App {
         self.git.set_enabled(settings.git_status);
         let (hotlist_file, settings_file) = (self.config.hotlist_file.take(), self.config.settings_file.take());
         let history_file = self.config.history_file.take();
+        let (schemes_dir, colours) = (self.config.schemes_dir.take(), self.config.colours);
         self.config = Config::new(settings, hotlist_file, settings_file);
         self.config.history_file = history_file;
+        self.config.schemes_dir = schemes_dir;
+        self.config.colours = colours;
+        if scheme_changed {
+            self.scheme = self.saved_scheme();
+        }
+    }
+
+    /// The colour scheme the settings name, as the terminal shows it; classic if there is no
+    /// such scheme.
+    fn saved_scheme(&self) -> Scheme {
+        scheme::find(&self.config.settings.scheme, self.config.schemes_dir.as_deref())
+            .map_or_else(scheme::classic, |choice| choice.scheme)
+            .for_terminal(self.config.colours)
+    }
+
+    /// Alt+C: every colour scheme, the cursor on the one in use. `back` is the options editor
+    /// when it was opened from there.
+    fn open_schemes(&mut self, back: Option<Box<Dialog>>) {
+        let choices = scheme::choices(self.config.schemes_dir.as_deref());
+        let current = &self.config.settings.scheme;
+        let cursor = choices.iter().position(|c| c.name.eq_ignore_ascii_case(current)).unwrap_or(0);
+        self.dialog = Some(Dialog::Schemes { cursor, choices, back });
+    }
+
+    /// Keys in the scheme list. Moving shows the scheme under the cursor on the whole screen;
+    /// Enter keeps it (and saves it), Esc goes back to the one before; F4 opens its file in the
+    /// editor, writing a built-in one out first; a letter jumps to the next name starting
+    /// with it.
+    fn on_schemes_key(
+        &mut self,
+        key: &KeyEvent,
+        mut cursor: usize,
+        choices: Vec<Choice>,
+        back: Option<Box<Dialog>>,
+    ) -> Option<Dialog> {
+        let last = choices.len().saturating_sub(1);
+        let before = cursor;
+        match key.code {
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(last),
+            KeyCode::Home | KeyCode::PageUp => cursor = 0,
+            KeyCode::End | KeyCode::PageDown => cursor = last,
+            KeyCode::Enter => {
+                if let Some(choice) = choices.get(cursor) {
+                    self.scheme = choice.scheme.for_terminal(self.config.colours);
+                    let mut settings = self.config.settings.clone();
+                    settings.scheme = choice.name.clone();
+                    self.apply_settings(settings);
+                }
+                return self.back_from_schemes(back);
+            }
+            KeyCode::Esc | KeyCode::F(10) => {
+                self.scheme = self.saved_scheme();
+                return self.back_from_schemes(back);
+            }
+            KeyCode::F(4) => {
+                if let Some(choice) = choices.get(cursor) {
+                    match scheme::file_for(choice, self.config.schemes_dir.as_deref()) {
+                        Ok(file) => self.external = Some(External::Edit(file, None)),
+                        Err(e) => {
+                            self.scheme = self.saved_scheme();
+                            self.error(format!("Cannot write the scheme to a file:\n{e}"));
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) if dialog::is_text_input(key) => {
+                let c = c.to_lowercase().to_string();
+                let starts = |i: &usize| choices[*i].name.to_lowercase().starts_with(&c);
+                if let Some(i) = (cursor + 1..choices.len()).chain(0..=cursor).find(starts) {
+                    cursor = i;
+                }
+            }
+            _ => {}
+        }
+        if cursor != before
+            && let Some(choice) = choices.get(cursor)
+        {
+            self.scheme = choice.scheme.for_terminal(self.config.colours);
+        }
+        Some(Dialog::Schemes { cursor, choices, back })
+    }
+
+    /// Where the scheme list goes when it closes: back to the options editor if it came from
+    /// there, which then shows the scheme in use.
+    fn back_from_schemes(&self, back: Option<Box<Dialog>>) -> Option<Dialog> {
+        let mut dialog = *back?;
+        if let Dialog::Options { settings, .. } = &mut dialog {
+            settings.scheme = self.config.settings.scheme.clone();
+        }
+        Some(dialog)
+    }
+
+    /// Back from the editor with the scheme list open: the schemes are read again, and the
+    /// one under the cursor (the one edited) shown as it is now.
+    fn reload_schemes(&mut self) {
+        let Some(Dialog::Schemes { cursor, choices, .. }) = &mut self.dialog else { return };
+        let name = choices.get(*cursor).map(|c| c.name.clone()).unwrap_or_default();
+        *choices = scheme::choices(self.config.schemes_dir.as_deref());
+        *cursor = choices.iter().position(|c| c.name.eq_ignore_ascii_case(&name)).unwrap_or(0);
+        if let Some(choice) = choices.get(*cursor) {
+            self.scheme = choice.scheme.for_terminal(self.config.colours);
+        }
     }
 
     /// F9: a menu of sort orders, the cursor on the current one (so F9 F9 reverses it).
@@ -1508,7 +1645,13 @@ impl App {
         {
             self.change_dir(self.active, dir);
         }
+        // F4 in the scheme list: the file edited counts at once.
+        self.reload_schemes();
         if let Err(e) = result {
+            // The error takes the scheme list's place, so the scheme in use is back too.
+            if matches!(self.dialog, Some(Dialog::Schemes { .. })) {
+                self.scheme = self.saved_scheme();
+            }
             self.error(e);
         }
     }
@@ -3153,6 +3296,10 @@ mod tests {
         assert!(app.config.settings.git_status);
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.config.settings.git_status);
+        // The colour scheme isn't typed: letters do nothing there (Enter opens the list).
+        app.on_key(key(KeyCode::Down));
+        typing(&mut app, "x");
+        assert!(matches!(app.dialog, Some(Dialog::Options { .. })) && app.config.settings.scheme == "classic");
 
         // Text rows: type, and it counts when the cursor moves on.
         app.on_key(key(KeyCode::Down));
@@ -3174,6 +3321,137 @@ mod tests {
         let saved = Settings::load(Some(&file)).unwrap();
         assert_eq!(saved, app.config.settings);
         assert_eq!((saved.big_file_mb, saved.editor.as_str(), saved.mouse), (25, "micro", false));
+    }
+
+    /// A config whose settings (loaded from there, as rmc starts) and schemes live in `dir`.
+    fn scheme_config(dir: &Path) -> Config {
+        let rmc = dir.join("rmc");
+        let file = rmc.join("settings.ini");
+        let settings = Settings { git_status: false, ..Settings::load(Some(&file)).unwrap() };
+        Config { settings, settings_file: Some(file), schemes_dir: Some(rmc.join("schemes")), ..crate::testutil::config() }
+    }
+
+    /// Alt+C: moving through the list shows each scheme; Esc brings back the one before, Enter
+    /// keeps the one under the cursor, saved for next time.
+    #[test]
+    fn alt_c_shows_each_scheme_and_keeps_the_one_chosen() {
+        let tmp = TempDir::new("app-schemes");
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
+        assert_eq!(app.scheme, scheme::classic());
+        app.on_key(alt(KeyCode::Char('c')));
+        assert!(matches!(&app.dialog, Some(Dialog::Schemes { cursor: 0, back: None, .. })));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.scheme, scheme::built_in("dark").unwrap(), "shown at once");
+        assert_eq!(app.config.settings.scheme, "classic", "but not kept yet");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.scheme, scheme::classic());
+
+        // A letter jumps to the next name with it; Enter keeps it.
+        app.on_key(alt(KeyCode::Char('c')));
+        typing(&mut app, "n");
+        assert_eq!(app.scheme, scheme::built_in("nord").unwrap());
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.scheme, scheme::built_in("nord").unwrap());
+        assert_eq!(Settings::load(app.config.settings_file.as_deref()).unwrap().scheme, "nord");
+        // Next time rmc starts in it, with the list's cursor on it.
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
+        assert_eq!(app.scheme, scheme::built_in("nord").unwrap());
+        app.on_key(alt(KeyCode::Char('c')));
+        let Some(Dialog::Schemes { cursor, choices, .. }) = &app.dialog else { panic!("no list") };
+        assert_eq!(choices[*cursor].name, "nord");
+        // A click picks a row.
+        app.on_key(key(KeyCode::Down));
+        let hit = crate::mouse::DialogHit {
+            rows: Some((ratatui::layout::Rect::new(10, 5, 40, 13), 0)),
+            area: ratatui::layout::Rect::new(9, 4, 42, 20),
+            ..Default::default()
+        };
+        app.hit.dialog = Some(hit);
+        app.on_mouse(ratatui::crossterm::event::MouseEvent {
+            kind: ratatui::crossterm::event::MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.dialog.is_none());
+        assert_eq!((app.config.settings.scheme.as_str(), &app.scheme), ("classic", &scheme::classic()));
+    }
+
+    /// F4 in the list writes a built-in scheme out as a file and opens it in the editor; back
+    /// from there the file counts at once.
+    #[test]
+    fn f4_in_the_scheme_list_edits_a_file_that_counts_when_back() {
+        let tmp = TempDir::new("app-scheme-edit");
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
+        app.on_key(alt(KeyCode::Char('c')));
+        typing(&mut app, "n");
+        app.on_key(key(KeyCode::F(4)));
+        let file = tmp.path().join("rmc").join("schemes").join("nord.ini");
+        assert_eq!(app.external.take(), Some(External::Edit(file.clone(), None)));
+        // What the user does in the editor.
+        let text = fs::read_to_string(&file).unwrap().replace("\nheading ", "\nheading = red ;").replace("\nmarked ", "\nmarked = blu ;");
+        fs::write(&file, text).unwrap();
+        app.after_external(Ok(()), None);
+        let Some(Dialog::Schemes { cursor, choices, .. }) = &app.dialog else { panic!("the list is still open") };
+        assert_eq!((choices[*cursor].name.as_str(), choices[*cursor].file.as_deref()), ("nord", Some(file.as_path())));
+        assert_eq!(choices[*cursor].problems.len(), 1, "{:?}", choices[*cursor].problems);
+        assert_eq!(app.scheme.heading, ratatui::style::Style::new().red());
+        assert_eq!(app.scheme.marked, scheme::built_in("nord").unwrap().marked, "the line it couldn't read");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.config.settings.scheme, "nord");
+        assert_eq!(app.scheme.heading, ratatui::style::Style::new().red());
+    }
+
+    /// The options' Colour scheme row opens the list, which comes back to the options with
+    /// the scheme chosen in it.
+    #[test]
+    fn the_options_pick_a_scheme_from_the_list() {
+        let tmp = TempDir::new("app-options-scheme");
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
+        app.on_key(ctrl('p'));
+        let row = options::ROWS.iter().position(|r| r.is_choice()).unwrap();
+        for _ in 0..row {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.dialog, Some(Dialog::Schemes { back: Some(_), .. })));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Dialog::Options { cursor, settings, .. }) = &app.dialog else { panic!("not back in the options") };
+        assert_eq!((*cursor, settings.scheme.as_str()), (row, "dark"));
+        // Toggling something else there keeps the scheme.
+        app.on_key(key(KeyCode::PageUp));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.config.settings.scheme, "dark");
+        assert_eq!(app.scheme, scheme::built_in("dark").unwrap());
+        // Esc in the list goes back to the options too, with nothing changed.
+        for _ in 0..row {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(&app.dialog, Some(Dialog::Options { .. })));
+        assert_eq!(app.scheme, scheme::built_in("dark").unwrap());
+    }
+
+    /// A scheme that isn't there (a file deleted): classic, and a word about it. NO_COLOR:
+    /// mono, whatever the settings say.
+    #[test]
+    fn a_missing_scheme_is_classic_and_no_color_is_mono() {
+        let tmp = TempDir::new("app-scheme-missing");
+        let mut config = scheme_config(tmp.path());
+        config.settings.scheme = "mine".into();
+        let app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        assert_eq!(app.scheme, scheme::classic());
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("no colour scheme \"mine\"")), "{:?}", app.notice);
+        let mut config = scheme_config(tmp.path());
+        config.settings.scheme = "nord".into();
+        config.colours.off = true;
+        let app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        assert_eq!(app.scheme, scheme::mono());
     }
 
     #[test]

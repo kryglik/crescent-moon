@@ -18,6 +18,7 @@ mod options;
 mod panel;
 mod platform;
 mod preview;
+mod scheme;
 mod settings;
 mod sizes;
 mod subshell;

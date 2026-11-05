@@ -18,6 +18,10 @@ What it does differently from the Windows port of mc:
 - **Git** at a glance: a row below each panel's path with the branch, whether it is a
   worktree and what changed, a mark beside every changed, new or conflicting file (ignored
   ones dimmed), and Alt+W jumps between the repository's worktrees, into the same subfolder.
+- **Colour schemes**: Alt+C shows each one on the whole screen as you move through the list:
+  mc's classic blue, dark, the terminal's own colours, light, Nord, Gruvbox, Dracula, Tokyo
+  Night, Catppuccin, One Dark, Solarized, mono. F4 there turns one into a file of your own to
+  change. Archives, pictures, sound and video, leftovers and hidden files have colours of their own.
 - Copies and moves never put a file at risk: an overwrite only replaces the old file once the
   new one is complete, a move to another drive deletes each file only after its copy, and the
   same file under another name is recognised.
@@ -111,6 +115,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | Ctrl+P | options (see Settings) |
+| Alt+C | colour scheme: the list shows the one under the cursor on the whole screen; Enter keeps it, Esc goes back, F4 edits it as a file (see Colour schemes) |
 | F10 | quit (right away; it asks only if the option says so, or while the shell is busy) |
 | F12 | every command with its key, found by typing |
 
@@ -249,7 +254,7 @@ Click selects, double-click opens, right-click marks, the wheel scrolls the pane
 pointer. Click a column heading (Name, Size, Modify time) to sort by it, and again to flip
 the order; an arrow on the heading shows which way round it is (↑ A to Z, small to big, old
 to new). Click the F-key bar labels to run them; dialog buttons and the rows of the drive
-picker, hotlist, sort menu, folder history, worktree list, F12 list and attributes are
+picker, hotlist, sort menu, folder history, worktree list, F12 list, colour schemes and attributes are
 clickable too, as are the tabs. The wheel scrolls the quick view.
 
 While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
@@ -270,6 +275,7 @@ text row (it counts when you move off it). Everything takes effect at once and i
 | Left/Right go up and into folders | on: with an empty command line, Left is the parent folder and Right the folder under the cursor |
 | Numbers in names by value | on: "day 2" sorts before "day 10", as in Explorer |
 | Git: mark changed and new files | on: in a repository `git status` runs in the background (see Git); off, only the branch shows |
+| Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
 
@@ -307,6 +313,58 @@ function rmc {
 }
 ```
 
+## Colour schemes
+
+**Alt+C** (or the Colour scheme row of Ctrl+P, or F12 "colour") lists the schemes. Moving
+through the list shows the one under the cursor on the whole screen, panels and dialogs
+alike; **Enter** keeps it (saved in `settings.ini`), **Esc** goes back to the one before, a
+letter jumps to the next name starting with it. A click on a row keeps that one.
+
+| Scheme | Look |
+| --- | --- |
+| classic | mc's blue panels, rmc's look from the start |
+| dark | classic on black, with dimmer lines and hidden files |
+| terminal | the terminal's own background and palette, with `ls`'s colours for folders and files |
+| light | black on white, red marks (as Total Commander marks), Windows' blue cursor |
+| nord, gruvbox, dracula, tokyo-night, catppuccin, one-dark, solarized-dark, solarized-light | the well-known palettes ([Nord](https://www.nordtheme.com), [Gruvbox](https://github.com/morhetz/gruvbox) dark, [Dracula](https://draculatheme.com), [Tokyo Night](https://github.com/enkia/tokyo-night-vscode-theme), [Catppuccin](https://catppuccin.com) Mocha, Atom's One Dark, [Solarized](https://ethanschoonover.com/solarized)) |
+| mono | no colours, only bold, dim and reverse video |
+
+Files have colours by kind: folders, programs, archives (zip, 7z, tar, gz…), pictures (jpg,
+png, raw photos such as cr2, cr3, nef, arw, dng; svg…), sound and video, leftovers (`.bak`,
+`.tmp`, `.swp`, `name~`), hidden files and those git ignores. Source code and documents have
+their own parts too, plain in the built-in schemes.
+
+**F4** in the list opens the scheme in the editor as a file: a built-in one is first written
+out as `<name>.ini` in the `schemes` folder beside the settings (`%APPDATA%\rmc\schemes`,
+`~/.config/rmc/schemes`), every part spelled out with what it is, and from then on that file
+takes the built-in one's place (delete it to get the built-in one back). Back from the editor
+the list reads it again and shows it at once; a line it can't read is named under the list.
+Any other `*.ini` file there is a scheme of its own, named after the file. A line gives a
+part of the screen its look:
+
+```ini
+base = nord                     ; start from this built-in scheme (classic if none)
+description = Nord, my way      ; what the list says about it
+panel  = #d8dee9 on #2e3440     ; colour [on colour] [bold] [dim] [italic] [underline] [reverse]
+cursor = on #4c566a             ; only a background: a file keeps its own colour on the cursor
+marked = lightyellow bold
+temp   =                        ; empty: nothing special
+```
+
+A colour is `#rrggbb`, a number from 0 to 255 (the terminal's palette), `default` (the
+terminal's own), or one of the sixteen names: black, red, green, yellow, blue, magenta,
+cyan, gray, darkgray, lightred, lightgreen, lightyellow, lightblue, lightmagenta,
+lightcyan, white. A part drawn on a panel, in a dialog or on the command line has their
+background unless it names one; a file's look builds up from the panel's, its kind's,
+hidden, ignored, marked and the cursor's.
+
+Terminals that show only 256 colours (or 16) get the nearest of theirs. rmc takes any
+colour in Windows' consoles and Windows Terminal (WSL in it too), and on Linux where
+`COLORTERM=truecolor` (or `24bit`) says so. ssh doesn't pass `COLORTERM` on, so a server
+reached from Windows Terminal gets 256 colours unless its `~/.bashrc` sets
+`export COLORTERM=truecolor`. The list says what the terminal gets. With `NO_COLOR` set,
+rmc shows the mono scheme.
+
 ## Layout
 
 | File | Contents |
@@ -330,6 +388,7 @@ function rmc {
 | `src/find.rs` | the Find search: ignore + grep crates on a background thread, cancellable |
 | `src/finder.rs` | the Find window's state: fields, results sorted by path, cursor |
 | `src/settings.rs` | `settings.ini`: loading, saving |
+| `src/scheme.rs` | colour schemes: the parts of the screen, the built-in schemes, scheme files, fewer colours for terminals with fewer, files' kinds |
 | `src/survey.rs` | counting what a delete would remove, and checking permissions, in the background |
 | `src/admin.rs` | "As admin": starting the elevated helper (`rmc --admin-job`) and the helper itself |
 | `src/options.rs` | the options editor's rows |
@@ -350,8 +409,9 @@ wsl -- bash -lc 'cd /mnt/e/devel/midnight-commander && CARGO_TARGET_DIR=~/rmc-ta
 
 To check rmc itself in a Windows Terminal window, the scripts in `tools/` attach to its
 console. That works for rmc inside WSL too: give them the pid of its `wsl.exe`. A `NO_COLOR`
-variable in the environment the window inherits (some tools set it) turns rmc's colours off,
-as crossterm honours it.
+variable in the environment the window inherits (some tools set it) gives the mono scheme.
+Trying schemes there saves the one kept in `settings.ini`; point `APPDATA` (on Linux
+`XDG_CONFIG_HOME`) at another folder for the window to keep yours as they are.
 
 ```powershell
 wt -w new cmd /c rmc E:\some\dir          # then find its pid: Get-Process rmc
@@ -361,4 +421,4 @@ tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
 
 ## Not there yet
 
-Writing into archives, other archive formats (7z, rar, tar), SFTP, a user menu, themes.
+Writing into archives, other archive formats (7z, rar, tar), SFTP, a user menu.

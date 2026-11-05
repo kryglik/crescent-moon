@@ -80,6 +80,8 @@ pub struct Entry {
     pub is_link: bool,
     pub is_exec: bool,
     pub is_parent: bool,
+    /// Hidden (Windows' attribute; on Linux a name starting with a dot), shown dimmed.
+    pub is_hidden: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
     sort_name: String,
@@ -94,6 +96,7 @@ impl Entry {
             is_link: false,
             is_exec: false,
             is_parent: true,
+            is_hidden: false,
             size: 0,
             modified: fs::metadata(cwd).and_then(|m| m.modified()).ok(),
             sort_name: String::new(),
@@ -679,6 +682,7 @@ fn archive_entries(view: &ArchiveView, filter: Option<&NameFilter>) -> Vec<Entry
             is_link: false,
             is_exec: false,
             is_parent: false,
+            is_hidden: item.name().starts_with('.'),
             size: item.size,
             modified: item.modified,
             sort_name: item.name().to_lowercase(),
@@ -694,7 +698,8 @@ fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> i
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
         let own = item.metadata().ok();
-        if !show_hidden && platform::is_hidden(&name, own.as_ref()) {
+        let is_hidden = platform::is_hidden(&name, own.as_ref());
+        if !show_hidden && is_hidden {
             continue;
         }
         let is_link = own.as_ref().is_some_and(|m| m.file_type().is_symlink());
@@ -716,6 +721,7 @@ fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> i
             is_dir,
             is_link,
             is_parent: false,
+            is_hidden,
         });
     }
     Ok(out)

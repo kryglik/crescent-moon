@@ -285,6 +285,7 @@ impl App {
                         Dialog::History { cursor, .. } | Dialog::Commands { cursor, .. } | Dialog::Worktrees { cursor, .. },
                     ) if i < list_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
+                    Some(Dialog::Schemes { cursor, choices, .. }) if i < choices.len() => *cursor = i,
                     _ => return,
                 }
                 self.on_key(KeyEvent::from(KeyCode::Enter));
@@ -305,6 +306,7 @@ impl App {
                             | Dialog::History { .. }
                             | Dialog::Commands { .. }
                             | Dialog::Worktrees { .. }
+                            | Dialog::Schemes { .. }
                             | Dialog::Attributes { .. }
                             | Dialog::Sort { .. }
                             | Dialog::Options { .. }

@@ -23,6 +23,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::options::{self, OptionsAutomatic};
 use crate::panel::{Entry, Panel, SortBy};
 use crate::preview::{Content, Preview};
+use crate::scheme::{self, Choice, Colours, Scheme};
 use crate::settings::Settings;
 use crate::platform::DriveInfo;
 use crate::subshell::Subshell;
@@ -30,18 +31,12 @@ use crate::util;
 
 pub const KEYS: [&str; 10] =["Help", "Rename", "View", "Edit", "Copy", "Move", "Mkdir", "Delete", "Sort", "Quit"];
 
-fn panel_style() -> Style {
-    Style::new().fg(Color::Gray).bg(Color::Blue)
+/// A dialog's own colours: an error's, or a dialog's.
+fn dialog_base(t: &Scheme, error: bool) -> Style {
+    if error { t.error } else { t.dialog }
 }
 
-fn cursor_style() -> Style {
-    Style::new().fg(Color::Black).bg(Color::Cyan)
-}
-
-fn dialog_style(error: bool) -> Style {
-    if error { Style::new().fg(Color::White).bg(Color::Red) } else { Style::new().fg(Color::Black).bg(Color::Gray) }
-}
-
+/// Draws everything in the colour scheme `app.scheme` (called `t` below).
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     // The shell's screen always matches the terminal, shown or not, so its output wraps right.
@@ -49,12 +44,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(shell) = app.subshell.as_mut() {
         shell.resize(area.height, area.width);
     }
+    let t = &app.scheme;
     if app.shell_shown
         && let Some(shell) = &app.subshell
     {
         if area.width > 0
             && area.height > 0
-            && let Some(cursor) = draw_shell(frame.buffer_mut(), area, shell)
+            && let Some(cursor) = draw_shell(frame.buffer_mut(), area, shell, t)
         {
             frame.set_cursor_position(cursor);
         }
@@ -65,7 +61,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.hit = HitAreas::default();
         let text = util::take_width("rmc: the window is too small", area.width as usize);
         if area.height > 0 {
-            frame.buffer_mut().set_string(area.x, area.y, text, Style::new().fg(Color::Yellow));
+            frame.buffer_mut().set_string(area.x, area.y, text, t.notice);
         }
         return;
     }
@@ -78,7 +74,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let [tabs_area, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(panels_area);
         let halves: [Rect; 2] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(tabs_area);
         for (side, rect) in halves.into_iter().enumerate() {
-            hit.tabs[side] = draw_tabs(frame.buffer_mut(), rect, &app.tab_names(side), app.tab_index[side], side == app.active);
+            hit.tabs[side] = draw_tabs(frame.buffer_mut(), rect, &app.tab_names(side), app.tab_index[side], side == app.active, t);
         }
         rest
     } else {
@@ -91,29 +87,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     for (side, rect) in [left, right].into_iter().enumerate() {
         if app.quick_view && side != active {
             let preview = app.previewer.as_ref().and_then(|p| p.current.as_ref());
-            let inner = draw_quick_view(frame.buffer_mut(), rect, preview, app.preview_focus);
+            let inner = draw_quick_view(frame.buffer_mut(), rect, preview, app.preview_focus, t);
             app.preview_rows = inner.height as usize;
             hit.preview = Some(rect);
             continue;
         }
         let query = if side == active { search.as_deref() } else { None };
-        let (cursor, panel_hit) = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query, &app.git);
+        let (cursor, panel_hit) = draw_panel(frame.buffer_mut(), rect, &mut app.panels[side], side == active, query, &app.git, t);
         hit.panels[side] = panel_hit;
         search_cursor = search_cursor.or(cursor);
     }
     let cmd_cursor = draw_cmdline(frame, cmd_area, app);
-    draw_keybar(frame.buffer_mut(), keys_area);
+    draw_keybar(frame.buffer_mut(), keys_area, t);
 
     let mut find_cursor = None;
     if app.find_shown
         && let Some(finder) = app.finder.as_mut()
     {
-        let (cursor, rows) = draw_find(frame.buffer_mut(), panels_area, finder);
+        let (cursor, rows) = draw_find(frame.buffer_mut(), panels_area, finder, t);
         find_cursor = Some(cursor);
         hit.find = Some(rows);
     }
     if let Some(job) = &app.job {
-        draw_progress(frame, area, job);
+        draw_progress(frame, area, job, t);
     }
     // Help can't scroll past its end (or keys up would first have to undo the excess).
     if let Some(Dialog::Help { scroll }) = &mut app.dialog {
@@ -122,23 +118,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(Dialog::History { filter, cursor }) = &app.dialog {
         let rows: Vec<String> = app.history_rows(filter.text()).iter().map(|d| d.display().to_string()).collect();
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Folder history", &rows, filter, *cursor, HISTORY_HINT);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Folder history", &rows, filter, *cursor, HISTORY_HINT, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Commands { filter, cursor }) = &app.dialog {
         let commands = dialog::matching_commands(filter.text());
         let label_w = commands.iter().map(|c| util::width(c.label)).max().unwrap_or(0);
         let rows: Vec<String> = commands.iter().map(|c| format!("{}  {}", util::pad(c.label, label_w), c.keys)).collect();
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Commands", &rows, filter, *cursor, COMMANDS_HINT);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Commands", &rows, filter, *cursor, COMMANDS_HINT, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Worktrees { filter, cursor, worktrees, here }) = &app.dialog {
         let rows = worktree_rows(&dialog::worktree_rows(worktrees, filter.text()), here);
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Git worktrees", &rows, filter, *cursor, WORKTREES_HINT);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Git worktrees", &rows, filter, *cursor, WORKTREES_HINT, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
+    } else if let Some(Dialog::Schemes { cursor, choices, .. }) = &app.dialog {
+        let current = &app.config.settings.scheme;
+        hit.dialog = Some(draw_schemes(frame, area, choices, *cursor, current, app.config.colours, t));
     } else if let Some(dialog) = &app.dialog {
-        let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist, app.config.settings_file.as_deref());
+        let (cursor, dialog_hit) = draw_dialog(frame, area, dialog, &app.hotlist, app.config.settings_file.as_deref(), t);
         if let Some(position) = cursor {
             frame.set_cursor_position(position);
         }
@@ -154,11 +153,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// The Find window over both panels: the Text and Files fields, a hint, the results (each
 /// file, then its lines with the matches marked) and a status line. Returns the text cursor
 /// and the result rows' area with the first row shown, for the mouse.
-fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (Rect, usize)) {
-    let base = panel_style();
+fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder, t: &Scheme) -> (Position, (Rect, usize)) {
+    let base = t.panel;
+    let frame = t.on_panel(t.frame);
     let inner_w = area.width.saturating_sub(2) as usize;
     let title = format!(" Find in {} ", util::fit_left(&finder.root.display().to_string(), inner_w.saturating_sub(12)));
-    let block = Block::bordered().border_style(base).style(base).title(Line::from(Span::styled(title, cursor_style())));
+    let block = Block::bordered().border_style(frame).style(base).title(Line::from(Span::styled(title, t.on_panel(t.title_active))));
     let inner = block.inner(area);
     block.render(area, buf);
     let fallback = (Position::new(inner.x, inner.y), (Rect::default(), 0));
@@ -166,8 +166,9 @@ fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (R
         return fallback;
     }
     let width = inner.width as usize;
-    let grey = base.fg(Color::Gray).add_modifier(Modifier::DIM);
-    let field_style = Style::new().fg(Color::Black).bg(Color::Gray);
+    let grey = t.on_panel(t.dim);
+    let label_style = t.on_panel(t.heading);
+    let cursor_style = t.on_panel(t.cursor);
 
     // The two fields.
     let mut cursor = Position::new(inner.x, inner.y);
@@ -178,8 +179,8 @@ fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (R
         let field_w = width.saturating_sub(label.len());
         let (text, column) = edit.view(field_w.saturating_sub(1));
         let focused = finder.field == field;
-        buf.set_string(inner.x, y, label, base.fg(Color::Yellow));
-        let style = if focused { cursor_style() } else { field_style };
+        buf.set_string(inner.x, y, label, label_style);
+        let style = if focused { t.on_panel(t.input) } else { t.dialog };
         buf.set_string(inner.x + label.len() as u16, y, util::pad(&text, field_w), style);
         if focused {
             cursor = Position::new(inner.x + (label.len() + column) as u16, y);
@@ -191,14 +192,14 @@ fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (R
         "regex, smart case · skips ignored, hidden and binary files (Alt+U: all) · Tab: Files"
     };
     buf.set_string(inner.x, inner.y + 2, util::fit(hint, width), grey);
-    buf.set_string(area.x, inner.y + 3, "├", base);
-    buf.set_string(inner.x, inner.y + 3, "─".repeat(width), base);
-    buf.set_string(area.right() - 1, inner.y + 3, "┤", base);
+    buf.set_string(area.x, inner.y + 3, "├", frame);
+    buf.set_string(inner.x, inner.y + 3, "─".repeat(width), frame);
+    buf.set_string(area.right() - 1, inner.y + 3, "┤", frame);
 
     // The results.
     let list = Rect::new(inner.x, inner.y + 4, inner.width, inner.height - 5);
     finder.ensure_visible(list.height as usize);
-    let mark = Style::new().fg(Color::Black).bg(Color::Yellow);
+    let mark = t.on_panel(t.found_text);
     for i in 0..list.height as usize {
         let y = list.y + i as u16;
         let index = finder.offset + i;
@@ -208,13 +209,14 @@ fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (R
                 let file = &finder.files[f];
                 let name = format!("{}{}", finder.shown_path(f), if file.is_dir { "/" } else { "" });
                 let count = if file.hits.is_empty() { String::new() } else { format!(" {}", file.hits.len()) };
-                let style = if on_cursor { cursor_style() } else { base.fg(Color::LightCyan).add_modifier(Modifier::BOLD) };
+                let found = t.on_panel(t.found_file);
+                let style = if on_cursor { found.patch(t.cursor) } else { found };
                 let name_w = width.saturating_sub(util::width(&count));
                 Line::from(vec![Span::styled(util::fit_left(&name, name_w), style), Span::styled(count, style)])
             }
             Some(Row::Hit(f, h)) => {
                 let hit = &finder.files[f].hits[h];
-                let style = if on_cursor { cursor_style() } else { base };
+                let style = if on_cursor { cursor_style } else { base };
                 let number = format!("{:>6}: ", hit.number);
                 let mut spans = vec![Span::styled(number.clone(), if on_cursor { style } else { grey })];
                 spans.extend(marked_spans(&hit.text, &hit.ranges, width.saturating_sub(number.len()), style, mark));
@@ -223,14 +225,14 @@ fn draw_find(buf: &mut Buffer, area: Rect, finder: &mut Finder) -> (Position, (R
             None => Line::default(),
         };
         // The cursor bar spans the whole row; the spans (and their marks) go on top of it.
-        let row_style = if on_cursor && line.width() > 0 { cursor_style() } else { base };
+        let row_style = if on_cursor && line.width() > 0 { cursor_style } else { base };
         buf.set_string(list.x, y, " ".repeat(width), row_style);
         buf.set_line(list.x, y, &line, list.width);
     }
 
     // The status line.
     let status = find_status(finder);
-    buf.set_string(inner.x, inner.bottom() - 1, util::pad(&util::fit(&status, width), width), base.fg(Color::Yellow));
+    buf.set_string(inner.x, inner.bottom() - 1, util::pad(&util::fit(&status, width), width), label_style);
     (cursor, (list, finder.offset))
 }
 
@@ -295,25 +297,28 @@ fn draw_panel(
     active: bool,
     search: Option<&str>,
     git: &Tracker,
+    t: &Scheme,
 ) -> (Option<Position>, PanelHit) {
-    let base = panel_style();
+    let base = t.panel;
+    let frame = t.on_panel(t.frame);
     let inner_w = area.width.saturating_sub(2) as usize;
     // The filter (Ctrl+F) after the path, so hidden files are never a mystery.
     let filter = panel.filter.as_deref().map(|f| format!("[{f}] ")).unwrap_or_default();
     // In an archive, the path through it (E:\x\photos.zip\2024).
     let path = util::fit_left(&panel.location().display().to_string(), inner_w.saturating_sub(4 + util::width(&filter)));
-    let title_style = if active { cursor_style() } else { base };
+    let title_style = t.on_panel(if active { t.title_active } else { t.title });
     let mut title = vec![Span::styled(format!(" {path} "), title_style)];
     if !filter.is_empty() {
-        title.push(Span::styled(filter, base.fg(Color::Yellow)));
+        title.push(Span::styled(filter, t.on_panel(t.heading)));
     }
-    let mut block = Block::bordered().border_style(base).style(base).title(Line::from(title));
+    let mut block = Block::bordered().border_style(frame).style(base).title(Line::from(title));
     // Free space on the bottom line.
     if let Some((free, total)) = panel.space {
         let percent = free.saturating_mul(100) / total.max(1);
         let text = format!(" {} / {} ({percent}%) ", util::human_size(free), util::human_size(total));
         if util::width(&text) + 2 < inner_w {
-            block = block.title_bottom(Line::from(text).right_aligned());
+            // In the panel's text colour: on the border it would take the frame's, often dim.
+            block = block.title_bottom(Line::from(Span::styled(text, base)).right_aligned());
         }
     }
     let inner = block.inner(area);
@@ -327,7 +332,7 @@ fn draw_panel(
     let status = repo.as_ref().and_then(|repo| git.status(&repo.root));
     let git_row = repo.as_ref().filter(|_| inner.height >= 7);
     if let Some(repo) = git_row {
-        buf.set_line(inner.x, inner.y, &git_line(repo, status, inner_w), inner.width);
+        buf.set_line(inner.x, inner.y, &git_line(repo, status, inner_w, t), inner.width);
     }
     // The column headings' row, the list below it.
     let top = inner.y + u16::from(git_row.is_some());
@@ -351,16 +356,16 @@ fn draw_panel(
 
     // Column headings, with the sort indicator in the corner like mc, and an arrow on the
     // sorted column: ↑ for A to Z (small to big, old to new), ↓ the other way.
-    let heading = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let heading = t.on_panel(t.heading);
     buf.set_string(inner.x, top, panel.sort.indicator(), base);
     let arrow = if panel.sort.descending(panel.reverse) { "↓" } else { "↑" };
     let title = |text: &str, sorted: bool| if sorted { format!("{text}{arrow}") } else { text.to_string() };
     let by_name = matches!(panel.sort, SortBy::Name | SortBy::Extension);
     buf.set_string(inner.x + 2, top, util::center(&title("Name", by_name), name_w.saturating_sub(2)), heading);
     if details {
-        buf.set_string(size_x - 1, top, "│", base);
+        buf.set_string(size_x - 1, top, "│", frame);
         buf.set_string(size_x, top, util::center(&title("Size", panel.sort == SortBy::Size), size_w), heading);
-        buf.set_string(time_x - 1, top, "│", base);
+        buf.set_string(time_x - 1, top, "│", frame);
         let time = title("Modify time", panel.sort == SortBy::Time);
         buf.set_string(time_x, top, util::center(&time, time_w), heading);
     }
@@ -377,7 +382,7 @@ fn draw_panel(
             _ => None,
         };
         let ignored = matches!(git_mark, Some((Mark::Ignored, _)));
-        let style = entry_style(entry, marked, on_cursor, ignored);
+        let style = entry_style(entry, marked, on_cursor, ignored, t);
         let (name, size, time) = match entry {
             Some(e) => (
                 format!("{}{}", prefix(e), e.name),
@@ -389,14 +394,14 @@ fn draw_panel(
         buf.set_string(inner.x, y, util::fit(&name, name_w - mark_w), style);
         if mark_w == 1 {
             let (symbol, mark_style) = match git_mark {
-                Some((mark, inside)) if mark != Mark::Ignored => git_symbol(mark, inside),
+                Some((mark, inside)) if mark != Mark::Ignored => git_symbol(mark, inside, t),
                 _ => (" ", base),
             };
             let mark_style = if on_cursor { style } else { mark_style };
             buf.set_string(inner.x + (name_w - 1) as u16, y, symbol, mark_style);
         }
         if details {
-            let separator = if on_cursor { style } else { base };
+            let separator = if on_cursor { style } else { frame };
             buf.set_string(size_x - 1, y, "│", separator);
             buf.set_string(size_x, y, util::pad_left(&size, size_w), style);
             buf.set_string(time_x - 1, y, "│", separator);
@@ -406,9 +411,9 @@ fn draw_panel(
 
     // Separator line joined to the frame, with the marked-files summary on it.
     let sep_y = top + 1 + list_h as u16;
-    buf.set_string(area.x, sep_y, "├", base);
-    buf.set_string(inner.x, sep_y, "─".repeat(inner_w), base);
-    buf.set_string(area.right() - 1, sep_y, "┤", base);
+    buf.set_string(area.x, sep_y, "├", frame);
+    buf.set_string(inner.x, sep_y, "─".repeat(inner_w), frame);
+    buf.set_string(area.right() - 1, sep_y, "┤", frame);
     let summary = match (panel.marked_summary(), panel.total()) {
         (Some((count, bytes)), _) => {
             Some(format!(" {} in {count} item{} ", util::human_size(bytes), if count == 1 { "" } else { "s" }))
@@ -426,7 +431,7 @@ fn draw_panel(
     let status_y = sep_y + 1;
     if let Some(query) = search {
         let text = format!("Search: {query}");
-        buf.set_string(inner.x, status_y, util::fit(&text, inner_w), cursor_style());
+        buf.set_string(inner.x, status_y, util::fit(&text, inner_w), t.on_panel(t.input));
         let x = util::width(&text).min(inner_w.saturating_sub(1)) as u16;
         return (Some(Position::new(inner.x + x, status_y)), hit);
     }
@@ -448,21 +453,21 @@ fn draw_panel(
 }
 
 /// A side's tabs, `1:photos 2:Downloads …`, the shown one lit up. Returns each tab's place.
-fn draw_tabs(buf: &mut Buffer, area: Rect, names: &[String], shown: usize, active: bool) -> Vec<(Rect, usize)> {
+fn draw_tabs(buf: &mut Buffer, area: Rect, names: &[String], shown: usize, active: bool, t: &Scheme) -> Vec<(Rect, usize)> {
     let mut places = Vec::new();
     let mut x = area.x;
-    buf.set_string(area.x, area.y, " ".repeat(area.width as usize), Style::new().bg(Color::Black));
+    buf.set_string(area.x, area.y, " ".repeat(area.width as usize), t.tab_bar);
     for (i, name) in names.iter().enumerate() {
         let label = format!(" {}:{} ", i + 1, util::take_width(name, 18));
         let width = util::width(&label) as u16;
         if x + width > area.right() {
             break;
         }
-        let style = match (i == shown, active) {
-            (true, true) => cursor_style(),
-            (true, false) => panel_style().fg(Color::White),
-            (false, _) => Style::new().fg(Color::Gray).bg(Color::DarkGray),
-        };
+        let style = t.tab_bar.patch(match (i == shown, active) {
+            (true, true) => t.title_active,
+            (true, false) => t.tab_shown,
+            (false, _) => t.tab,
+        });
         buf.set_string(x, area.y, &label, style);
         places.push((Rect::new(x, area.y, width, 1), i));
         x += width + 1;
@@ -471,17 +476,18 @@ fn draw_tabs(buf: &mut Buffer, area: Rect, names: &[String], shown: usize, activ
 }
 
 /// Ctrl+Q: the other panel shows what is under the cursor. Returns the area of its text.
-fn draw_quick_view(buf: &mut Buffer, area: Rect, preview: Option<&Preview>, focused: bool) -> Rect {
-    let base = panel_style();
-    let grey = base.fg(Color::DarkGray);
+fn draw_quick_view(buf: &mut Buffer, area: Rect, preview: Option<&Preview>, focused: bool, t: &Scheme) -> Rect {
+    let base = t.panel;
+    let grey = t.on_panel(t.dim);
+    let bright = t.on_panel(t.directory);
     let inner_w = area.width.saturating_sub(2) as usize;
     let name = preview.and_then(|p| p.key.path.file_name()).map(|n| n.to_string_lossy().into_owned());
     let title = format!(" Quick view{} ", name.map(|n| format!(": {n}")).unwrap_or_default());
     let title = util::take_width(&title, inner_w.saturating_sub(2)).to_string();
     let mut block = Block::bordered()
-        .border_style(base)
+        .border_style(t.on_panel(t.frame))
         .style(base)
-        .title(Line::from(Span::styled(title, if focused { cursor_style() } else { base })));
+        .title(Line::from(Span::styled(title, t.on_panel(if focused { t.title_active } else { t.title }))));
     let info = preview.map(|p| preview_info(p)).unwrap_or_default();
     if !info.is_empty() && util::width(&info) + 4 < inner_w {
         block = block.title_bottom(Line::from(format!(" {info} ")).right_aligned());
@@ -510,7 +516,7 @@ fn draw_quick_view(buf: &mut Buffer, area: Rect, preview: Option<&Preview>, focu
             }
         }
         Content::Picture { format, width: w, height: h } => {
-            put(&format!("{format} picture"), base.fg(Color::White));
+            put(&format!("{format} picture"), bright);
             let megapixels = f64::from(*w) * f64::from(*h) / 1_000_000.0;
             put(&format!("{w} × {h} pixels ({megapixels:.1} megapixels)"), base);
         }
@@ -523,10 +529,10 @@ fn draw_quick_view(buf: &mut Buffer, area: Rect, preview: Option<&Preview>, focu
                     util::thousands(*files as u64),
                     util::human_size(*bytes)
                 ),
-                base.fg(Color::White),
+                bright,
             );
             for (name, is_dir) in names.iter().skip(preview.scroll).take(rows.saturating_sub(1)) {
-                let style = if *is_dir { base.fg(Color::White) } else { base };
+                let style = if *is_dir { bright } else { base };
                 put(&format!("{}{name}", if *is_dir { "/" } else { " " }), style);
             }
         }
@@ -548,7 +554,7 @@ fn preview_info(preview: &Preview) -> String {
 }
 
 /// The persistent shell, full screen. Returns its cursor (none while scrolled back).
-fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell) -> Option<Position> {
+fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell, t: &Scheme) -> Option<Position> {
     // Until the shell writes anything, say what's happening instead of showing a blank screen.
     if let Some(waiting) = shell.starting_for() {
         let seconds = waiting.as_secs();
@@ -566,7 +572,7 @@ fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell) -> Option<Position
             let y = top + i as u16;
             if y < area.bottom() {
                 let text = util::center(line, area.width as usize);
-                buf.set_string(area.x, y, text, Style::new().fg(if i == 0 { Color::Yellow } else { Color::Gray }));
+                buf.set_string(area.x, y, text, if i == 0 { t.notice } else { t.dim });
             }
         }
         return None;
@@ -589,8 +595,7 @@ fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell) -> Option<Position
             if scrolled > 0 {
                 let note = format!(" ↑ {scrolled} lines back · Shift+PgDn or any key returns ");
                 let w = util::width(&note).min(area.width as usize) as u16;
-                let style = Style::new().fg(Color::Black).bg(Color::Yellow);
-                buf.set_string(area.right() - w, area.y, util::take_width(&note, w as usize), style);
+                buf.set_string(area.right() - w, area.y, util::take_width(&note, w as usize), t.found_text);
                 return None;
             }
             if screen.hide_cursor() {
@@ -654,14 +659,13 @@ fn size_text(panel: &Panel, entry: &Entry) -> String {
 
 /// The mark beside a name in a repository: what happened to the file (M changed, A added, R
 /// renamed, ? untracked, ! conflict), or `•` for a folder with changes inside; in its colour.
-fn git_symbol(mark: Mark, inside: bool) -> (&'static str, Style) {
-    let base = panel_style();
-    let style = match mark {
-        Mark::Conflict => base.fg(Color::LightRed).add_modifier(Modifier::BOLD),
-        Mark::Modified => base.fg(Color::Yellow),
-        Mark::Added | Mark::Renamed | Mark::Untracked => base.fg(Color::LightGreen),
-        Mark::Ignored => base.fg(Color::DarkGray),
-    };
+fn git_symbol(mark: Mark, inside: bool, t: &Scheme) -> (&'static str, Style) {
+    let style = t.on_panel(match mark {
+        Mark::Conflict => t.git_conflict,
+        Mark::Modified => t.git_changed,
+        Mark::Added | Mark::Renamed | Mark::Untracked => t.git_new,
+        Mark::Ignored => t.git_ignored,
+    });
     let symbol = match mark {
         _ if inside => "•",
         Mark::Conflict => "!",
@@ -687,34 +691,34 @@ fn branch_name(repo: &Repo, status: Option<&Status>) -> String {
 /// (cyan in a linked worktree), an operation under way, commits ahead/behind, "worktree", and
 /// how many files are in conflict, changed or untracked. ` main ↑1 · 3 changed · 1 untracked`,
 /// then the counts as signs (` main ↑1 ~3 ?1`), without them, and the branch cut short last.
-fn git_line(repo: &Repo, status: Option<&Status>, room: usize) -> Line<'static> {
-    let base = panel_style();
-    let colour = if repo.linked { Color::LightCyan } else { Color::White };
+fn git_line(repo: &Repo, status: Option<&Status>, room: usize, t: &Scheme) -> Line<'static> {
+    let base = t.panel;
+    let branch_style = t.on_panel(if repo.linked { t.git_worktree } else { t.git_branch });
     let branch = branch_name(repo, status);
-    let name = |text: String| vec![Span::styled(" ", base), Span::styled(text, base.fg(colour).add_modifier(Modifier::BOLD))];
+    let name = |text: String| vec![Span::styled(" ", base), Span::styled(text, branch_style)];
     let mut bare = name(branch.clone());
     if let Some(state) = &repo.state {
-        bare.push(Span::styled(format!(" {state}"), base.fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        bare.push(Span::styled(format!(" {state}"), t.on_panel(t.git_state)));
     }
     let mut head = bare.clone();
     if let Some((ahead, behind)) = status.and_then(|s| s.ahead_behind) {
         let arrows: String =
             [(ahead, "↑"), (behind, "↓")].into_iter().filter(|(n, _)| *n > 0).map(|(n, arrow)| format!("{arrow}{n}")).collect();
         if !arrows.is_empty() {
-            head.push(Span::styled(format!(" {arrows}"), base.fg(Color::White)));
+            head.push(Span::styled(format!(" {arrows}"), t.on_panel(t.git_branch)));
         }
     }
     let mut worktree = head.clone();
     if repo.linked {
-        worktree.extend([Span::styled(" ·", base), Span::styled(" worktree", base.fg(Color::LightCyan))]);
+        worktree.extend([Span::styled(" · ", base), Span::styled("worktree", t.on_panel(t.git_worktree))]);
     }
     // How many, in words, as a sign, and in what colour; conflicts first, as they need you.
     let counts: Vec<(usize, String, &str, Style)> = status.map_or_else(Vec::new, |s| {
         let plural = if s.conflicts == 1 { "" } else { "s" };
         let counts = [
-            (s.conflicts, format!("{} conflict{plural}", s.conflicts), "!", base.fg(Color::LightRed).add_modifier(Modifier::BOLD)),
-            (s.changed, format!("{} changed", s.changed), "~", base.fg(Color::Yellow)),
-            (s.untracked, format!("{} untracked", s.untracked), "?", base.fg(Color::LightGreen)),
+            (s.conflicts, format!("{} conflict{plural}", s.conflicts), "!", t.on_panel(t.git_conflict)),
+            (s.changed, format!("{} changed", s.changed), "~", t.on_panel(t.git_changed)),
+            (s.untracked, format!("{} untracked", s.untracked), "?", t.on_panel(t.git_new)),
         ];
         counts.into_iter().filter(|(n, ..)| *n > 0).collect()
     });
@@ -733,28 +737,34 @@ fn git_line(repo: &Repo, status: Option<&Status>, room: usize) -> Line<'static> 
         .unwrap_or_else(|| if room >= 3 { Line::from(name(format!("{}…", util::take_width(&branch, room - 2)))) } else { Line::default() })
 }
 
-fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool, ignored: bool) -> Style {
-    let fg = match entry {
-        _ if marked => Color::Yellow,
-        // Ignored by git (target, .venv): dimmed, as editors show them.
-        _ if ignored => Color::DarkGray,
-        Some(e) if e.is_dir => Color::White,
-        Some(e) if e.is_exec => Color::LightGreen,
-        _ => Color::Gray,
-    };
-    // Folders stand out by their brighter white and the "/" before the name; only marked
-    // entries are bold.
-    let mut style = Style::new().fg(fg).bg(Color::Blue);
+/// A file's look: the panel's, its kind's (folder, program, archive…), dimmed when hidden or
+/// ignored by git (target, .venv, as editors show them), marked, the cursor on top.
+fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool, ignored: bool, t: &Scheme) -> Style {
+    let mut style = t.panel;
+    if let Some(entry) = entry {
+        style = style.patch(match entry {
+            e if e.is_dir => t.directory,
+            e if e.is_exec => t.executable,
+            e => scheme::kind_of(&e.name).map_or_else(Style::new, |kind| t.kind(kind)),
+        });
+        if entry.is_hidden {
+            style = style.patch(t.hidden);
+        }
+    }
+    if ignored {
+        style = style.patch(t.git_ignored);
+    }
     if marked {
-        style = style.add_modifier(Modifier::BOLD);
+        style = style.patch(t.marked);
     }
     if on_cursor {
-        style = style.bg(Color::Cyan).fg(if marked { Color::Yellow } else { Color::Black });
+        style = style.patch(if marked { t.marked_cursor } else { t.cursor });
     }
     style
 }
 
 fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
+    let t = &app.scheme;
     let cwd = app.active_panel().cwd.display().to_string();
     let prompt = format!("{}>", util::fit_left(&cwd, (area.width as usize / 3).max(10)));
     let prompt_w = util::width(&prompt) + 1;
@@ -765,13 +775,14 @@ fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
     if app.cmdline.is_empty()
         && let Some(notice) = &app.notice
     {
-        spans.push(Span::styled(util::take_width(notice, room).to_string(), Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(util::take_width(notice, room).to_string(), t.on_bar(t.notice)));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(t.command_line), area);
     Position::new(area.x + (prompt_w + cursor) as u16, area.y)
 }
 
-fn draw_keybar(buf: &mut Buffer, area: Rect) {
+fn draw_keybar(buf: &mut Buffer, area: Rect, t: &Scheme) {
+    buf.set_style(area, t.command_line);
     let slot = area.width / KEYS.len() as u16;
     for (i, label) in KEYS.iter().enumerate() {
         let x = area.x + slot * i as u16;
@@ -780,8 +791,8 @@ fn draw_keybar(buf: &mut Buffer, area: Rect) {
         if w <= number.len() {
             continue;
         }
-        buf.set_string(x, area.y, &number, Style::new().fg(Color::White));
-        buf.set_string(x + number.len() as u16, area.y, util::fit(label, w - number.len()), cursor_style());
+        buf.set_string(x, area.y, &number, t.on_bar(t.key_number));
+        buf.set_string(x + number.len() as u16, area.y, util::fit(label, w - number.len()), t.on_bar(t.key_label));
     }
 }
 
@@ -796,10 +807,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Clears a centred box and draws a dialog frame; returns the box and the area inside it.
-fn dialog_frame(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str, error: bool) -> (Rect, Rect) {
+fn dialog_frame(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str, error: bool, t: &Scheme) -> (Rect, Rect) {
     let rect = centered(area, width, height);
-    let style = dialog_style(error);
-    let title_style = if error { style.add_modifier(Modifier::BOLD) } else { style.fg(Color::Blue) };
+    let style = dialog_base(t, error);
+    let title_style = style.patch(if error { t.error_title } else { t.dialog_title });
     let block = Block::bordered()
         .style(style)
         .padding(Padding::horizontal(1))
@@ -812,7 +823,7 @@ fn dialog_frame(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &
 
 /// The buttons centred in `width` columns (by hand, so their positions are known exactly),
 /// and each button's offset and width for the mouse.
-fn buttons_line(buttons: &[Button], focus: usize, base: Style, width: u16) -> (Line<'static>, Vec<(u16, u16)>) {
+fn buttons_line(buttons: &[Button], focus: usize, base: Style, width: u16, t: &Scheme) -> (Line<'static>, Vec<(u16, u16)>) {
     let widths: Vec<u16> = buttons.iter().map(|b| util::width(b.label) as u16 + 4).collect();
     let total = widths.iter().sum::<u16>() + widths.len().saturating_sub(1) as u16;
     let mut x = width.saturating_sub(total) / 2;
@@ -825,7 +836,7 @@ fn buttons_line(buttons: &[Button], focus: usize, base: Style, width: u16) -> (L
         }
         places.push((x, widths[i]));
         x += widths[i];
-        let style = if i == focus { cursor_style() } else { base };
+        let style = if i == focus { base.patch(t.dialog_focus) } else { base };
         let hot = button.label.char_indices().find(|(_, c)| c.eq_ignore_ascii_case(&button.hotkey));
         spans.push(Span::styled("[ ", style));
         match hot {
@@ -851,17 +862,18 @@ fn draw_message(
     buttons: &[Button],
     focus: usize,
     error: bool,
+    t: &Scheme,
 ) -> DialogHit {
     let widest = lines.iter().map(|l| util::width(l)).max().unwrap_or(0).max(util::width(title) + 4);
     // At least 34 wide, but never wider than the screen (clamp would panic on a narrow one).
     let width = (widest as u16 + 4).max(34).min(area.width.saturating_sub(4).max(10));
     let height = lines.len() as u16 + 4;
-    let (outer, inner) = dialog_frame(frame, area, width, height, title, error);
-    let style = dialog_style(error);
+    let (outer, inner) = dialog_frame(frame, area, width, height, title, error, t);
+    let style = dialog_base(t, error);
     let mut text: Vec<Line> = lines.iter().map(|l| Line::from(util::fit_left(l, inner.width as usize))).collect();
     text.push(Line::default());
     let button_y = inner.y + text.len() as u16;
-    let (line, places) = buttons_line(buttons, focus, style, inner.width);
+    let (line, places) = buttons_line(buttons, focus, style, inner.width, t);
     text.push(line);
     frame.render_widget(Paragraph::new(text).style(style), inner);
     let buttons = if button_y < inner.bottom() {
@@ -880,64 +892,126 @@ fn draw_dialog(
     dialog: &Dialog,
     hotlist: &Hotlist,
     settings_file: Option<&std::path::Path>,
+    t: &Scheme,
 ) -> (Option<Position>, DialogHit) {
     match dialog {
-        Dialog::Message { title, lines, error } => (None, draw_message(frame, area, title, lines, dialog::OK, 0, *error)),
+        Dialog::Message { title, lines, error } => (None, draw_message(frame, area, title, lines, dialog::OK, 0, *error, t)),
         Dialog::Confirm { title, lines, focus, danger, .. } => {
-            (None, draw_message(frame, area, title, lines, dialog::YES_NO, *focus, *danger))
+            (None, draw_message(frame, area, title, lines, dialog::YES_NO, *focus, *danger, t))
         }
         Dialog::Question { title, lines, buttons, focus, error, .. } => {
-            (None, draw_message(frame, area, title, lines, buttons, *focus, *error))
+            (None, draw_message(frame, area, title, lines, buttons, *focus, *error, t))
         }
         Dialog::Input { title, prompt, edit, .. } => {
             let width = (area.width * 2 / 3).clamp(40, 90).min(area.width);
-            let (outer, inner) = dialog_frame(frame, area, width, 6, title, false);
-            let style = dialog_style(false);
+            let (outer, inner) = dialog_frame(frame, area, width, 6, title, false, t);
+            let style = t.dialog;
             let field_w = inner.width as usize;
             let (text, cursor) = edit.view(field_w.saturating_sub(1));
             let lines = vec![
                 Line::from(util::fit_left(prompt, field_w)),
-                Line::from(Span::styled(util::pad(&text, field_w), cursor_style())),
+                Line::from(Span::styled(util::pad(&text, field_w), t.on_dialog(t.input))),
                 Line::default(),
-                Line::from(Span::styled("Enter = OK   Esc = cancel", style.fg(Color::DarkGray))).right_aligned(),
+                Line::from(Span::styled("Enter = OK   Esc = cancel", t.on_dialog(t.dialog_dim))).right_aligned(),
             ];
             frame.render_widget(Paragraph::new(lines).style(style), inner);
             let cursor = Position::new(inner.x + cursor as u16, inner.y + 1);
             (Some(cursor), DialogHit { area: outer, ..DialogHit::default() })
         }
-        Dialog::Drives { drives, cursor, side, .. } => (None, draw_drives(frame, area, drives, *cursor, *side)),
-        Dialog::Sort { cursor, current, reverse, .. } => (None, draw_sort(frame, area, *cursor, *current, *reverse)),
+        Dialog::Drives { drives, cursor, side, .. } => (None, draw_drives(frame, area, drives, *cursor, *side, t)),
+        Dialog::Sort { cursor, current, reverse, .. } => (None, draw_sort(frame, area, *cursor, *current, *reverse, t)),
         Dialog::Delete { paths, to_trash, focus, survey } => {
             let tally = survey.tally();
             let (title, lines) = crate::app::delete_question(paths, *to_trash, &tally);
-            (None, draw_message(frame, area, title, &lines, dialog::delete_buttons(&tally), *focus, !*to_trash))
+            (None, draw_message(frame, area, title, &lines, dialog::delete_buttons(&tally), *focus, !*to_trash, t))
         }
         Dialog::Options { cursor, edit, settings, automatic } => {
-            draw_options(frame, area, *cursor, edit, settings, automatic, settings_file)
+            draw_options(frame, area, *cursor, edit, settings, automatic, settings_file, t)
         }
-        Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor)),
+        Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor, t)),
         // Drawn by `draw`, which has the rows.
-        Dialog::History { .. } | Dialog::Commands { .. } | Dialog::Worktrees { .. } => (None, DialogHit::default()),
-        Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor)),
+        Dialog::History { .. } | Dialog::Commands { .. } | Dialog::Worktrees { .. } | Dialog::Schemes { .. } => {
+            (None, DialogHit::default())
+        }
+        Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor, t)),
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
-            let (outer, inner) = dialog_frame(frame, area, 72, height, "rmc keys (Esc closes)", false);
+            let (outer, inner) = dialog_frame(frame, area, 72, height, "rmc keys (Esc closes)", false, t);
             let visible = inner.height as usize;
             let start = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
+            let heading = t.on_dialog(t.dialog_title).add_modifier(Modifier::BOLD);
             let lines: Vec<Line> = dialog::HELP[start..]
                 .iter()
                 .take(visible)
                 .map(|l| {
-                    let heading = !l.starts_with(' ') && !l.is_empty();
-                    let style = if heading { dialog_style(false).fg(Color::Blue).add_modifier(Modifier::BOLD) } else { dialog_style(false) };
-                    Line::from(Span::styled(*l, style))
+                    let is_heading = !l.starts_with(' ') && !l.is_empty();
+                    Line::from(Span::styled(*l, if is_heading { heading } else { t.dialog }))
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(lines).style(dialog_style(false)), inner);
+            frame.render_widget(Paragraph::new(lines).style(t.dialog), inner);
             (None, DialogHit { area: outer, ..DialogHit::default() })
         }
     }
+}
+
+/// Alt+C: the colour schemes, `*` on the one in use and "(your file)" on the user's; under
+/// them how to go about it, how many colours the terminal shows, and what the file under the
+/// cursor got wrong.
+fn draw_schemes(
+    frame: &mut Frame,
+    area: Rect,
+    choices: &[Choice],
+    cursor: usize,
+    current: &str,
+    colours: Colours,
+    t: &Scheme,
+) -> DialogHit {
+    let name_w = choices.iter().map(|c| util::width(&c.name)).max().unwrap_or(0).min(24);
+    let rows: Vec<String> = choices
+        .iter()
+        .map(|c| {
+            let mark = if c.name.eq_ignore_ascii_case(current) { "*" } else { " " };
+            let own = if c.file.is_some() { " (your file)" } else { "" };
+            format!("{mark} {}  {}{own}", util::pad(util::take_width(&c.name, name_w), name_w), c.about)
+        })
+        .collect();
+    let hint = "↑↓ shows one · Enter keeps it · F4 edits it as a file · Esc";
+    let terminal = colours.describe();
+    let problem = choices.get(cursor).and_then(|c| {
+        let file = c.file.as_ref()?.file_name()?.to_string_lossy().into_owned();
+        c.problems.first().map(|p| format!("{file}, {p}"))
+    });
+    let widest = rows.iter().map(|r| util::width(r)).chain([util::width(hint), util::width(terminal)]).max().unwrap_or(0);
+    let width = (widest as u16 + 4).max(40).min(area.width);
+    // A blank row, the hint and the terminal's colours under the list (and the problem).
+    let below = 3 + u16::from(problem.is_some());
+    let height = (choices.len() as u16 + below + 2).min(area.height.saturating_sub(2)).max(below + 3);
+    let (outer, inner) = dialog_frame(frame, area, width, height, "Colour scheme", false, t);
+    let field_w = inner.width as usize;
+    let list_h = inner.height.saturating_sub(below) as usize;
+    let offset = (cursor + 1).saturating_sub(list_h);
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(list_h)
+        .map(|(i, row)| {
+            let style = if i == cursor { t.on_dialog(t.dialog_focus) } else { t.dialog };
+            Line::from(Span::styled(util::pad(&util::fit(row, field_w), field_w), style))
+        })
+        .collect();
+    lines.resize(list_h + 1, Line::default());
+    if let Some(problem) = problem {
+        lines.push(Line::from(Span::styled(util::fit(&problem, field_w), t.error)));
+    }
+    let grey = t.on_dialog(t.dialog_dim);
+    lines.push(Line::from(Span::styled(util::fit(hint, field_w), grey)));
+    lines.push(Line::from(Span::styled(util::fit(terminal, field_w), grey)));
+    frame.render_widget(Paragraph::new(lines).style(t.dialog), inner);
+    let shown = choices.len().saturating_sub(offset).min(list_h) as u16;
+    let rows = (shown > 0).then(|| (Rect::new(inner.x, inner.y, inner.width, shown), offset));
+    DialogHit { area: outer, buttons: Vec::new(), rows }
 }
 
 /// The options editor: checkboxes and text rows; an empty command shows what it stands for
@@ -950,13 +1024,15 @@ fn draw_options(
     settings: &Settings,
     automatic: &OptionsAutomatic,
     settings_file: Option<&std::path::Path>,
+    t: &Scheme,
 ) -> (Option<Position>, DialogHit) {
     const LABEL_W: usize = 22;
     let rows = options::ROWS.len() as u16;
     let width = (area.width * 2 / 3).clamp(60, 90).min(area.width);
-    let (outer, inner) = dialog_frame(frame, area, width, rows + 5, "Options", false);
-    let style = dialog_style(false);
-    let grey = style.fg(Color::DarkGray);
+    let (outer, inner) = dialog_frame(frame, area, width, rows + 5, "Options", false, t);
+    let style = t.dialog;
+    let focus = t.on_dialog(t.dialog_focus);
+    let grey = t.on_dialog(t.dialog_dim);
     let field_w = (inner.width as usize).saturating_sub(LABEL_W);
     let mut text_cursor = None;
     let mut lines: Vec<Line> = Vec::new();
@@ -966,14 +1042,25 @@ fn draw_options(
         if row.is_flag() {
             let mark = if row.flag(settings) { "[x]" } else { "[ ]" };
             let text = util::pad(&format!("{mark} {}", row.label()), inner.width as usize);
-            lines.push(Line::from(Span::styled(text, if focused { cursor_style() } else { style })));
+            lines.push(Line::from(Span::styled(text, if focused { focus } else { style })));
             continue;
         }
         let label = Span::styled(util::pad(row.label(), LABEL_W), style);
+        // The colour scheme: its name; Enter opens the list.
+        if row.is_choice() {
+            let name = row.text(settings);
+            let value = if focused {
+                Span::styled(util::pad(&util::fit(&format!("{name}   Enter: choose"), field_w), field_w), focus)
+            } else {
+                Span::styled(util::fit(&name, field_w), style)
+            };
+            lines.push(Line::from(vec![label, value]));
+            continue;
+        }
         let value = if focused {
             let (text, column) = edit.view(field_w.saturating_sub(1));
             text_cursor = Some(Position::new(inner.x + (LABEL_W + column) as u16, y));
-            Span::styled(util::pad(&text, field_w), cursor_style())
+            Span::styled(util::pad(&text, field_w), t.on_dialog(t.input))
         } else {
             let text = row.text(settings);
             match automatic.for_row(row) {
@@ -995,22 +1082,22 @@ fn draw_options(
 }
 
 /// The F9 menu: the four orders with their keys; the current one says which way round it is.
-fn draw_sort(frame: &mut Frame, area: Rect, cursor: usize, current: SortBy, reverse: bool) -> DialogHit {
+fn draw_sort(frame: &mut Frame, area: Rect, cursor: usize, current: SortBy, reverse: bool, t: &Scheme) -> DialogHit {
     let rows = SortBy::ALL.len() as u16;
-    let (outer, inner) = dialog_frame(frame, area, 36, rows + 4, "Sort by", false);
-    let style = dialog_style(false);
+    let (outer, inner) = dialog_frame(frame, area, 36, rows + 4, "Sort by", false, t);
+    let style = t.dialog;
     let mut lines: Vec<Line> = SortBy::ALL
         .iter()
         .enumerate()
         .map(|(i, &by)| {
             let order = if by == current { by.direction(reverse) } else { "" };
             let text = format!("{}  {:<12}{order}", by.letter(), by.label());
-            let row_style = if i == cursor { cursor_style() } else { style };
+            let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
             Line::from(Span::styled(util::pad(&text, inner.width as usize), row_style))
         })
         .collect();
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled("again: the other way round", style.fg(Color::DarkGray))).right_aligned());
+    lines.push(Line::from(Span::styled("again: the other way round", t.on_dialog(t.dialog_dim))).right_aligned());
     frame.render_widget(Paragraph::new(lines).style(style), inner);
     let list = Rect::new(inner.x, inner.y, inner.width, rows.min(inner.height));
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
@@ -1018,7 +1105,7 @@ fn draw_sort(frame: &mut Frame, area: Rect, cursor: usize, current: SortBy, reve
 
 /// The drive picker: letter, label (or network share), type and free space. Slow drives
 /// show "checking…" until their answer arrives.
-fn draw_drives(frame: &mut Frame, area: Rect, drives: &[DriveInfo], cursor: usize, side: usize) -> DialogHit {
+fn draw_drives(frame: &mut Frame, area: Rect, drives: &[DriveInfo], cursor: usize, side: usize, t: &Scheme) -> DialogHit {
     let label_w = drives.iter().map(|d| util::width(&d.label)).max().unwrap_or(0).min(32);
     let texts: Vec<String> = drives
         .iter()
@@ -1037,13 +1124,13 @@ fn draw_drives(frame: &mut Frame, area: Rect, drives: &[DriveInfo], cursor: usiz
     let widest = texts.iter().map(|t| util::width(t)).max().unwrap_or(0).max(label_w + 37);
     let width = (widest as u16 + 4).max(30);
     let title = if side == 0 { "Left drive" } else { "Right drive" };
-    let (outer, inner) = dialog_frame(frame, area, width, drives.len() as u16 + 2, title, false);
-    let style = dialog_style(false);
+    let (outer, inner) = dialog_frame(frame, area, width, drives.len() as u16 + 2, title, false, t);
+    let style = t.dialog;
     let lines: Vec<Line> = texts
         .iter()
         .enumerate()
         .map(|(i, text)| {
-            let row_style = if i == cursor { cursor_style() } else { style };
+            let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
             Line::from(Span::styled(util::fit(text, inner.width as usize), row_style))
         })
         .collect();
@@ -1052,12 +1139,12 @@ fn draw_drives(frame: &mut Frame, area: Rect, drives: &[DriveInfo], cursor: usiz
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((rows, 0)) }
 }
 
-fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize) -> DialogHit {
+fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize, t: &Scheme) -> DialogHit {
     let rows = hotlist.dirs.len().max(1) as u16;
     let height = (rows + 4).min(area.height.saturating_sub(2)).max(6);
     let width = (area.width * 2 / 3).clamp(50, 100).min(area.width);
-    let (outer, inner) = dialog_frame(frame, area, width, height, "Directory hotlist", false);
-    let style = dialog_style(false);
+    let (outer, inner) = dialog_frame(frame, area, width, height, "Directory hotlist", false, t);
+    let style = t.dialog;
     let list_h = inner.height.saturating_sub(2) as usize;
     let field_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -1068,7 +1155,7 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
     for (i, dir) in hotlist.dirs.iter().enumerate().skip(offset).take(list_h) {
         let number = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
         let text = format!("{number}{}", util::fit_left(&dir.display().to_string(), field_w.saturating_sub(2)));
-        let row_style = if i == cursor { cursor_style() } else { style };
+        let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
         lines.push(Line::from(Span::styled(util::pad(&text, field_w), row_style)));
     }
     while lines.len() < list_h + 1 {
@@ -1076,7 +1163,7 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
     }
     lines.truncate(list_h + 1);
     let hint = "Enter/1-9 go  Ins add here  Del remove  Shift+↑↓ move";
-    lines.push(Line::from(Span::styled(util::fit_left(hint, field_w), style.fg(Color::DarkGray))).right_aligned());
+    lines.push(Line::from(Span::styled(util::fit_left(hint, field_w), t.on_dialog(t.dialog_dim))).right_aligned());
     frame.render_widget(Paragraph::new(lines).style(style), inner);
     let shown = hotlist.dirs.len().saturating_sub(offset).min(list_h) as u16;
     let rows = (shown > 0).then(|| (Rect::new(inner.x, inner.y, inner.width, shown), offset));
@@ -1084,10 +1171,17 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize)
 }
 
 /// Alt+A: a checkbox per attribute, [?] where the files differ.
-fn draw_attributes(frame: &mut Frame, area: Rect, paths: &[std::path::PathBuf], states: &[Option<bool>], cursor: usize) -> DialogHit {
+fn draw_attributes(
+    frame: &mut Frame,
+    area: Rect,
+    paths: &[std::path::PathBuf],
+    states: &[Option<bool>],
+    cursor: usize,
+    t: &Scheme,
+) -> DialogHit {
     let rows = states.len() as u16;
-    let (outer, inner) = dialog_frame(frame, area, 52, rows + 6, "Attributes", false);
-    let style = dialog_style(false);
+    let (outer, inner) = dialog_frame(frame, area, 52, rows + 6, "Attributes", false, t);
+    let style = t.dialog;
     let what = match paths {
         [one] => one.file_name().map_or_else(|| one.display().to_string(), |n| n.to_string_lossy().into_owned()),
         many => format!("{} items", many.len()),
@@ -1099,11 +1193,11 @@ fn draw_attributes(frame: &mut Frame, area: Rect, paths: &[std::path::PathBuf], 
             Some(false) => "[ ]",
             None => "[?]",
         };
-        let row_style = if i == cursor { cursor_style() } else { style };
+        let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
         lines.push(Line::from(Span::styled(util::pad(&format!("{mark} {label}"), inner.width as usize), row_style)));
     }
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled("Space toggles · Enter sets them · Esc", style.fg(Color::DarkGray))).right_aligned());
+    lines.push(Line::from(Span::styled("Space toggles · Enter sets them · Esc", t.on_dialog(t.dialog_dim))).right_aligned());
     frame.render_widget(Paragraph::new(lines).style(style), inner);
     let list = Rect::new(inner.x, inner.y + 2, inner.width, rows.min(inner.height.saturating_sub(2)));
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
@@ -1147,18 +1241,19 @@ fn draw_filtered_list(
     filter: &LineEdit,
     cursor: usize,
     hint: &str,
+    t: &Scheme,
 ) -> (Position, DialogHit) {
     let height = (rows.len() as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
     let widest = rows.iter().map(|r| util::width(&r.replace('\t', ""))).max().unwrap_or(0) as u16 + 4;
     let width = (area.width * 2 / 3).clamp(50, 100).max(widest.min(area.width)).min(area.width);
-    let (outer, inner) = dialog_frame(frame, area, width, height, title, false);
-    let style = dialog_style(false);
-    let grey = style.fg(Color::DarkGray);
+    let (outer, inner) = dialog_frame(frame, area, width, height, title, false, t);
+    let style = t.dialog;
+    let grey = t.on_dialog(t.dialog_dim);
     let field_w = inner.width as usize;
     const LABEL: &str = "Filter: ";
     let (text, column) = filter.view(field_w.saturating_sub(LABEL.len() + 1));
-    let mut lines =
-        vec![Line::from(vec![Span::styled(LABEL, style), Span::styled(util::pad(&text, field_w.saturating_sub(LABEL.len())), cursor_style())])];
+    let field = util::pad(&text, field_w.saturating_sub(LABEL.len()));
+    let mut lines = vec![Line::from(vec![Span::styled(LABEL, style), Span::styled(field, t.on_dialog(t.input))])];
     let list_h = inner.height.saturating_sub(3) as usize;
     let cursor = cursor.min(rows.len().saturating_sub(1));
     let offset = (cursor + 1).saturating_sub(list_h);
@@ -1172,7 +1267,7 @@ fn draw_filtered_list(
             Some((left, right)) => format!("{left}{}", util::fit_left(right, field_w.saturating_sub(util::width(left)))),
             None => util::fit_left(row, field_w),
         };
-        let row_style = if i == cursor { cursor_style() } else { style };
+        let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
         lines.push(Line::from(Span::styled(util::pad(&text, field_w), row_style)));
     }
     lines.resize(list_h + 2, Line::default());
@@ -1184,14 +1279,14 @@ fn draw_filtered_list(
     (position, DialogHit { area: outer, buttons: Vec::new(), rows: rows_area })
 }
 
-fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
+fn draw_progress(frame: &mut Frame, area: Rect, job: &Running, t: &Scheme) {
     let width = area.width.saturating_sub(4).clamp(30, 72);
-    let (_, inner) = dialog_frame(frame, area, width, 8, job.title, false);
+    let (_, inner) = dialog_frame(frame, area, width, 8, job.title, false, t);
     if inner.height < 6 {
         return;
     }
     let p = &job.progress;
-    let style = dialog_style(false);
+    let style = t.dialog;
     let row = |n: u16| Rect::new(inner.x, inner.y + n, inner.width, 1);
     let current = if p.scanning { format!("Scanning… {}", p.files_total) } else { p.current.clone() };
     frame.render_widget(Paragraph::new(util::fit_left(&current, inner.width as usize)).style(style), row(0));
@@ -1202,7 +1297,7 @@ fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
     } else {
         0.0
     };
-    let gauge = Gauge::default().gauge_style(Style::new().fg(Color::Cyan).bg(Color::Black)).ratio(ratio.clamp(0.0, 1.0));
+    let gauge = Gauge::default().gauge_style(t.on_dialog(t.gauge)).ratio(ratio.clamp(0.0, 1.0));
     frame.render_widget(gauge, row(2));
     let mut counts = format!("{} / {} items", p.files_done, p.files_total);
     if p.bytes_total > 0 {
@@ -1219,7 +1314,7 @@ fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
         let text = format!("{}/s   {left} left", util::human_size(speed as u64));
         frame.render_widget(Paragraph::new(text).style(style), row(4));
     }
-    frame.render_widget(Paragraph::new(Line::from("Esc = cancel").right_aligned()).style(style.fg(Color::DarkGray)), row(5));
+    frame.render_widget(Paragraph::new(Line::from("Esc = cancel").right_aligned()).style(t.on_dialog(t.dialog_dim)), row(5));
 }
 
 #[cfg(test)]
@@ -1374,7 +1469,7 @@ mod tests {
         };
         let output = ["# branch.ab +1 -0", "1 .M N... 100644 100644 100644 a a changed.txt", "? new.txt", ""].join("\0");
         let status = Status::parse(output.as_bytes());
-        let text = |repo: &Repo, room| git_line(repo, Some(&status), room).spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let text = |repo: &Repo, room| git_line(repo, Some(&status), room, &scheme::classic()).spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let long = " claude/gentle-fox REBASE 2/5 ↑1 · worktree · 1 changed · 1 untracked";
         assert_eq!(text(&repo, 100), long);
         assert_eq!(text(&repo, util::width(long)), long);
@@ -1386,7 +1481,7 @@ mod tests {
         assert_eq!(text(&repo, 2), "");
         // A commit checked out; nothing to count.
         let detached = Repo { head: Head::Detached("1a2b3c4".into()), linked: false, state: None, ..repo };
-        assert_eq!(git_line(&detached, None, 100).spans.iter().map(|s| s.content.as_ref()).collect::<String>(), " (1a2b3c4)");
+        assert_eq!(git_line(&detached, None, 100, &scheme::classic()).spans.iter().map(|s| s.content.as_ref()).collect::<String>(), " (1a2b3c4)");
     }
 
     #[test]
@@ -1679,6 +1774,72 @@ mod tests {
         }
         assert!(screen.contains("Folder history") && screen.contains("Filter: fot"));
         assert!(screen.contains(r"E:\Fotky\2024 Léto") && !screen.contains("Downloads"));
+    }
+
+    /// Alt+C's list: every scheme with what it is, `*` on the one in use, how to go about it
+    /// and what the terminal can show.
+    #[test]
+    fn renders_the_scheme_list() {
+        let tmp = TempDir::new("ui-schemes");
+        let mut app = app_for(&tmp);
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('c'),
+            ratatui::crossterm::event::KeyModifiers::ALT,
+        ));
+        let screen = render(&mut app, 100, 30);
+        if std::env::var_os("RMC_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("Colour scheme"), "{screen}");
+        assert!(screen.contains("* classic          mc's blue panels"), "{screen}");
+        assert!(screen.contains("  solarized-light  Solarized, light"), "{screen}");
+        assert!(screen.contains("↑↓ shows one · Enter keeps it · F4 edits it as a file · Esc"), "{screen}");
+        assert!(screen.contains("The terminal shows any colour."), "{screen}");
+        // Small screens: the list scrolls, nothing panics.
+        for (w, h) in [(40, 12), (30, 8), (100, 9)] {
+            render(&mut app, w, h);
+        }
+    }
+
+    /// Files take their kind's colour (classic: archives red, pictures cyan, sound and
+    /// video green, leftovers dark grey); a true-colour scheme colours everything, the cursor
+    /// too; mono names no colour at all, its cursor is reverse video.
+    #[test]
+    fn files_and_schemes_have_their_colours() {
+        let tmp = TempDir::new("ui-kinds");
+        for name in ["a.zip", "b.jpg", "c.mp4", "d.bak", "e.txt"] {
+            tmp.file(name, "x");
+        }
+        let mut app = app_for(&tmp);
+        app.active_panel_mut_for_tests().select_name("e.txt");
+        let colours = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let cell = |name: &str| {
+                let y = (0..16).find(|&y| (0..50).map(|x| buffer[(x, y)].symbol()).collect::<String>().contains(name)).unwrap();
+                let x = (0..50).find(|&x| buffer[(x, y)].symbol() == &name[..1]).unwrap();
+                buffer[(x, y)].clone()
+            };
+            ["a.zip", "b.jpg", "c.mp4", "d.bak", "e.txt"].map(cell)
+        };
+        let [zip, jpg, mp4, bak, txt] = colours(&mut app);
+        assert_eq!(
+            [zip.fg, jpg.fg, mp4.fg, bak.fg, txt.fg],
+            [Color::LightRed, Color::LightCyan, Color::Green, Color::DarkGray, Color::Black],
+            "e.txt is under the cursor"
+        );
+        assert_eq!((zip.bg, txt.bg), (Color::Blue, Color::Cyan));
+
+        app.scheme = scheme::built_in("nord").unwrap();
+        let [zip, _, _, _, txt] = colours(&mut app);
+        assert_eq!((zip.fg, zip.bg), (Color::Rgb(0xb4, 0x8e, 0xad), Color::Rgb(0x2e, 0x34, 0x40)));
+        assert_eq!(txt.bg, Color::Rgb(0x88, 0xc0, 0xd0), "the cursor bar");
+
+        app.scheme = scheme::mono();
+        let [zip, _, _, _, txt] = colours(&mut app);
+        assert_eq!((zip.fg, zip.bg, txt.fg, txt.bg), (Color::Reset, Color::Reset, Color::Reset, Color::Reset));
+        assert!(txt.modifier.contains(Modifier::REVERSED));
     }
 
     /// Scrolling help past its end doesn't build up a dead zone: Up moves at once.

@@ -21,6 +21,8 @@ pub fn config() -> Config {
         hotlist_file: None,
         settings_file: None,
         history_file: None,
+        schemes_dir: None,
+        colours: crate::scheme::Colours::default(),
         settings: Settings { git_status: false, ..Settings::default() },
     }
 }

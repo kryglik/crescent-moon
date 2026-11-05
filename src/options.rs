@@ -12,6 +12,7 @@ pub enum Row {
     Arrows,
     NaturalSort,
     GitStatus,
+    Scheme,
     BigFile,
     Editor,
     Viewer,
@@ -19,13 +20,14 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 11] = [
+pub const ROWS: [Row; 12] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
     Row::Arrows,
     Row::NaturalSort,
     Row::GitStatus,
+    Row::Scheme,
     Row::BigFile,
     Row::Editor,
     Row::Viewer,
@@ -42,6 +44,7 @@ impl Row {
             Row::Arrows => "Left/Right go up and into folders",
             Row::NaturalSort => "Numbers in names by value (2 before 10)",
             Row::GitStatus => "Git: mark changed and new files",
+            Row::Scheme => "Colour scheme (Alt+C)",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
             Row::Viewer => "Viewer (F3)",
@@ -53,6 +56,11 @@ impl Row {
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
         matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus)
+    }
+
+    /// Picked from a list (Enter opens it) rather than typed.
+    pub fn is_choice(self) -> bool {
+        self == Row::Scheme
     }
 
     pub fn flag(self, settings: &Settings) -> bool {
@@ -82,6 +90,7 @@ impl Row {
     pub fn text(self, settings: &Settings) -> String {
         match self {
             Row::BigFile => settings.big_file_mb.to_string(),
+            Row::Scheme => settings.scheme.clone(),
             Row::Editor => settings.editor.clone(),
             Row::Viewer => settings.viewer.clone(),
             Row::Pager => settings.pager.clone(),

@@ -11,6 +11,7 @@ use crate::ops::Answer;
 use crate::options::OptionsAutomatic;
 use crate::panel::SortBy;
 use crate::platform::DriveInfo;
+use crate::scheme::Choice;
 use crate::settings::Settings;
 use crate::survey::Survey;
 use crate::util;
@@ -69,6 +70,9 @@ pub enum Dialog {
     /// Ctrl+P: `settings` being edited; `edit` holds the text of the row under the cursor
     /// when that is a text row.
     Options { cursor: usize, edit: LineEdit, settings: Settings, automatic: OptionsAutomatic },
+    /// Alt+C (or the options' Colour scheme row, which is `back`): every colour scheme, the
+    /// one under the cursor on the whole screen until Enter keeps it or Esc goes back.
+    Schemes { cursor: usize, choices: Vec<Choice>, back: Option<Box<Dialog>> },
     /// A question from a running job; the answer goes back over `reply`.
     Question {
         title: String,
@@ -322,6 +326,7 @@ pub const COMMANDS: &[Command] = &[
     command("Attributes: read-only, hidden… (permissions)", "Alt+A", KeyCode::Char('a'), ALT),
     command("Shell (switch to it and back)", "Ctrl+O", KeyCode::Char('o'), CTRL),
     command("Options", "Ctrl+P", KeyCode::Char('p'), CTRL),
+    command("Colour scheme: try them on the whole screen (theme)", "Alt+C", KeyCode::Char('c'), ALT),
 ];
 
 /// The commands whose label or key holds every word of `filter` (any case).
@@ -329,10 +334,10 @@ pub fn matching_commands(filter: &str) -> Vec<&'static Command> {
     COMMANDS.iter().filter(|c| matches_words(&format!("{} {}", c.label, c.keys), filter)).collect()
 }
 
-/// Whether `text` holds every word of `filter`, in any case.
+/// Whether `text` holds every word of `filter`, in any case ("color" finds "colour" too).
 fn matches_words(text: &str, filter: &str) -> bool {
-    let text = text.to_lowercase();
-    filter.split_whitespace().all(|word| text.contains(&word.to_lowercase()))
+    let text = text.to_lowercase().replace("colour", "color");
+    filter.split_whitespace().all(|word| text.contains(&word.to_lowercase().replace("colour", "color")))
 }
 
 /// The worktrees whose branch or folder holds every word of `filter`.
@@ -422,6 +427,8 @@ pub const HELP: &[&str] = &[
     "  Shift+PgUp/PgDn, wheel   scroll back through its output",
     "",
     "  Ctrl+P       options (saved in settings.ini)",
+    "  Alt+C        colour scheme: ↑↓ shows each on the whole screen,",
+    "               Enter keeps it, F4 makes it a file of yours to change",
     "",
     "Find (Alt+F7)",
     "  Text: a regex; lowercase ignores case, a capital makes it count",
