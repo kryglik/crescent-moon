@@ -9,10 +9,18 @@ What it does differently from the Windows port of mc:
 - F8 and Delete move files to the **Recycle Bin**; only Shift+F8 / Shift+Delete delete permanently.
   The question counts what would go while you decide, and for files only an administrator may
   delete (Windows' own, owned by TrustedInstaller) it offers **As admin**, like Total Commander.
-- Long paths (over 260 characters) work.
-- Czech and other non-ASCII file names work everywhere, including opening a file in its app.
+- It works **with Explorer**: Ctrl+C / Ctrl+X put files on the clipboard the way Explorer does,
+  Alt+V pastes what Explorer copied; panels show what other programs change at once; Enter on
+  a shortcut to a folder opens it; Shift+Enter asks Windows which app to open a file in.
+- Total Commander habits: Ctrl+Q quick view, Shift+F2 compare folders, Alt+F5 / Alt+F9 pack and
+  unpack zips (and zips open as folders), folder tabs (Ctrl+T), back and forward (Alt+Left /
+  Alt+Right), Ctrl+D hotlist, Alt+F7 find.
+- Copies and moves never put a file at risk: an overwrite only replaces the old file once the
+  new one is complete, a move to another drive deletes each file only after its copy, and the
+  same file under another name is recognised.
+- Long paths (over 260 characters) work, as do Czech and other non-ASCII names everywhere.
 - F3/F4 open files in **Neovim** (or any editor you set) instead of a built-in viewer and editor.
-- `..` at a drive root opens the drive picker.
+- F12 lists every command, found by typing part of its name.
 
 ## Build and install
 
@@ -46,45 +54,69 @@ CARGO_TARGET_DIR=~/rmc-target cargo install --path .
 
 ## Keys
 
-Press **F1** inside rmc for the full list. The essentials:
+Press **F1** inside rmc for the full list, or **F12** to find a command by typing part of its
+name ("zip", "clip", "hist"; Enter runs it). The essentials:
+
+#### Moving around
 
 | Key | Action |
 | --- | --- |
 | Tab | switch panel |
-| Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
 | Enter / Backspace | open directory or file / parent directory; a Windows shortcut (.lnk) to a folder opens the folder in the panel, as in Total Commander |
-| Shift+Enter | open with… : Windows asks which app to open the file in |
-| Alt+F1, Alt+F2 | drive picker for the left / right panel |
-| Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
-| Alt+Left / Alt+Right | back / forward through the folders the panel was in, as in a browser (mc's Alt+Y / Alt+U too); `cd -` goes back |
-| Alt+H or Alt+Down | folder history: the folders visited lately, newest first, kept between sessions; type part of a path to narrow it, Enter goes there, Del forgets one |
-| Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
 | Left / Right | with an empty command line: up to the parent folder / into the folder under the cursor, as mc's "Lynx-like motion" (an option, on by default) |
 | Ctrl+PgUp / Ctrl+PgDn | up / into a folder, as in Total Commander and Far |
+| Alt+Left / Alt+Right | back / forward through the folders the panel was in, as in a browser (mc's Alt+Y / Alt+U too); `cd -` goes back |
+| Alt+H or Alt+Down | folder history: the folders visited lately, newest first, kept between sessions; type part of a path to narrow it, Enter goes there, Del forgets one |
+| Alt+F1, Alt+F2 | drive picker for the left / right panel |
+| Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
+| Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
+| Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
+| Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
+
+#### Looking at things
+
+| Key | Action |
+| --- | --- |
+| F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
+| Ctrl+Q | quick view (as in Total Commander and Far): the other panel shows what is under the cursor, read in the background: the start of a text file (UTF-8 or UTF-16), a hex dump of a binary one, a picture's format and size (PNG, JPEG, GIF, BMP, WebP), a folder's contents. Tab goes into it to scroll (arrows, pages), the wheel scrolls it too |
+| Shift+Enter | open with… : Windows asks which app to open the file in |
+| Ctrl+F | filter the panel: only files matching `*.jpg *.cr2`, or not `!*.tmp`, or containing a word; folders stay. The panel's title shows it until Ctrl+F empties it |
+| F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
+| Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
+| Shift+F2 | compare the two folders (as in Total Commander): marks on each side the files and folders the other side lacks or has an older copy of (same time but another size counts too), so F5 brings the other side up to date |
+
+#### Marking and changing files
+
+| Key | Action |
+| --- | --- |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
 | Ctrl+A | mark everything (with an empty command line) |
-| Alt+A | attributes of the marked files (or the one under the cursor): read-only, hidden, system, archive on Windows, the permission bits (rwx) on Linux. Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
-| Ctrl+F | filter the panel: only files matching `*.jpg *.cr2`, or not `!*.tmp`, or containing a word; folders stay. The panel's title shows it until Ctrl+F empties it |
 | F2 | rename |
-| Shift+F2 | compare the two folders (as in Total Commander): marks on each side the files and folders the other side lacks or has an older copy of (same time but another size counts too), so F5 brings the other side up to date |
-| Ctrl+Q | quick view (as in Total Commander and Far): the other panel shows what is under the cursor, read in the background: the start of a text file (UTF-8 or UTF-16), a hex dump of a binary one, a picture's format and size (PNG, JPEG, GIF, BMP, WebP), a folder's contents. Tab goes into it to scroll (arrows, pages), the wheel scrolls it too |
-| F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
-| F5 / F6 / F7 | copy / move / make directory |
+| F5 / F6 / F7 | copy / move / make directory; the progress shows the speed and the time left |
 | F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
+| Alt+A | attributes of the marked files (or the one under the cursor): read-only, hidden, system, archive on Windows, the permission bits (rwx) on Linux. Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
+| Alt+F5 / Alt+F9 | pack into a zip / unpack the zip under the cursor (see Zip archives) |
 | Ctrl+C / Ctrl+X | the marked files (or the one under the cursor) to the clipboard, copied or cut, the way Explorer puts them there: paste them in Explorer, a mail or a chat |
 | Ctrl+Shift+C | their full paths to the clipboard as text |
 | Alt+V | paste files copied or cut in Explorer or in rmc into the panel's folder (cut ones are moved, and the clipboard is emptied afterwards, as Explorer does). Windows Terminal keeps Ctrl+V for its own paste; where a terminal lets Ctrl+V through, it works too. On Linux rmc keeps its own clipboard for files, and the paths go to the terminal's clipboard (OSC 52, over ssh too) |
-| F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
+
+#### Everything else
+
+| Key | Action |
+| --- | --- |
 | Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
-| Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
-| Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | Ctrl+P | options (see Settings) |
 | F10 | quit (right away; it asks only if the option says so, or while the shell is busy) |
-| F12 | every command with its key: type part of a name ("zip", "clip", "hist") to narrow the list, Enter runs it |
+| F12 | every command with its key, found by typing |
 
 Typing anywhere goes to the command line; Enter runs it in the shell (see below), in the
-active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder.
+active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder; it
+reads quotes and environment variables as the shell would, and `cd -` goes back.
+
+Panels show what other programs change in their folders (a download finishing, a build) by
+themselves, as Explorer does, keeping the cursor and the marks; removable drives aren't
+watched, so they can still be ejected. The window's title names the active folder.
 
 Each panel remembers where it was on every drive: picking E: in the drive picker (or `cd e:`)
 returns to that folder, and picking the drive the panel is already on goes to its root.
@@ -174,8 +206,9 @@ command is still running, so it never refuses one.
 Click selects, double-click opens, right-click marks, the wheel scrolls the panel under the
 pointer. Click a column heading (Name, Size, Modify time) to sort by it, and again to flip
 the order; an arrow on the heading shows which way round it is (↑ A to Z, small to big, old
-to new). Click the F-key bar labels to run them; dialog buttons and the drive, hotlist and
-sort menu rows are clickable too.
+to new). Click the F-key bar labels to run them; dialog buttons and the rows of the drive
+picker, hotlist, sort menu, folder history, F12 list and attributes are clickable too, as are
+the tabs. The wheel scrolls the quick view.
 
 While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
 `rmc --no-mouse` to leave the mouse to the terminal.
@@ -237,8 +270,15 @@ function rmc {
 | --- | --- |
 | `src/main.rs` | arguments, terminal setup, event loop, running nvim/shell/commands |
 | `src/app.rs` | application state and all key handling |
-| `src/panel.rs` | a panel: listing, sorting, cursor, marks |
-| `src/ops.rs` | copy/move/delete jobs on a worker thread (progress, questions, cancel) |
+| `src/panel.rs` | a panel: listing, sorting, cursor, marks, back/forward, filter, a zip shown as a folder |
+| `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |
+| `src/archive.rs` | zip archives: the index, names, times |
+| `src/watch.rs` | watching the panels' folders for changes (Windows change notifications, inotify) |
+| `src/history.rs` | folders visited and commands typed, kept in `history.txt` |
+| `src/compare.rs` | Shift+F2's comparison of two folders |
+| `src/preview.rs` | quick view: reading what to show on a background thread |
+| `src/clipboard.rs` | files on the Windows clipboard (as Explorer puts them), OSC 52 elsewhere |
+| `src/lnk.rs` | reading where a Windows shortcut leads |
 | `src/sizes.rs` | directory size measuring on a worker thread |
 | `src/mouse.rs` | mouse handling, using the screen areas `ui.rs` records each frame |
 | `src/subshell.rs` | the persistent shell: ConPTY via portable-pty, screen copy via vt100, key encoding |
