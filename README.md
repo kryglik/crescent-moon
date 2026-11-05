@@ -190,6 +190,7 @@ text row (it counts when you move off it). Everything takes effect at once and i
 | Show hidden files | on (Ctrl+H or Alt+. toggles it for the session) |
 | Mouse | on (`--no-mouse` turns it off for one run) |
 | Left/Right go up and into folders | on: with an empty command line, Left is the parent folder and Right the folder under the cursor |
+| Numbers in names by value | on: "day 2" sorts before "day 10", as in Explorer |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
 

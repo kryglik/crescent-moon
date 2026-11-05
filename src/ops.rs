@@ -135,6 +135,36 @@ pub struct Running {
     pub progress: Progress,
     pub rx: Receiver<Msg>,
     pub cancel: Arc<AtomicBool>,
+    /// When the bytes started to move (after the scan) and how many were done then: the
+    /// speed and the time left are measured from there.
+    pub measured_from: Option<(Instant, u64)>,
+}
+
+impl Running {
+    pub fn new(title: &'static str, progress: Progress, rx: Receiver<Msg>, cancel: Arc<AtomicBool>) -> Running {
+        Running { title, progress, rx, cancel, measured_from: None }
+    }
+
+    /// Takes the job's latest progress.
+    pub fn update(&mut self, progress: Progress) {
+        if self.measured_from.is_none() && !progress.scanning && progress.bytes_total > 0 {
+            self.measured_from = Some((Instant::now(), progress.bytes_done));
+        }
+        self.progress = progress;
+    }
+
+    /// Bytes a second and the time left, once a second's worth has been measured.
+    pub fn speed(&self) -> Option<(f64, Duration)> {
+        let (since, at_start) = self.measured_from?;
+        let elapsed = since.elapsed().as_secs_f64();
+        let moved = self.progress.bytes_done.saturating_sub(at_start) as f64;
+        if elapsed < 1.0 || moved <= 0.0 {
+            return None;
+        }
+        let speed = moved / elapsed;
+        let left = self.progress.bytes_total.saturating_sub(self.progress.bytes_done) as f64 / speed;
+        Some((speed, Duration::from_secs_f64(left.min(1e7))))
+    }
 }
 
 pub fn start(job: Job) -> Running {
@@ -162,7 +192,7 @@ fn run_job(job: Job, privileged: bool) -> Running {
         let as_admin = worker.as_admin.take().filter(|paths| !cancelled && !paths.is_empty());
         let _ = tx.send(Msg::Done { errors: worker.errors, cancelled, as_admin });
     });
-    Running { title, progress: Progress::default(), rx, cancel }
+    Running::new(title, Progress::default(), rx, cancel)
 }
 
 /// Why a job stops early: the user cancelled, or chose to go on as administrator.
@@ -1035,6 +1065,21 @@ mod tests {
                 Msg::Done { errors, cancelled, .. } => return (errors, cancelled, questions),
             }
         }
+    }
+
+    /// Speed and time left count from when the bytes started to move (not the scan).
+    #[test]
+    fn speed_and_time_left() {
+        let (_tx, rx) = mpsc::channel();
+        let mut job = Running::new("Copy", Progress::default(), rx, Arc::new(AtomicBool::new(false)));
+        job.update(Progress { scanning: true, files_total: 10, ..Progress::default() });
+        assert!(job.measured_from.is_none() && job.speed().is_none());
+        job.update(Progress { bytes_total: 4 << 20, bytes_done: 0, ..Progress::default() });
+        job.measured_from = Some((Instant::now() - Duration::from_secs(2), 0));
+        job.update(Progress { bytes_total: 4 << 20, bytes_done: 2 << 20, ..Progress::default() });
+        let (speed, left) = job.speed().unwrap();
+        assert!((speed - 1048576.0).abs() < 1048576.0 * 0.1, "{speed}");
+        assert!((left.as_secs_f64() - 2.0).abs() < 0.3, "{left:?}");
     }
 
     #[test]

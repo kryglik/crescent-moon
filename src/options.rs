@@ -10,6 +10,7 @@ pub enum Row {
     ShowHidden,
     Mouse,
     Arrows,
+    NaturalSort,
     BigFile,
     Editor,
     Viewer,
@@ -17,11 +18,12 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 9] = [
+pub const ROWS: [Row; 10] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
     Row::Arrows,
+    Row::NaturalSort,
     Row::BigFile,
     Row::Editor,
     Row::Viewer,
@@ -36,6 +38,7 @@ impl Row {
             Row::ShowHidden => "Show hidden files",
             Row::Mouse => "Mouse",
             Row::Arrows => "Left/Right go up and into folders",
+            Row::NaturalSort => "Numbers in names by value (2 before 10)",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
             Row::Viewer => "Viewer (F3)",
@@ -46,7 +49,7 @@ impl Row {
 
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
-        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows)
+        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort)
     }
 
     pub fn flag(self, settings: &Settings) -> bool {
@@ -55,6 +58,7 @@ impl Row {
             Row::ShowHidden => settings.show_hidden,
             Row::Mouse => settings.mouse,
             Row::Arrows => settings.arrows_navigate,
+            Row::NaturalSort => settings.natural_sort,
             _ => false,
         }
     }
@@ -65,6 +69,7 @@ impl Row {
             Row::ShowHidden => settings.show_hidden = !settings.show_hidden,
             Row::Mouse => settings.mouse = !settings.mouse,
             Row::Arrows => settings.arrows_navigate = !settings.arrows_navigate,
+            Row::NaturalSort => settings.natural_sort = !settings.natural_sort,
             _ => {}
         }
     }

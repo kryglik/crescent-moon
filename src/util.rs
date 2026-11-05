@@ -437,6 +437,40 @@ fn environment_value(name: &str) -> Option<String> {
     (name == "HOME").then(home_dir).flatten().map(|home| home.to_string_lossy().into_owned())
 }
 
+/// Compares names the way Explorer does: runs of digits by their value, so "day 2" comes
+/// before "day 10"; everything else character by character.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let digits_a: String = std::iter::from_fn(|| a.next_if(char::is_ascii_digit)).collect();
+                let digits_b: String = std::iter::from_fn(|| b.next_if(char::is_ascii_digit)).collect();
+                let (value_a, value_b) = (digits_a.trim_start_matches('0'), digits_b.trim_start_matches('0'));
+                let order = value_a
+                    .len()
+                    .cmp(&value_b.len())
+                    .then_with(|| value_a.cmp(value_b))
+                    .then_with(|| digits_a.len().cmp(&digits_b.len()));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
 /// Splits a command such as `"C:\Program Files\x.exe" -R` into words, honouring double quotes.
 pub fn split_command(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
@@ -618,6 +652,18 @@ mod tests {
         }
         let before_1970 = SystemTime::UNIX_EPOCH - Duration::from_millis(1500);
         assert_eq!(local_time(before_1970).map(|t| t.timestamp_millis()), Some(-1500));
+    }
+
+    #[test]
+    fn numbers_in_names_sort_by_value() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp("day 2", "day 10"), Less);
+        assert_eq!(natural_cmp("img_0010.jpg", "img_0009.jpg"), Greater);
+        assert_eq!(natural_cmp("a10b2", "a10b10"), Less);
+        assert_eq!(natural_cmp("abc", "abd"), Less);
+        assert_eq!(natural_cmp("7", "007"), Less, "the same value: fewer zeros first");
+        assert_eq!(natural_cmp("x", "x1"), Less);
+        assert_eq!(natural_cmp("99999999999999999999999", "100000000000000000000000"), Less, "no overflow");
     }
 
     #[test]

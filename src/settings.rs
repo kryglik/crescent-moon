@@ -17,6 +17,8 @@ pub struct Settings {
     /// Left and Right (with an empty command line) go to the parent folder and into the one
     /// under the cursor, as mc's "Lynx-like motion".
     pub arrows_navigate: bool,
+    /// Numbers in names sort by value ("day 2" before "day 10"), as in Explorer.
+    pub natural_sort: bool,
     /// Files bigger than this many megabytes go to the pager, and the editor asks first.
     pub big_file_mb: u64,
     /// Commands; empty means automatic (environment variables, then what is installed).
@@ -33,6 +35,7 @@ impl Default for Settings {
             show_hidden: true,
             mouse: true,
             arrows_navigate: true,
+            natural_sort: true,
             big_file_mb: 10,
             editor: String::new(),
             viewer: String::new(),
@@ -84,6 +87,7 @@ impl Settings {
                 "show_hidden" => settings.show_hidden = flag(settings.show_hidden),
                 "mouse" => settings.mouse = flag(settings.mouse),
                 "arrows_navigate" => settings.arrows_navigate = flag(settings.arrows_navigate),
+                "natural_sort" => settings.natural_sort = flag(settings.natural_sort),
                 "big_file_mb" => {
                     if let Ok(mb) = value.parse::<u64>()
                         && mb > 0
@@ -109,6 +113,7 @@ impl Settings {
              show_hidden = {}\n\
              mouse = {}\n\
              arrows_navigate = {}\n\
+             natural_sort = {}\n\
              big_file_mb = {}\n\
              editor = {}\n\
              viewer = {}\n\
@@ -118,6 +123,7 @@ impl Settings {
             self.show_hidden,
             self.mouse,
             self.arrows_navigate,
+            self.natural_sort,
             self.big_file_mb,
             self.editor,
             self.viewer,

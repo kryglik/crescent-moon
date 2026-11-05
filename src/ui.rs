@@ -985,6 +985,16 @@ fn draw_progress(frame: &mut Frame, area: Rect, job: &Running) {
         counts += &format!("   {} / {}", util::human_size(p.bytes_done), util::human_size(p.bytes_total));
     }
     frame.render_widget(Paragraph::new(counts).style(style), row(3));
+    if let Some((speed, left)) = job.speed() {
+        let secs = left.as_secs();
+        let left = if secs >= 3600 {
+            format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+        } else {
+            format!("{}:{:02}", secs / 60, secs % 60)
+        };
+        let text = format!("{}/s   {left} left", util::human_size(speed as u64));
+        frame.render_widget(Paragraph::new(text).style(style), row(4));
+    }
     frame.render_widget(Paragraph::new(Line::from("Esc = cancel").right_aligned()).style(style.fg(Color::DarkGray)), row(5));
 }
 

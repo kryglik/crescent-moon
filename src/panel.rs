@@ -164,6 +164,13 @@ impl ArchiveView {
 /// How many folders back the panel remembers.
 const BACK_LIMIT: usize = 100;
 
+/// Numbers in names sort by value ("day 2" before "day 10"), as in Explorer; an option.
+pub static NATURAL_SORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn name_order(a: &str, b: &str) -> Ordering {
+    if NATURAL_SORT.load(std::sync::atomic::Ordering::Relaxed) { util::natural_cmp(a, b) } else { a.cmp(b) }
+}
+
 impl Panel {
     /// Opens `cwd`, falling back to its parents, the home directory or the system root.
     pub fn new(cwd: PathBuf, show_hidden: bool) -> Panel {
@@ -704,7 +711,7 @@ fn sort_entries(entries: &mut [Entry], sort: SortBy, reverse: bool, sizes: &Hash
             SortBy::Size => effective_size(b, sizes).cmp(&effective_size(a, sizes)),
             SortBy::Time => b.modified.cmp(&a.modified),
         }
-        .then_with(|| a.sort_name.cmp(&b.sort_name));
+        .then_with(|| name_order(&a.sort_name, &b.sort_name));
         b.is_dir.cmp(&a.is_dir).then(if reverse { order.reverse() } else { order })
     });
 }

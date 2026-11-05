@@ -257,6 +257,7 @@ pub struct App {
 impl App {
     pub fn new(left: PathBuf, right: PathBuf, config: Config) -> Self {
         let show_hidden = config.settings.show_hidden;
+        crate::panel::NATURAL_SORT.store(config.settings.natural_sort, Ordering::Relaxed);
         let mut history = History::load(config.history_file.clone());
         let panels = [Panel::new(left, show_hidden), Panel::new(right, show_hidden)];
         history.visit(&panels[1].cwd);
@@ -1004,7 +1005,8 @@ impl App {
         {
             self.error(format!("Cannot save the settings:\n{e}"));
         }
-        if settings.show_hidden != self.config.settings.show_hidden {
+        crate::panel::NATURAL_SORT.store(settings.natural_sort, Ordering::Relaxed);
+        if settings.show_hidden != self.config.settings.show_hidden || settings.natural_sort != self.config.settings.natural_sort {
             for panel in &mut self.panels {
                 panel.show_hidden = settings.show_hidden;
                 panel.reload();
@@ -1336,7 +1338,7 @@ impl App {
             };
             changed = true;
             match msg {
-                Msg::Progress(progress) => job.progress = progress,
+                Msg::Progress(progress) => job.update(progress),
                 Msg::Ask(question, reply) => self.dialog = Some(question_dialog(question, reply)),
                 Msg::Done { errors, cancelled, as_admin } => {
                     finished = Some((errors, cancelled, as_admin));
@@ -2735,6 +2737,11 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.config.settings.arrows_navigate);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.natural_sort);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.config.settings.natural_sort);
 
         // Text rows: type, and it counts when the cursor moves on.
         app.on_key(key(KeyCode::Down));

@@ -83,7 +83,7 @@ pub fn start(paths: Vec<PathBuf>, earlier: Vec<String>) -> Running {
         let _ = tx.send(Msg::Done { errors, cancelled, as_admin: None });
     });
     let progress = Progress { current: "Waiting for Windows to allow administrator rights…".into(), ..Progress::default() };
-    Running { title: "Delete as administrator", progress, rx, cancel }
+    Running::new("Delete as administrator", progress, rx, cancel)
 }
 
 /// Starts the helper, passes its progress on, asks it to stop when cancelled, and reads
