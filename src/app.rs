@@ -231,6 +231,8 @@ pub struct App {
     stray_key: Option<Instant>,
     /// Where the cursor goes when the running job ends.
     select_after: Option<PathBuf>,
+    /// The running job works on the item under the cursor, whatever is marked: the marks stay.
+    keep_marks: bool,
     pub quit: bool,
     pub hotlist: Hotlist,
     /// Screen areas from the last frame, for the mouse.
@@ -329,6 +331,7 @@ impl App {
             answer_delay: std::time::Duration::from_millis(if cfg!(test) { 0 } else { 550 }),
             stray_key: None,
             select_after: None,
+            keep_marks: false,
             quit: false,
             hit: HitAreas::default(),
             last_click: None,
@@ -632,6 +635,8 @@ impl App {
             KeyCode::F(4) => self.edit_current(),
             KeyCode::F(5) if alt => self.start_pack(),
             KeyCode::F(9) if alt => self.start_unpack(),
+            KeyCode::F(5) if shift => self.start_in_place(false),
+            KeyCode::F(6) if shift => self.start_in_place(true),
             KeyCode::F(5) => self.start_transfer(false),
             KeyCode::F(6) => self.start_transfer(true),
             // Alt+F7 as in Total Commander, Alt+? as in mc.
@@ -1493,21 +1498,10 @@ impl App {
     fn on_input(&mut self, action: InputAction, text: String) {
         let cwd = self.active_panel().cwd.clone();
         match action {
-            InputAction::Copy(sources) => match ops::plan(&sources, &text, &cwd) {
-                Ok(pairs) => self.start_job(Job::Copy(pairs)),
-                Err(e) => self.error(e),
-            },
-            InputAction::Move(sources) => match ops::plan_move(&sources, &text, &cwd) {
-                Ok(pairs) => {
-                    if let [(from, to)] = pairs.as_slice()
-                        && from.parent().zip(to.parent()).is_some_and(|(a, b)| util::same_path(a, b))
-                    {
-                        self.select_after = Some(to.clone());
-                    }
-                    self.start_job(Job::Move(pairs));
-                }
-                Err(e) => self.error(e),
-            },
+            InputAction::Copy(sources) => self.transfer(&sources, &text, false, false),
+            InputAction::Move(sources) => self.transfer(&sources, &text, true, false),
+            InputAction::CopyHere(source) => self.transfer(&[source], &text, false, true),
+            InputAction::MoveHere(source) => self.transfer(&[source], &text, true, true),
             InputAction::Rename(from) => self.rename(&from, &text),
             InputAction::Mkdir => self.mkdir(&cwd, &text),
             InputAction::NewFile => self.new_file(&cwd, &text),
@@ -1562,6 +1556,28 @@ impl App {
                 }
             }
         }
+    }
+
+    /// F5, F6 and their Shift forms once the destination is typed; nothing typed, nothing done.
+    /// `keep_marks`: the job leaves the marks alone, as they aren't what it worked on.
+    fn transfer(&mut self, sources: &[PathBuf], text: &str, moving: bool, keep_marks: bool) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let cwd = &self.active_panel().cwd;
+        let planned = if moving { ops::plan_move(sources, text, cwd) } else { ops::plan(sources, text, cwd) };
+        let pairs = match planned {
+            Ok(pairs) => pairs,
+            Err(e) => return self.error(e),
+        };
+        // One item under another name in its own folder: the cursor goes along.
+        if let [(from, to)] = pairs.as_slice()
+            && from.parent().zip(to.parent()).is_some_and(|(a, b)| util::same_path(a, b))
+        {
+            self.select_after = Some(to.clone());
+        }
+        self.keep_marks = keep_marks;
+        self.start_job(if moving { Job::Move(pairs) } else { Job::Copy(pairs) });
     }
 
     fn start_input(&mut self, title: &str, prompt: &str, text: &str, action: InputAction) {
@@ -1710,7 +1726,7 @@ impl App {
             // Done: the marks of the panel it started from have served (the other side's are
             // for another job, as after Shift+F2). Stopped or partly failed: they stay, to try
             // again.
-            if touched_files && side == job_side && errors.is_empty() && !cancelled {
+            if touched_files && side == job_side && errors.is_empty() && !cancelled && !self.keep_marks {
                 panel.clear_marks();
             }
             // Sizes may be out of date after copying, moving or deleting.
@@ -1719,7 +1735,8 @@ impl App {
             }
             panel.reload();
         }
-        // A rename by F6: the cursor goes along, as with Shift+F6.
+        self.keep_marks = false;
+        // One item renamed or copied beside itself: the cursor goes along.
         if let Some(target) = self.select_after.take() {
             self.select_in_active(&target);
         }
@@ -2362,6 +2379,21 @@ impl App {
             self.start_input("Move", &format!("Move {what} to:"), &default, InputAction::Move(sources));
         } else {
             self.start_input("Copy", &format!("Copy {what} to:"), &default, InputAction::Copy(sources));
+        }
+    }
+
+    /// Shift+F5 / Shift+F6, as in mc: the item under the cursor, marks or not, in this folder.
+    /// The field starts empty, and what is typed counts from this folder.
+    fn start_in_place(&mut self, is_move: bool) {
+        if self.refuse_in_archive(self.active) {
+            return;
+        }
+        let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
+        let (name, path) = (entry.name.clone(), entry.path.clone());
+        if is_move {
+            self.start_input("Rename", &format!("Rename \"{name}\" to:"), "", InputAction::MoveHere(path));
+        } else {
+            self.start_input("Copy", &format!("Copy \"{name}\" to:"), "", InputAction::CopyHere(path));
         }
     }
 
@@ -3935,6 +3967,56 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(tmp.path().join("Gamma.txt").exists());
         assert_eq!(app.active_panel().current().unwrap().name, "Gamma.txt");
+    }
+
+    /// Shift+F5 and Shift+F6 take the file under the cursor, whatever is marked, and stay in
+    /// its folder: the field starts empty (not on the other panel), the cursor follows the new
+    /// name, the marks stay for the next job.
+    #[test]
+    fn shift_f5_and_shift_f6_work_in_place() {
+        let left = TempDir::new("app-here-left");
+        let right = TempDir::new("app-here-right");
+        left.file("a.txt", "a");
+        left.file("b.txt", "b");
+        let mut app = test_app(left.path(), right.path());
+        assert!(app.active_panel_mut().select_name("a.txt"));
+        app.active_panel_mut().toggle_mark();
+        assert!(app.active_panel_mut().select_name("b.txt"));
+        let shift = |n| with_mods(KeyCode::F(n), KeyModifiers::SHIFT);
+
+        app.on_key(shift(5));
+        let Some(Dialog::Input { edit, prompt, .. }) = &app.dialog else { panic!("no dialog") };
+        assert_eq!((edit.text(), prompt.as_str()), ("", "Copy \"b.txt\" to:"));
+        typing(&mut app, "b copy.txt");
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        assert_eq!(fs::read_to_string(left.path().join("b copy.txt")).unwrap(), "b");
+        assert!(left.path().join("b.txt").exists() && fs::read_dir(right.path()).unwrap().next().is_none());
+        assert_eq!(app.active_panel().current().unwrap().name, "b copy.txt");
+        assert_eq!(app.active_panel().marked_summary(), Some((1, 1)), "the marks are for another job");
+
+        app.on_key(shift(6));
+        typing(&mut app, "c.txt");
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
+        assert!(left.path().join("c.txt").exists() && !left.path().join("b copy.txt").exists());
+        assert_eq!(app.active_panel().current().unwrap().name, "c.txt");
+        assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
+
+        // Nothing typed, nothing done, and no box to say so.
+        app.on_key(shift(5));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none() && app.job.is_none());
+
+        // A name that is there: the usual question, here too.
+        app.active_panel_mut().select_name("c.txt");
+        app.on_key(shift(6));
+        typing(&mut app, "b.txt");
+        app.on_key(key(KeyCode::Enter));
+        wait_until("the overwrite question", &mut app, |app| matches!(app.dialog, Some(Dialog::Question { .. })));
+        app.on_key(key(KeyCode::Esc));
+        wait_for_job(&mut app);
+        assert_eq!(fs::read_to_string(left.path().join("b.txt")).unwrap(), "b");
     }
 
     #[test]
