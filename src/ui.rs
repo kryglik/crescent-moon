@@ -111,6 +111,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(job) = &app.job {
         draw_progress(frame, area, job, t);
     }
+    if let Some(connecting) = &app.connecting {
+        let lines = [format!("Connecting to {}…", connecting.target), "Esc stops".to_string()];
+        draw_message(frame, area, "SSH", &lines, &[], 0, false, t);
+    }
     // Help can't scroll past its end (or keys up would first have to undo the excess).
     if let Some(Dialog::Help { scroll }) = &mut app.dialog {
         let visible = help_height(area).saturating_sub(2) as usize;
@@ -1699,7 +1703,7 @@ mod tests {
         let mut app = app_for(&tmp);
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(1)));
         // Tall enough for all of it.
-        let help = render(&mut app, 80, 90);
+        let help = render(&mut app, 80, 110);
         assert!(help.contains("rmc keys"));
         // The longest help lines fit whole.
         assert!(help.contains("Enter runs it in the shell, in the panel's folder"), "{help}");

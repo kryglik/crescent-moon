@@ -5,11 +5,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::archive::{self, Archive};
 use crate::find::NameFilter;
 use crate::git::Repo;
+use crate::ssh::{self, Connection};
 use crate::{platform, util};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +148,35 @@ pub struct Panel {
     pub archive: Option<ArchiveView>,
     /// The git repository the folder is in (not while in a zip), read again at each load.
     pub repo: Option<Repo>,
+    /// A folder on another computer shown here. `cwd` stays the folder on this one, which the
+    /// shell and the drive memory go by.
+    pub remote: Option<RemoteView>,
+    /// A reload couldn't reach the other computer, and why; for the user to be told.
+    pub lost: Option<String>,
+}
+
+/// The folder of another computer a panel shows.
+#[derive(Clone)]
+pub struct RemoteView {
+    pub connection: Arc<Connection>,
+    pub dir: String,
+}
+
+impl RemoteView {
+    /// The whole address of `path` over there.
+    pub fn place(&self, path: &str) -> PathBuf {
+        PathBuf::from(self.connection.target.place(path))
+    }
+
+    /// The address of this folder, as a folder to put things in: with a slash at the end.
+    pub fn folder_text(&self) -> String {
+        self.connection.target.place(&ssh::join(&self.dir, ""))
+    }
+
+    /// What `input` means from this folder.
+    pub fn resolve(&self, input: &str) -> String {
+        ssh::resolve(&self.dir, &self.connection.home, input)
+    }
 }
 
 /// The zip a panel shows, and where in it.
@@ -219,6 +250,8 @@ impl Panel {
             forward: Vec::new(),
             archive: None,
             repo: None,
+            remote: None,
+            lost: None,
         }
     }
 
@@ -227,6 +260,7 @@ impl Panel {
         let mut tab = Panel::new(self.cwd.clone(), self.show_hidden);
         (tab.sort, tab.reverse, tab.filter) = (self.sort, self.reverse, self.filter.clone());
         tab.drive_dirs = self.drive_dirs.clone();
+        tab.remote = self.remote.clone();
         tab.reload();
         tab
     }
@@ -250,9 +284,10 @@ impl Panel {
     /// Re-reads the directory. Marks of entries that still exist are kept.
     pub fn load(&mut self) -> io::Result<()> {
         let filter = self.filter.as_deref().map(NameFilter::parse);
-        let mut entries = match &self.archive {
-            Some(view) => archive_entries(view, filter.as_ref()),
-            None => read_entries(&self.cwd, self.show_hidden, filter.as_ref())?,
+        let mut entries = match (&self.archive, &self.remote) {
+            (Some(view), _) => archive_entries(view, filter.as_ref()),
+            (None, Some(view)) => remote_entries(view, self.show_hidden, filter.as_ref())?,
+            (None, None) => read_entries(&self.cwd, self.show_hidden, filter.as_ref())?,
         };
         sort_entries(&mut entries, self.sort, self.reverse, &self.dir_sizes);
         // On Windows a drive root gets ".." too: it opens the drive picker. In an archive ".."
@@ -261,12 +296,19 @@ impl Panel {
             let mut up = Entry::parent(&self.cwd);
             up.path = view.location().parent().map_or_else(|| self.cwd.clone(), Path::to_path_buf);
             entries.insert(0, up);
+        } else if let Some(view) = &self.remote {
+            // At the top of the other computer, ".." leads back to this one.
+            let path = ssh::parent(&view.dir).map_or_else(|| self.cwd.clone(), |parent| view.place(&parent));
+            entries.insert(0, Entry { path, modified: None, ..Entry::parent(Path::new("")) });
         } else if self.cwd.parent().is_some() || cfg!(windows) {
             entries.insert(0, Entry::parent(&self.cwd));
         }
         self.entries = entries;
-        self.space = platform::disk_space(&self.cwd);
-        self.repo = if self.archive.is_none() { Repo::find(&self.cwd) } else { None };
+        self.space = match &self.remote {
+            Some(view) => view.connection.sftp.space(&view.dir).map(|space| (space.free, space.total)),
+            None => platform::disk_space(&self.cwd),
+        };
+        self.repo = if self.archive.is_none() && self.remote.is_none() { Repo::find(&self.cwd) } else { None };
         // Marks and sizes of entries that are gone go too (looked up by name: a folder of
         // 50,000 photos with all of them marked must not take seconds).
         let names: HashSet<&str> = self.entries.iter().filter(|e| !e.is_parent).map(|e| e.name.as_str()).collect();
@@ -292,7 +334,10 @@ impl Panel {
     pub fn reload(&mut self) {
         let name = self.current().map(|e| e.name.clone());
         self.reopen_archive();
-        if self.load().is_err() {
+        if let Err(error) = self.load() {
+            if self.remote.is_some() {
+                return self.remote_failed(&error);
+            }
             // The directory vanished (deleted, drive removed): climb to something that exists,
             // starting above it. When the whole drive is gone (a share offline), each step up
             // would wait for it again, so go home at once.
@@ -320,11 +365,37 @@ impl Panel {
         }
     }
 
-    /// Goes to `dir`; the folder it leaves is the one Alt+Left goes back to.
+    /// A folder on another computer can't be read. If the server is only slow the panel stays
+    /// as it is. If the folder is gone, the nearest one above it. If the connection is gone,
+    /// back to this computer. `lost` tells the user.
+    fn remote_failed(&mut self, error: &io::Error) {
+        let Some(view) = &self.remote else { return };
+        let target = view.connection.target.to_string();
+        if error.kind() == io::ErrorKind::TimedOut {
+            self.lost = Some(format!("{target} doesn't answer: the panel shows what it last read."));
+            return;
+        }
+        if view.connection.sftp.lost().is_none() {
+            while let Some(view) = self.remote.as_mut() {
+                let Some(parent) = ssh::parent(&view.dir) else { break };
+                view.dir = parent;
+                if self.load().is_ok() {
+                    return;
+                }
+            }
+        }
+        self.remote = None;
+        self.archive = None;
+        self.lost = Some(format!("The connection to {target} is gone."));
+        self.reload();
+    }
+
+    /// Goes to `dir`, a folder or the address of one on another computer; where the panel was
+    /// is where Alt+Left goes back to.
     pub fn change_dir(&mut self, dir: PathBuf) -> Result<(), String> {
-        let previous = self.cwd.clone();
+        let previous = self.place();
         self.open_dir(dir)?;
-        if !util::same_path(&previous, &self.cwd) {
+        if !util::same_path(&previous, &self.place()) {
             self.back.push(previous);
             if self.back.len() > BACK_LIMIT {
                 self.back.remove(0);
@@ -349,10 +420,14 @@ impl Panel {
         loop {
             let next = if back { self.back.pop() } else { self.forward.pop() };
             let Some(dir) = next else { return Ok(false) };
-            if !crate::lfs::is_dir(&dir) {
+            let reachable = match ssh::parse_exact(&dir.to_string_lossy()) {
+                Some((target, _)) => ssh::find(&target).is_some(),
+                None => crate::lfs::is_dir(&dir),
+            };
+            if !reachable {
                 continue;
             }
-            let here = self.cwd.clone();
+            let here = self.place();
             self.open_dir(dir)?;
             if back { self.forward.push(here) } else { self.back.push(here) }
             return Ok(true);
@@ -420,9 +495,25 @@ impl Panel {
         let _ = self.load();
     }
 
-    /// Where the panel is: its folder, or inside a zip (`E:\x\photos.zip\2024`).
+    /// Where the panel is: its folder, on another computer its address (`nas:/home/me`).
+    pub fn place(&self) -> PathBuf {
+        self.remote.as_ref().map_or_else(|| self.cwd.clone(), |view| view.place(&view.dir))
+    }
+
+    /// What the panel shows: `place`, or inside a zip (`E:\x\photos.zip\2024`).
     pub fn location(&self) -> PathBuf {
-        self.archive.as_ref().map_or_else(|| self.cwd.clone(), ArchiveView::location)
+        self.archive.as_ref().map_or_else(|| self.place(), ArchiveView::location)
+    }
+
+    /// On another computer: the paths there of the marked entries (or the one under the cursor).
+    pub fn remote_selection(&self) -> Vec<String> {
+        let Some(view) = &self.remote else { return Vec::new() };
+        let names: Vec<&str> = if self.marked.is_empty() {
+            self.current().filter(|e| !e.is_parent).map(|e| vec![e.name.as_str()]).unwrap_or_default()
+        } else {
+            self.entries.iter().filter(|e| self.is_marked(e)).map(|e| e.name.as_str()).collect()
+        };
+        names.iter().map(|name| ssh::join(&view.dir, name)).collect()
     }
 
     /// The archive item of an entry of this panel.
@@ -444,9 +535,15 @@ impl Panel {
     }
 
     fn open_dir(&mut self, dir: PathBuf) -> Result<(), String> {
+        if let Some((target, path)) = ssh::parse_exact(&dir.to_string_lossy()) {
+            let connection = ssh::find(&target).ok_or_else(|| format!("Not connected to {target}."))?;
+            let dir = ssh::absolute(&connection.home, &path);
+            return self.open_remote(RemoteView { connection, dir });
+        }
         let dir = util::normalize(&dir);
-        // Going anywhere else leaves the archive.
+        // Going anywhere else leaves the archive, and the other computer.
         let archive = self.archive.take();
+        let remote = self.remote.take();
         let previous = std::mem::replace(&mut self.cwd, dir.clone());
         let marked = std::mem::take(&mut self.marked);
         let sizes = std::mem::take(&mut self.dir_sizes);
@@ -466,8 +563,37 @@ impl Panel {
                 self.marked = marked;
                 self.dir_sizes = sizes;
                 self.archive = archive;
+                self.remote = remote;
                 let _ = self.load();
                 Err(format!("Cannot open \"{}\":\n{e}", dir.display()))
+            }
+        }
+    }
+
+    /// Goes to a folder on another computer.
+    fn open_remote(&mut self, view: RemoteView) -> Result<(), String> {
+        let archive = self.archive.take();
+        let (place, dir) = (view.place(&view.dir), view.dir.clone());
+        let previous = self.remote.replace(view);
+        let marked = std::mem::take(&mut self.marked);
+        let sizes = std::mem::take(&mut self.dir_sizes);
+        match self.load() {
+            Ok(()) => {
+                (self.cursor, self.offset) = (0, 0);
+                // Coming back up: the cursor on the folder just left.
+                let left = previous.as_ref().map_or("", |view| view.dir.as_str());
+                if let Some(name) = left.strip_prefix(&ssh::join(&dir, "")).and_then(|below| below.split('/').next()) {
+                    self.select_name(name);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.remote = previous;
+                self.marked = marked;
+                self.dir_sizes = sizes;
+                self.archive = archive;
+                let _ = self.load();
+                Err(format!("Cannot open \"{}\":\n{e}", place.display()))
             }
         }
     }
@@ -688,6 +814,38 @@ fn archive_entries(view: &ArchiveView, filter: Option<&NameFilter>) -> Vec<Entry
             sort_name: item.name().to_lowercase(),
         })
         .collect()
+}
+
+/// The entries of a folder on another computer. A link shows what it points to, as here.
+fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {
+    let sftp = &view.connection.sftp;
+    let mut out = Vec::new();
+    for item in sftp.read_dir(&view.dir)? {
+        let is_hidden = item.name.starts_with('.');
+        if !show_hidden && is_hidden {
+            continue;
+        }
+        let path = ssh::join(&view.dir, &item.name);
+        let is_link = item.attrs.is_link();
+        let attrs = if is_link { sftp.stat(&path).unwrap_or(item.attrs) } else { item.attrs };
+        let is_dir = attrs.is_dir();
+        if !is_dir && filter.is_some_and(|f| !f.matches(&item.name)) {
+            continue;
+        }
+        out.push(Entry {
+            sort_name: item.name.to_lowercase(),
+            is_exec: attrs.is_executable(),
+            size: if is_dir { 0 } else { attrs.size.unwrap_or(0) },
+            modified: attrs.modified(),
+            path: view.place(&path),
+            name: item.name,
+            is_dir,
+            is_link,
+            is_parent: false,
+            is_hidden,
+        });
+    }
+    Ok(out)
 }
 
 fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {

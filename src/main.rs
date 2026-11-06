@@ -23,7 +23,9 @@ mod preview;
 mod sandbox_tests;
 mod scheme;
 mod settings;
+mod sftp;
 mod sizes;
+mod ssh;
 mod subshell;
 mod survey;
 #[cfg(test)]
@@ -324,6 +326,8 @@ fn init_terminal() -> io::Result<Tui> {
 }
 
 fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
+    // Panels on another computer are read from here: a silent network mustn't hold the screen.
+    sftp::be_impatient(Duration::from_secs(10));
     // The options editor can turn the mouse on and off; this follows `app.mouse`.
     let mut mouse = Mouse(app.mouse);
     mouse.capture()?;
@@ -422,6 +426,9 @@ fn run_external(
     external: External,
     mouse: Mouse,
 ) -> io::Result<(Result<(), String>, Option<PathBuf>)> {
+    if let External::SshLogin(target) = &external {
+        return log_in(terminal, target, mouse).map(|result| (result, None));
+    }
     // Windows programs read `foo.` as `foo` (and `nul` as the device): the editor would show
     // and save another file than the one under the cursor.
     if let External::Edit(path, _) | External::View(path, _) | External::Page(path, _) = &external
@@ -444,6 +451,7 @@ fn run_external(
         }
         External::Shell => (config.shell.interactive(&cwd_file), "the shell"),
         External::Command(line) => (config.shell.command(line), "the shell"),
+        External::SshLogin(_) => unreachable!("handled above"),
     };
     let wait = matches!(external, External::Command(_));
     command.current_dir(&cwd).env(platform::RMC_PID, std::process::id().to_string());
@@ -482,6 +490,31 @@ fn run_external(
         .map(|report| report.dir);
     let _ = std::fs::remove_file(&cwd_file);
     Ok((result, shell_cwd))
+}
+
+/// Hands the terminal to `ssh` for what it has to ask (a password, a passphrase, whether to
+/// trust a new host), and takes it back when the connection is there or has failed. Ctrl+C
+/// ends `ssh` alone, as the shield keeps it from rmc.
+fn log_in(terminal: &mut Tui, target: &ssh::Target, mouse: Mouse) -> io::Result<Result<(), String>> {
+    mouse.release();
+    terminal::disable_raw_mode()?;
+    execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
+    println!("rmc: connecting to {target}; ssh asks here for what it needs (Ctrl+C gives up).");
+    let mut shield = None;
+    let connection = ssh::Connection::open(target, ssh::Login::AtTheTerminal, || shield = Some(IgnoreInterrupts::new()));
+    drop(shield);
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), terminal::EnterAlternateScreen)?;
+    mouse.capture()?;
+    terminal.clear()?;
+    Ok(match connection {
+        Ok(connection) => {
+            ssh::keep(connection);
+            Ok(())
+        }
+        Err(ssh::Failure::Said(why)) => Err(format!("Cannot connect to {target}:\n{why}")),
+        Err(ssh::Failure::NeedsTheUser) => Err(format!("Cannot connect to {target}.")),
+    })
 }
 
 /// Runs a program in the foreground. Ctrl+C there is meant for it (stopping a search in

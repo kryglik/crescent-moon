@@ -1,9 +1,10 @@
 //! Application state and keyboard handling.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -20,14 +21,17 @@ use crate::hotlist::Hotlist;
 use crate::lfs;
 use crate::lnk;
 use crate::mouse::{HitAreas, LastClick};
+use crate::ops::remote;
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
-use crate::panel::{DirSize, Entry, Panel, SortBy};
+use crate::panel::{DirSize, Entry, Panel, RemoteView, SortBy};
 use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
 use crate::scheme::{self, Choice, Colours, Scheme};
 use crate::settings::Settings;
+use crate::sftp::Attrs;
 use crate::sizes::Sizer;
+use crate::ssh::{self, Connection, Failure, Login, Target};
 use crate::subshell::Subshell;
 use crate::survey::{Survey, Tally};
 use crate::util;
@@ -40,13 +44,46 @@ const FIND_FILES: &str = "find-files";
 /// A viewer that comes back sooner than this went on by itself, and still reads its file.
 const VIEWER_STAYS: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 0 } else { 3 });
 
-/// What happens to a file taken out of an archive (into rmc's temp folder) once it is out.
-#[derive(Debug)]
+/// What happens to a file taken out of an archive, or fetched from another computer, into
+/// rmc's temp folder once it is there.
 enum AfterJob {
     /// Enter: opened in its app; a zip in the zip opens in the panel, called `shown`.
     Open { shown: PathBuf },
     /// F3 (and F4: files in archives are read-only).
     View,
+    /// F4 on another computer: edited here, and put back if it changed. `there` is how the
+    /// file looked over there.
+    Edit { connection: Arc<Connection>, path: String, there: Attrs },
+}
+
+/// A file of another computer in the editor.
+pub struct EditedCopy {
+    local: PathBuf,
+    connection: Arc<Connection>,
+    path: String,
+    /// The copy as it came, to see if the editor changed it.
+    size: u64,
+    modified: Option<SystemTime>,
+    /// The file over there as it was fetched, to see if it changed meanwhile.
+    there: Attrs,
+    since: Instant,
+    /// A copy kept where it outlives rmc, while it isn't sure yours goes back.
+    rescued: Option<PathBuf>,
+}
+
+/// What a connection being made is for.
+enum AfterConnect {
+    /// Panel `side` goes to this address.
+    Go { side: usize, place: PathBuf },
+    /// A copy or move typed with an address on this computer as its destination.
+    Transfer { sources: Vec<PathBuf>, text: String, moving: bool, keep_marks: bool },
+}
+
+/// A connection being made behind the panels.
+pub struct Connecting {
+    pub target: Target,
+    answer: Receiver<Result<Arc<Connection>, Failure>>,
+    then: AfterConnect,
 }
 
 /// Something to run outside the TUI; the main loop gives it the terminal.
@@ -59,6 +96,8 @@ pub enum External {
     Page(PathBuf, Option<u64>),
     Shell,
     Command(String),
+    /// `ssh` wants to ask something, on the terminal.
+    SshLogin(Target),
 }
 
 /// The default big-file limit: files bigger than this go to the pager instead of the viewer,
@@ -226,6 +265,15 @@ pub struct App {
     scheme_file_written: Option<(PathBuf, String)>,
     /// The folder of a file taken out of an archive for the viewer, removed when it closes.
     viewed_copy: Option<(PathBuf, Instant)>,
+    /// A file of another computer in the editor.
+    edited_copy: Option<EditedCopy>,
+    /// The running job puts this edited copy back: what is left of it when it is over, and
+    /// the place it was saved to for safety.
+    putting_back: Option<(PathBuf, Option<PathBuf>)>,
+    /// A connection being made; keys wait for it.
+    pub connecting: Option<Connecting>,
+    /// What to do once `ssh` has logged in at the terminal.
+    login_then: Option<AfterConnect>,
     /// The panel the running job started from: its marks are the ones the job uses up.
     job_side: usize,
     /// When an overwrite question opened, and how long it takes no answer (see `on_key`).
@@ -332,6 +380,10 @@ impl App {
             external: None,
             scheme_file_written: None,
             viewed_copy: None,
+            edited_copy: None,
+            putting_back: None,
+            connecting: None,
+            login_then: None,
             job_side: 0,
             overwrite_asked: None,
             // Longer than a key takes to start repeating when it is held (0.5 s by default).
@@ -455,6 +507,10 @@ impl App {
     fn preview_key(&self) -> Option<PreviewKey> {
         let panel = self.active_panel();
         let entry = panel.current().filter(|e| !e.is_parent)?;
+        // A file on another computer stays there until it is asked for.
+        if panel.remote.is_some() && panel.archive.is_none() {
+            return None;
+        }
         let archive = match &panel.archive {
             Some(view) => {
                 let item = panel.archive_item(entry).filter(|item| !item.is_dir)?;
@@ -494,6 +550,11 @@ impl App {
         let now = Instant::now();
         let mut changed = false;
         for side in 0..2 {
+            // What another computer does isn't seen from here: Ctrl+R reads it again.
+            if self.panels[side].remote.is_some() {
+                self.watches[side] = None;
+                continue;
+            }
             let cwd = &self.panels[side].cwd;
             if self.watches[side].as_ref().is_none_or(|w| w.dir != *cwd) {
                 self.watches[side] = Some(Watch::new(cwd));
@@ -541,7 +602,12 @@ impl App {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
         let finding = self.finder.as_ref().is_some_and(Finder::working);
         let surveying = matches!(&self.dialog, Some(Dialog::Delete { survey, .. }) if !survey.is_done());
-        self.job.is_some() || self.sizer.as_ref().is_some_and(Sizer::is_busy) || drives_pending || finding || surveying
+        self.job.is_some()
+            || self.connecting.is_some()
+            || self.sizer.as_ref().is_some_and(Sizer::is_busy)
+            || drives_pending
+            || finding
+            || surveying
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -600,6 +666,11 @@ impl App {
         self.git.touch();
         if self.shell_shown {
             self.on_shell_key(key);
+        } else if self.connecting.is_some() {
+            // The attempt ends by itself, and nobody takes its answer.
+            if key.code == KeyCode::Esc {
+                self.connecting = None;
+            }
         } else if self.dialog.is_some() {
             self.on_dialog_key(key);
         } else if self.find_shown {
@@ -635,7 +706,7 @@ impl App {
                 self.refuse_in_archive(self.active);
             }
             KeyCode::F(4) if shift => {
-                if !self.refuse_in_archive(self.active) {
+                if !self.refuse_in_archive(self.active) && !self.refuse_over_ssh("Shift+F4 makes files on this computer") {
                     self.start_input("New file", "Create and edit file:", "", InputAction::NewFile);
                 }
             }
@@ -657,6 +728,9 @@ impl App {
             KeyCode::F(12) => self.dialog = Some(Dialog::Commands { filter: LineEdit::default(), cursor: 0 }),
             KeyCode::Char('p') if ctrl && !alt => self.open_options(),
             KeyCode::Char('q') if ctrl && !alt => self.toggle_quick_view(),
+            KeyCode::Char('n') if ctrl && !alt => {
+                self.start_input("Connect over SSH", "Connect to (host, user@host, host:/path):", "", InputAction::Connect);
+            }
             KeyCode::Char('c') if ctrl && !alt => self.copy_to_clipboard(Effect::Copy),
             KeyCode::Char('C') if ctrl && !alt => self.copy_paths(),
             KeyCode::Char('x') if ctrl && !alt => self.copy_to_clipboard(Effect::Move),
@@ -719,13 +793,13 @@ impl App {
             // Ctrl+S or Alt+S, as in mc (both together is AltGr, which types a character).
             KeyCode::Char('s') if ctrl != alt => self.quicksearch = Some(String::new()),
             KeyCode::Char('i') if alt && !ctrl => {
-                let cwd = self.active_panel().cwd.clone();
-                self.change_dir(1 - self.active, cwd);
+                let place = self.active_panel().place();
+                self.change_dir(1 - self.active, place);
             }
             KeyCode::Char('o') if alt && !ctrl => {
                 let target = match self.active_panel().current() {
                     Some(entry) if entry.is_dir && !entry.is_parent => entry.path.clone(),
-                    _ => self.active_panel().cwd.clone(),
+                    _ => self.active_panel().place(),
                 };
                 self.change_dir(1 - self.active, target);
             }
@@ -1048,6 +1122,16 @@ impl App {
             && dir.is_dir()
             && !util::same_path(&dir, &self.active_panel().cwd)
         {
+            self.follow_shell(dir);
+        }
+    }
+
+    /// The shell has moved to `dir`: the active panel follows, unless it shows another computer,
+    /// whose folder the shell has nothing to do with.
+    fn follow_shell(&mut self, dir: PathBuf) {
+        if self.active_panel().remote.is_some() {
+            self.active_panel_mut().cwd = dir;
+        } else {
             self.change_dir(self.active, dir);
         }
     }
@@ -1072,6 +1156,9 @@ impl App {
     /// Alt+F7: the Find window for the active panel's folder. It comes back as it was left;
     /// if the panel has moved since, the same query runs in the new folder.
     fn open_find(&mut self) {
+        if self.refuse_over_ssh("Find looks through files on this computer") {
+            return;
+        }
         let cwd = self.active_panel().cwd.clone();
         self.finder = Some(match self.finder.take() {
             Some(finder) if util::same_path(&finder.root, &cwd) => finder,
@@ -1426,8 +1513,8 @@ impl App {
     }
 
     fn open_hotlist(&mut self) {
-        let cwd = &self.active_panel().cwd;
-        let cursor = self.hotlist.dirs.iter().position(|d| util::same_path(d, cwd)).unwrap_or(0);
+        let cwd = self.active_panel().place();
+        let cursor = self.hotlist.dirs.iter().position(|d| util::same_path(d, &cwd)).unwrap_or(0);
         self.dialog = Some(Dialog::Hotlist { cursor });
     }
 
@@ -1466,7 +1553,7 @@ impl App {
                 }
             }
             KeyCode::Insert | KeyCode::Char('a' | 'A' | '+') if !ctrl => {
-                let cwd = self.active_panel().cwd.clone();
+                let cwd = self.active_panel().place();
                 cursor = self.hotlist.add(&cwd);
                 self.save_hotlist();
             }
@@ -1491,6 +1578,9 @@ impl App {
     /// Ctrl+Space: measures the marked directories, the one under the cursor,
     /// or on ".." every directory in the panel.
     fn calculate_sizes(&mut self) {
+        if self.refuse_over_ssh("Ctrl+Space measures folders on this computer") {
+            return;
+        }
         // In an archive the sizes are all in its index: no measuring needed.
         if let Some(view) = &self.panels[self.active].archive {
             let sizes: Vec<(String, u64)> = view
@@ -1538,13 +1628,15 @@ impl App {
             ConfirmAction::Edit(path, line) => self.external = Some(External::Edit(path, line)),
             ConfirmAction::View(path, line) => self.external = Some(External::View(path, line)),
             ConfirmAction::Pack(sources, dest) => self.start_job(Job::Pack { sources, dest }),
+            ConfirmAction::DeleteThere(connection, paths) => self.start_job(Job::DeleteThere { connection, paths }),
+            ConfirmAction::PutBack(copy) => self.put_back(*copy),
         }
     }
 
     /// Alt+F5 (Total Commander's key): the marked files (or the one under the cursor) into a
     /// new zip, in the other panel's folder by default.
     fn start_pack(&mut self) {
-        if self.refuse_in_archive(self.active) {
+        if self.refuse_in_archive(self.active) || self.refuse_over_ssh("Alt+F5 packs files on this computer") {
             return;
         }
         let sources = self.active_panel().selection();
@@ -1564,7 +1656,7 @@ impl App {
     /// panel's folder; one with several things at its top into a folder of its own name, as
     /// 7-Zip's "Extract to name\" does.
     fn start_unpack(&mut self) {
-        if self.refuse_in_archive(self.active) {
+        if self.refuse_in_archive(self.active) || self.refuse_over_ssh("Alt+F9 unpacks zips on this computer") {
             return;
         }
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_dir && archive::is_archive(&e.path)).cloned() else {
@@ -1586,8 +1678,11 @@ impl App {
     }
 
     fn on_input(&mut self, action: InputAction, text: String) {
-        self.history.inputs.add(action.kind(), text.trim());
-        self.history_changed = true;
+        // A password typed into an address is refused, and isn't kept either.
+        if !ssh::has_password(&text) {
+            self.history.inputs.add(action.kind(), text.trim());
+            self.history_changed = true;
+        }
         let cwd = self.active_panel().cwd.clone();
         match action {
             InputAction::Copy(sources) => self.transfer(&sources, &text, false, false),
@@ -1603,9 +1698,21 @@ impl App {
             InputAction::Unselect => {
                 self.active_panel_mut().mark_matching(&text, false);
             }
+            InputAction::Connect => {
+                if text.trim().is_empty() {
+                    return;
+                }
+                match ssh::parse_connect(&text) {
+                    Ok((target, path)) => self.change_dir(self.active, PathBuf::from(target.place(&path))),
+                    Err(e) => self.error(e),
+                }
+            }
             InputAction::Extract { archive, items } => {
                 if text.trim().is_empty() {
                     return;
+                }
+                if ssh::parse(&text).is_some() {
+                    return self.error("Files come out of an archive on this computer: copy them to the other one from here.");
                 }
                 let dest = util::as_windows_makes_it(util::resolve(&cwd, &text));
                 self.start_job(Job::Extract { archive, items, dest });
@@ -1613,6 +1720,9 @@ impl App {
             InputAction::Pack(sources) => {
                 if text.trim().is_empty() {
                     return;
+                }
+                if ssh::parse(&text).is_some() {
+                    return self.error("A zip is made on this computer: copy it to the other one from here.");
                 }
                 let mut dest = util::as_windows_makes_it(util::resolve(&cwd, &text));
                 // A folder, also one typed with a slash at the end that isn't there yet.
@@ -1656,6 +1766,16 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
+        let typed = match ssh::parse_typed(text) {
+            Ok(typed) => typed,
+            Err(e) => return self.error(e),
+        };
+        // `a:b` that is there is that name here, as in scp a `./` would make it.
+        let panel = self.active_panel();
+        let typed = typed.filter(|_| panel.remote.is_some() || lfs::symlink_metadata(&util::resolve(&panel.cwd, text)).is_err());
+        if typed.is_some() || panel.remote.is_some() {
+            return self.transfer_over_ssh(sources, text, typed, moving, keep_marks);
+        }
         let cwd = &self.active_panel().cwd;
         let planned = if moving { ops::plan_move(sources, text, cwd) } else { ops::plan(sources, text, cwd) };
         let pairs = match planned {
@@ -1670,6 +1790,88 @@ impl App {
         }
         self.keep_marks = keep_marks;
         self.start_job(if moving { Job::Move(pairs) } else { Job::Copy(pairs) });
+    }
+
+    /// F5, F6 and their Shift forms with an end on another computer. An address goes there
+    /// (connecting first if need be); on a panel showing another computer a name counts from
+    /// the folder there; a whole path is on this computer.
+    fn transfer_over_ssh(&mut self, sources: &[PathBuf], text: &str, typed: Option<(Target, String)>, moving: bool, keep_marks: bool) {
+        let panel = self.active_panel();
+        let view = panel.remote.clone();
+        let dest = match typed {
+            Some((target, path)) => {
+                let Some(connection) = ssh::find(&target) else {
+                    let then = AfterConnect::Transfer { sources: sources.to_vec(), text: text.to_string(), moving, keep_marks };
+                    return self.connect(target, then);
+                };
+                let path = ssh::resolve(&connection.home, &connection.home, &path);
+                remote::Place::There(connection, path)
+            }
+            None => match &view {
+                Some(view) if !is_whole_path(text) => remote::Place::There(view.connection.clone(), view.resolve(text)),
+                _ => remote::Place::Here(util::as_windows_makes_it(util::resolve(&panel.cwd, text))),
+            },
+        };
+        let from: Vec<remote::Place> = sources
+            .iter()
+            .map(|source| match (&view, ssh::parse_exact(&source.to_string_lossy())) {
+                (Some(view), Some((_, path))) => remote::Place::There(view.connection.clone(), path),
+                _ => remote::Place::Here(source.clone()),
+            })
+            .collect();
+        let as_folder = util::strip_quotes(text.trim()).ends_with(['/', '\\']);
+        let pairs = match remote::plan(&from, &dest, as_folder) {
+            Ok(pairs) => pairs,
+            Err(e) => return self.error(e),
+        };
+        if let [(from, to)] = pairs.as_slice()
+            && from.is_beside(to)
+        {
+            self.select_after = Some(to.shown());
+        }
+        self.keep_marks = keep_marks;
+        self.start_job(Job::Transfer { pairs, moving, replace: false });
+    }
+
+    /// Starts connecting to `target` behind the panels; `then` follows when that is done.
+    fn connect(&mut self, target: Target, then: AfterConnect) {
+        let (tx, answer) = mpsc::channel();
+        let who = target.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Connection::open(&who, Login::Quiet, || {}));
+        });
+        self.connecting = Some(Connecting { target, answer, then });
+    }
+
+    /// The answer of a connection being made. If `ssh` wants to ask something, it gets the
+    /// terminal. Returns whether anything arrived.
+    fn tick_connecting(&mut self) -> bool {
+        let Some(connecting) = &self.connecting else { return false };
+        let answer = match connecting.answer.try_recv() {
+            Ok(answer) => answer,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err(Failure::Said("the attempt ended without a word".into())),
+        };
+        let Some(Connecting { target, then, .. }) = self.connecting.take() else { return false };
+        match answer {
+            Ok(connection) => {
+                ssh::keep(connection);
+                self.connected(then);
+            }
+            Err(Failure::NeedsTheUser) => {
+                self.login_then = Some(then);
+                self.external = Some(External::SshLogin(target));
+            }
+            Err(Failure::Said(why)) => self.error(format!("Cannot connect to {target}:\n{why}")),
+        }
+        true
+    }
+
+    fn connected(&mut self, then: AfterConnect) {
+        match then {
+            AfterConnect::Go { side, place } => self.change_dir(side, place),
+            AfterConnect::Transfer { sources, text, moving, keep_marks } => self.transfer(&sources, &text, moving, keep_marks),
+        }
     }
 
     fn start_input(&mut self, title: &str, prompt: &str, text: &str, action: InputAction) {
@@ -1735,6 +1937,13 @@ impl App {
         }
         if let Some(finder) = &mut self.finder {
             changed |= finder.tick();
+        }
+        changed |= self.tick_connecting();
+        for side in 0..2 {
+            if let Some(why) = self.panels[side].lost.take() {
+                changed = true;
+                self.error(why);
+            }
         }
         changed |= self.follow_changes();
         changed |= self.tick_git();
@@ -1805,6 +2014,8 @@ impl App {
         {
             self.clipboard.moved();
         }
+        // An edited file is back on its computer, or isn't.
+        let put_back = self.putting_back.take();
         // A file taken out of an archive: now it can be opened. That changes nothing in the
         // panels, so what is marked and measured there stays.
         let taken_out = self.after_job.take();
@@ -1835,6 +2046,20 @@ impl App {
             self.select_in_active(&target);
         }
         self.git.refresh();
+        let kept_at = put_back.and_then(|(copy, rescued)| {
+            if errors.is_empty() && !cancelled {
+                let _ = rescued.map(fs::remove_file);
+                let _ = copy.parent().map(fs::remove_dir_all);
+                None
+            } else {
+                rescued.or_else(|| rescue(&copy)).or(Some(copy))
+            }
+        });
+        if let Some(kept_at) = &kept_at
+            && errors.is_empty()
+        {
+            self.notice = Some(format!("Stopped: your changes are in {}", kept_at.display()));
+        }
         // Esc just stops the job: no "cancelled" box to dismiss as well. Failures from before
         // the stop are still worth knowing about.
         if !errors.is_empty() {
@@ -1843,6 +2068,9 @@ impl App {
             lines.extend(errors.iter().take(8).map(|e| e.lines().next().unwrap_or_default().to_string()));
             if errors.len() > 8 {
                 lines.push(format!("… and {} more", errors.len() - 8));
+            }
+            if let Some(kept_at) = kept_at {
+                lines.push(format!("Your changes are in {}", kept_at.display()));
             }
             let title = if cancelled { "Stopped" } else { "Problems" };
             self.dialog = Some(Dialog::Message { title: title.into(), lines, error: true });
@@ -1858,7 +2086,17 @@ impl App {
             && dir.is_dir()
             && !util::same_path(&dir, &self.active_panel().cwd)
         {
-            self.change_dir(self.active, dir);
+            self.follow_shell(dir);
+        }
+        // `ssh` has logged in, or hasn't.
+        if let Some(then) = self.login_then.take()
+            && result.is_ok()
+        {
+            self.connected(then);
+        }
+        // A file of another computer: it goes back if it changed.
+        if let Some(copy) = self.edited_copy.take() {
+            self.after_editing(copy);
         }
         // F4 in the scheme list: the file edited counts at once (one left as it was goes).
         self.reload_schemes();
@@ -1878,7 +2116,58 @@ impl App {
         }
     }
 
+    /// The editor closed on a file of another computer. Changed, it goes back: over there it
+    /// may have changed too, and that isn't simply replaced.
+    fn after_editing(&mut self, mut copy: EditedCopy) {
+        let now = fs::metadata(&copy.local).ok();
+        let changed = now.is_some_and(|meta| meta.len() != copy.size || meta.modified().ok() != copy.modified);
+        if !changed {
+            // An editor back at once went on by itself (gvim, code), and what it saves stays here.
+            if copy.since.elapsed() < VIEWER_STAYS {
+                self.notice = Some(format!("The editor went on by itself: what it saves stays in {}", copy.local.display()));
+            } else {
+                let _ = copy.local.parent().map(fs::remove_dir_all);
+            }
+            return;
+        }
+        let target = copy.connection.target.to_string();
+        let name = ssh::name_of(&copy.path).to_string();
+        let there = copy.connection.sftp.stat(&copy.path);
+        match there {
+            // Not by the last access: fetching the file was one.
+            Ok(attrs) if attrs.size == copy.there.size && attrs.modified() == copy.there.modified() => self.put_back(copy),
+            Ok(_) => {
+                copy.rescued = rescue(&copy.local);
+                let kept = copy.rescued.as_ref().map_or_else(String::new, |path| format!("If not, yours stays in {}", path.display()));
+                self.dialog = Some(Dialog::Confirm {
+                    title: "Changed meanwhile".into(),
+                    lines: vec![format!("{name} changed on {target} while you edited it."), "Replace it with yours?".into(), kept],
+                    focus: 1,
+                    danger: true,
+                    action: ConfirmAction::PutBack(Box::new(copy)),
+                });
+            }
+            // It is gone, or the connection is: nothing replaces anything yet.
+            Err(e) => {
+                let kept = rescue(&copy.local).unwrap_or_else(|| copy.local.clone());
+                self.error(format!("Cannot save {name} on {target}:\n{e}\nYour changes are in {}", kept.display()));
+            }
+        }
+    }
+
+    fn put_back(&mut self, copy: EditedCopy) {
+        let pairs = vec![(remote::Place::Here(copy.local.clone()), remote::Place::There(copy.connection, copy.path))];
+        self.putting_back = Some((copy.local, copy.rescued));
+        self.start_job(Job::Transfer { pairs, moving: false, replace: true });
+    }
+
     fn change_dir(&mut self, side: usize, dir: PathBuf) {
+        // Another computer with no connection yet: that comes first.
+        if let Some((target, _)) = ssh::parse_exact(&dir.to_string_lossy())
+            && ssh::find(&target).is_none()
+        {
+            return self.connect(target, AfterConnect::Go { side, place: dir });
+        }
         match self.panels[side].change_dir(dir) {
             Ok(()) => self.visited(side),
             Err(e) => self.error(e),
@@ -1887,7 +2176,7 @@ impl App {
 
     /// The panel arrived in a folder: it goes to the top of the folder history (Alt+H).
     fn visited(&mut self, side: usize) {
-        let cwd = self.panels[side].cwd.clone();
+        let cwd = self.panels[side].place();
         self.history.visit(&cwd);
         self.history_changed = true;
     }
@@ -1910,7 +2199,7 @@ impl App {
     /// Explorer puts them there, so Explorer or a mail can paste them; their paths go along as
     /// text. Elsewhere than Windows the paths go to the terminal's clipboard (OSC 52).
     fn copy_to_clipboard(&mut self, effect: Effect) {
-        if self.refuse_in_archive(self.active) {
+        if self.refuse_in_archive(self.active) || self.refuse_over_ssh("The clipboard holds files of this computer") {
             return;
         }
         let paths = self.active_panel().selection();
@@ -1960,7 +2249,7 @@ impl App {
     /// the active panel's folder, copied, or moved if they were cut. A copy into the folder it
     /// came from gets Explorer's "name - Copy" name.
     fn paste(&mut self) {
-        if self.refuse_in_archive(self.active) {
+        if self.refuse_in_archive(self.active) || self.refuse_over_ssh("The clipboard pastes on this computer") {
             return;
         }
         let Some(files) = self.clipboard.files() else {
@@ -1996,7 +2285,7 @@ impl App {
     /// Alt+A: the attributes (Windows) or permissions (elsewhere) of the marked files, or the
     /// one under the cursor. Where they differ, a row shows [?] and is left as each has it.
     fn open_attributes(&mut self) {
-        if self.refuse_in_archive(self.active) {
+        if self.refuse_in_archive(self.active) || self.refuse_over_ssh("Alt+A works on this computer") {
             return;
         }
         let paths = self.active_panel().selection();
@@ -2115,8 +2404,8 @@ impl App {
     /// The folder history's rows for `filter`, without the folder the panel is in. (Whether
     /// each still exists isn't checked: a network drive could make that slow.)
     pub fn history_rows(&self, filter: &str) -> Vec<PathBuf> {
-        let cwd = &self.active_panel().cwd;
-        self.history.matching(filter).into_iter().filter(|dir| !util::same_path(dir, cwd)).cloned().collect()
+        let cwd = self.active_panel().place();
+        self.history.matching(filter).into_iter().filter(|dir| !util::same_path(dir, &cwd)).cloned().collect()
     }
 
     fn on_history_key(&mut self, key: &KeyEvent, mut filter: LineEdit, mut cursor: usize) -> Option<Dialog> {
@@ -2235,14 +2524,36 @@ impl App {
         if self.active_panel().archive.is_some() {
             return self.panels[self.active].archive_up();
         }
+        // On another computer: up there, and from its top back to this one.
+        if let Some(view) = &self.active_panel().remote {
+            let target = ssh::parent(&view.dir).map_or_else(|| self.active_panel().cwd.clone(), |parent| view.place(&parent));
+            return self.change_dir(self.active, target);
+        }
         match self.active_panel().cwd.parent() {
             Some(parent) => self.change_dir(self.active, parent.to_path_buf()),
             None => self.open_drives(self.active),
         }
     }
 
+    /// The drive picker. Under the drives come the computers connected to lately and the
+    /// hosts of `~/.ssh/config`.
     fn open_drives(&mut self, side: usize) {
-        let drives = platform::drives();
+        let mut drives = platform::drives();
+        let earlier = self.history.inputs.list("ssh").iter().rev().filter_map(|text| ssh::parse_connect(text).ok()).map(|(target, _)| target);
+        let configured = ssh::configured_hosts().into_iter().filter_map(|host| ssh::parse_connect(&host).ok()).map(|(target, _)| target);
+        let mut hosts: Vec<Target> = Vec::new();
+        for target in earlier.chain(configured) {
+            if !hosts.contains(&target) {
+                hosts.push(target);
+            }
+        }
+        drives.extend(hosts.iter().map(|target| platform::DriveInfo {
+            root: PathBuf::from(target.place("")),
+            label: String::new(),
+            kind: "ssh",
+            space: None,
+            pending: false,
+        }));
         let cwd = &self.panels[side].cwd;
         // The most specific drive holding the panel's folder (on Linux everything is under /).
         let cursor = drives
@@ -2259,6 +2570,9 @@ impl App {
     /// Goes to the folder the panel last had open on that drive. Choosing the drive the panel
     /// is already on goes to its root, as in Total Commander.
     fn switch_drive(&mut self, side: usize, root: &Path) {
+        if ssh::parse_exact(&root.to_string_lossy()).is_some() {
+            return self.change_dir(side, root.to_path_buf());
+        }
         let panel = &self.panels[side];
         let here = util::volume_key(root) == util::volume_key(&panel.cwd);
         let target = if here { root.to_path_buf() } else { panel.dir_on_drive(root) };
@@ -2274,6 +2588,8 @@ impl App {
             self.go_up();
         } else if entry.is_dir {
             self.change_dir(self.active, entry.path);
+        } else if self.active_panel().remote.is_some() {
+            self.fetch(&entry, AfterJob::Open { shown: entry.path.clone() });
         } else if crate::lfs::needs_literal(&entry.path) {
             // `foo.` would open as `foo` in any program it was given to.
             self.error(crate::lfs::UNOPENABLE);
@@ -2306,7 +2622,7 @@ impl App {
 
     /// Shift+Enter: Windows' "How do you want to open this file?" for the file under the cursor.
     fn open_with(&mut self) {
-        if self.refuse_in_archive(self.active) {
+        if self.refuse_in_archive(self.active) || self.refuse_over_ssh("Shift+Enter opens files of this computer") {
             return;
         }
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent && !e.is_dir).cloned() else { return };
@@ -2338,13 +2654,35 @@ impl App {
         let Some(view) = self.active_panel().archive.as_ref() else { return };
         let inner = archive::join(&view.inner, &entry.name);
         let file = view.archive.file.clone();
-        static TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = match archive::temp_dir() {
-            Ok(dir) => dir.join(TAKEN.fetch_add(1, Ordering::Relaxed).to_string()),
-            Err(e) => return self.error(format!("No folder for files taken out of the archive:\n{e}")),
-        };
+        let Some(dir) = self.temp_folder() else { return };
         self.after_job = Some((then, dir.join(&entry.name)));
         self.start_job(Job::Extract { archive: file, items: vec![inner], dest: dir });
+    }
+
+    /// A new folder in rmc's temp folder, for a file that comes here for a while.
+    fn temp_folder(&mut self) -> Option<PathBuf> {
+        static TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        match archive::temp_dir() {
+            Ok(dir) => Some(dir.join(TAKEN.fetch_add(1, Ordering::Relaxed).to_string())),
+            Err(e) => {
+                self.error(format!("No folder for files taken out for a while:\n{e}"));
+                None
+            }
+        }
+    }
+
+    /// A file on another computer comes into rmc's temp folder (as a job: it may be big), and
+    /// `then` happens to it there.
+    fn fetch(&mut self, entry: &Entry, then: AfterJob) {
+        let Some(view) = self.active_panel().remote.clone() else { return };
+        let Some(dir) = self.temp_folder() else { return };
+        if !remote::Place::Here(dir.clone()).can_hold(&entry.name) {
+            return self.error(format!("\"{}\" can't be a name on this computer.", entry.name));
+        }
+        let local = dir.join(&entry.name);
+        self.after_job = Some((then, local.clone()));
+        let from = remote::Place::There(view.connection.clone(), ssh::join(&view.dir, &entry.name));
+        self.start_job(Job::Transfer { pairs: vec![(from, remote::Place::Here(local))], moving: false, replace: false });
     }
 
     /// The file a job took out of an archive is there: open it, view it, or open it as an
@@ -2372,7 +2710,23 @@ impl App {
                 self.viewed_copy = path.parent().map(|folder| (folder.to_path_buf(), Instant::now()));
                 self.view(path, size, None);
             }
+            AfterJob::Edit { connection, path: file, there } => {
+                let modified = fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+                let since = Instant::now();
+                self.edited_copy = Some(EditedCopy { local: path.clone(), connection, path: file, size, modified, there, since, rescued: None });
+                self.edit(path, size, None);
+            }
         }
+    }
+
+    /// What works on this computer only: in a panel showing another one, say so and return
+    /// true. `why` says what doesn't go.
+    fn refuse_over_ssh(&mut self, why: &str) -> bool {
+        let over_ssh = self.active_panel().remote.is_some();
+        if over_ssh {
+            self.notice = Some(format!("{why}, and this panel shows another one"));
+        }
+        over_ssh
     }
 
     /// Archives open read-only: in panel `side` one is shown, say so and return true.
@@ -2388,6 +2742,7 @@ impl App {
         match self.active_panel().current().cloned() {
             Some(entry) if entry.is_dir => self.open_current(),
             Some(entry) if self.active_panel().archive.is_some() => self.take_out(&entry, AfterJob::View),
+            Some(entry) if self.active_panel().remote.is_some() => self.fetch(&entry, AfterJob::View),
             Some(entry) => self.view(entry.path, entry.size, None),
             None => {}
         }
@@ -2415,6 +2770,13 @@ impl App {
             self.take_out(&entry, AfterJob::View);
             self.notice = Some("Files in archives open read-only".into());
             return;
+        }
+        if let Some(view) = self.active_panel().remote.clone() {
+            let path = ssh::join(&view.dir, &entry.name);
+            return match view.connection.sftp.stat(&path) {
+                Ok(there) => self.fetch(&entry, AfterJob::Edit { connection: view.connection, path, there }),
+                Err(e) => self.error(format!("Cannot read \"{}\":\n{e}", entry.path.display())),
+            };
         }
         self.edit(entry.path, entry.size, None);
     }
@@ -2467,7 +2829,8 @@ impl App {
         if sources.is_empty() {
             return;
         }
-        let default = util::with_trailing_separator(&self.panels[1 - self.active].cwd);
+        let other = &self.panels[1 - self.active];
+        let default = other.remote.as_ref().map_or_else(|| util::with_trailing_separator(&other.cwd), |view| view.folder_text());
         let what = describe(&sources);
         if is_move {
             self.start_input("Move", &format!("Move {what} to:"), &default, InputAction::Move(sources));
@@ -2500,9 +2863,34 @@ impl App {
         self.start_input("Rename", &format!("Rename \"{name}\" to:"), &name, InputAction::Rename(path));
     }
 
+    /// F2 on another computer. As here, what is there stays.
+    fn rename_there(&mut self, view: &RemoteView, from: &Path, input: &str) {
+        let Some((_, from)) = ssh::parse_exact(&from.to_string_lossy()) else { return };
+        let to = view.resolve(input);
+        if to == from {
+            return;
+        }
+        let shown = view.place(&from);
+        let sftp = &view.connection.sftp;
+        if sftp.lstat(&to).is_ok() {
+            return self.error(format!("\"{}\" already exists.", view.place(&to).display()));
+        }
+        match sftp.rename(&from, &to) {
+            Ok(true) => {
+                self.reload_panels();
+                self.select_in_active(&view.place(&to));
+            }
+            Ok(false) => self.error(format!("Cannot rename \"{}\":\nthe server refused.", shown.display())),
+            Err(e) => self.error(format!("Cannot rename \"{}\":\n{e}", shown.display())),
+        }
+    }
+
     fn rename(&mut self, from: &Path, input: &str) {
         if input.trim().is_empty() {
             return;
+        }
+        if let Some(view) = self.active_panel().remote.clone() {
+            return self.rename_there(&view, from, input);
         }
         let dir = from.parent().unwrap_or(from);
         // The name as Windows makes it, said here: left to Windows, `foo.` beside `foo` lands
@@ -2530,6 +2918,20 @@ impl App {
     fn mkdir(&mut self, cwd: &Path, input: &str) {
         if input.trim().is_empty() {
             return;
+        }
+        if let Some(view) = self.active_panel().remote.clone() {
+            let path = view.resolve(input);
+            let place = view.place(&path);
+            let sftp = &view.connection.sftp;
+            if sftp.lstat(&path).is_ok() {
+                self.error(format!("\"{}\" already exists.", place.display()));
+                return self.select_in_active(&place);
+            }
+            if let Err(e) = remote::make_folders(sftp, &path) {
+                return self.error(format!("Cannot create \"{}\":\n{e}", place.display()));
+            }
+            self.reload_panels();
+            return self.select_in_active(&place);
         }
         let target = util::as_windows_makes_it(util::resolve(cwd, input));
         if lfs::exists(&target) {
@@ -2568,6 +2970,14 @@ impl App {
     /// Puts the cursor on `path` (or the directory leading to it) in the active panel.
     fn select_in_active(&mut self, path: &Path) {
         let panel = self.active_panel_mut();
+        if let Some(view) = &panel.remote {
+            let Some((_, path)) = ssh::parse_exact(&path.to_string_lossy()) else { return };
+            let below = path.strip_prefix(&ssh::join(&view.dir, ""));
+            if let Some(name) = below.and_then(|below| below.split('/').next()).map(String::from) {
+                panel.select_name(&name);
+            }
+            return;
+        }
         if let Some(name) = util::child_name(&panel.cwd, path) {
             panel.select_name(&name);
         }
@@ -2575,6 +2985,22 @@ impl App {
 
     fn confirm_delete(&mut self, to_trash: bool) {
         if self.refuse_in_archive(self.active) {
+            return;
+        }
+        // Over SSH there is no trash, so F8 asks what Shift+F8 asks, and says so.
+        if let Some(view) = self.active_panel().remote.clone() {
+            let paths = self.active_panel().remote_selection();
+            let what = match paths.as_slice() {
+                [] => return,
+                [one] => format!("\"{}\"", ssh::name_of(one)),
+                many => format!("{} items", many.len()),
+            };
+            let lines = vec![
+                format!("Permanently delete {what} on {}?", view.connection.target),
+                "There is no trash over SSH. This cannot be undone.".to_string(),
+            ];
+            let action = ConfirmAction::DeleteThere(view.connection, paths);
+            self.dialog = Some(Dialog::Confirm { title: "Delete permanently".into(), lines, focus: 1, danger: true, action });
             return;
         }
         let paths = self.active_panel().selection();
@@ -2626,6 +3052,17 @@ impl App {
         match cd_argument(&line).map(|arg| util::shell_word(arg, posix)) {
             // `cd -`: back to the folder before, as in bash and PowerShell.
             Some(Some(arg)) if arg == "-" => self.step_back(true),
+            // Another computer, by its address; a folder of that name here stays that folder.
+            Some(Some(arg)) if ssh::parse(&arg).is_some() && !lfs::is_dir(&util::resolve(&self.active_panel().cwd, &arg)) => {
+                self.change_dir(self.active, PathBuf::from(arg));
+            }
+            // On a panel showing another computer, folders are the ones there, unless a drive
+            // of this computer is named.
+            Some(Some(arg)) if self.active_panel().remote.is_some() && util::bare_drive(&arg).is_none() && !has_drive(&arg) => {
+                if let Some(view) = self.active_panel().remote.clone() {
+                    self.change_dir(self.active, view.place(&view.resolve(&arg)));
+                }
+            }
             Some(Some(arg)) => {
                 let panel = self.active_panel();
                 let cwd = panel.cwd.clone();
@@ -2637,6 +3074,11 @@ impl App {
                     None => util::resolve(&cwd, &arg),
                 };
                 self.change_dir(self.active, target);
+            }
+            // A command would run on this computer, and not in the folder shown: `rm *` there
+            // is no place to find out.
+            _ if self.active_panel().remote.is_some() => {
+                self.error("Commands run on this computer, and this panel shows another one.\nTab goes to the other panel; Ctrl+O is this computer's shell.");
             }
             // Any other command, and a cd only the shell can read (a variable set in it,
             // `cd $(…)`): the shell runs it, and the panel follows when the panels come back.
@@ -2688,6 +3130,27 @@ fn cd_argument(line: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Whether a path typed names a drive of this computer (`C:\\x`, `e:foo`).
+fn has_drive(text: &str) -> bool {
+    matches!(Path::new(util::strip_quotes(text.trim())).components().next(), Some(Component::Prefix(_)))
+}
+
+/// Whether a path typed starts from the top rather than from a folder.
+fn is_whole_path(text: &str) -> bool {
+    let text = util::strip_quotes(text.trim());
+    has_drive(text) || text.starts_with(['/', '\\'])
+}
+
+/// An edited file that can't go back to its computer: it moves out of the temp folder, which
+/// goes when rmc ends. Returns where it went.
+fn rescue(copy: &Path) -> Option<PathBuf> {
+    let dir = util::config_dir()?.join("rescued");
+    fs::create_dir_all(&dir).ok()?;
+    let target = dir.join(format!("{:08x}-{}", util::random() as u32, copy.file_name()?.to_string_lossy()));
+    fs::copy(copy, &target).ok()?;
+    Some(target)
 }
 
 fn describe(paths: &[PathBuf]) -> String {
@@ -4061,6 +4524,381 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(tmp.path().join("Gamma.txt").exists());
         assert_eq!(app.active_panel().current().unwrap().name, "Gamma.txt");
+    }
+
+    /// A panel on another computer: a real server program, without `ssh`.
+    struct OverThere {
+        there: TempDir,
+        here: TempDir,
+        connection: Arc<Connection>,
+        app: App,
+    }
+
+    fn over_there(tag: &str) -> Option<OverThere> {
+        let there = TempDir::new(&format!("{tag}-there"));
+        let here = TempDir::new(&format!("{tag}-here"));
+        let connection = crate::ssh::tests::local_connection(there.path())?;
+        let mut app = test_app(here.path(), here.path());
+        app.on_key(ctrl('n'));
+        typing(&mut app, &connection.target.place(&connection.home));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none(), "connected");
+        assert!(app.active_panel().remote.is_some());
+        Some(OverThere { there, here, connection, app })
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.active_panel().entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    fn field(app: &App) -> String {
+        match &app.dialog {
+            Some(Dialog::Input { edit, .. }) => edit.text().to_string(),
+            _ => panic!("no field"),
+        }
+    }
+
+    /// Browsing another computer: its folders open, `..` goes up and from the top back here,
+    /// `cd` goes by its paths, and the address shows where the panel is.
+    #[test]
+    fn a_panel_on_another_computer_is_browsed_like_any_other() {
+        let Some(mut over) = over_there("app-ssh-browse") else { return };
+        over.there.file("folder/inner.txt", "inner");
+        over.there.file("report.txt", "report");
+        over.there.file(".hidden", "h");
+        let home = over.connection.home.clone();
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+        assert_eq!(names(app), ["..", "folder", ".hidden", "report.txt"]);
+        let shown = |app: &App| app.active_panel().location().to_string_lossy().into_owned();
+        assert_eq!(shown(app), over.connection.target.place(&home));
+        assert!(app.active_panel().space.is_some(), "the server tells the free space");
+        assert!(app.active_panel().repo.is_none());
+
+        app.active_panel_mut().select_name("folder");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(names(app), ["..", "inner.txt"]);
+        assert_eq!(shown(app), over.connection.target.place(&format!("{home}/folder")));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.active_panel().current().unwrap().name, "folder", "the cursor on the folder left");
+
+        // Sorting, filters and hidden files work on what was read.
+        app.on_key(ctrl('h'));
+        assert_eq!(names(app), ["..", "folder", "report.txt"]);
+        app.on_key(ctrl('h'));
+
+        for line in ["cd folder", "cd ..", "cd folder/../folder"] {
+            typing(app, line);
+            app.on_key(key(KeyCode::Enter));
+        }
+        assert_eq!(names(app), ["..", "inner.txt"]);
+        typing(app, "cd");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(shown(app), over.connection.target.place(&home), "cd alone goes home");
+        typing(app, "cd missing");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "a folder that isn't there is said");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(shown(app), over.connection.target.place(&home));
+
+        // A command doesn't run here in another folder than the one shown.
+        typing(app, "echo hello");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })) && app.external.is_none());
+        app.on_key(key(KeyCode::Enter));
+
+        // What needs this computer says so.
+        app.on_key(with_mods(KeyCode::F(7), KeyModifiers::ALT));
+        assert!(!app.find_shown && app.notice.as_deref().is_some_and(|n| n.contains("another one")), "{:?}", app.notice);
+
+        // Back and forward go across computers, and so do tabs, Alt+I and the history.
+        app.on_key(alt(KeyCode::Char('i')));
+        assert!(app.panels[1].remote.is_some(), "Alt+I: the other panel comes along");
+        assert!(app.history_rows("").is_empty() || !app.history.dirs.is_empty());
+        assert!(app.history.dirs.iter().any(|dir| dir.to_string_lossy() == shown(app)), "in the folder history");
+        let (local, address) = (app.panels[0].cwd.clone(), shown(app));
+        app.on_key(ctrl('t'));
+        assert_eq!(shown(app), address, "a new tab stays over there");
+        app.on_key(ctrl('w'));
+
+        // Up from the top comes back to this computer.
+        typing(app, "cd /");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Backspace));
+        assert!(app.active_panel().remote.is_none());
+        assert!(util::same_path(&app.active_panel().cwd, &local));
+        app.on_key(alt(KeyCode::Left));
+        assert!(app.active_panel().remote.is_some(), "Alt+Left goes back there");
+    }
+
+    /// F5 and F6 between a panel here and a panel there, and with an address typed.
+    #[test]
+    fn copying_between_the_panels_over_ssh() {
+        let Some(mut over) = over_there("app-ssh-copy") else { return };
+        over.there.file("from-there.txt", "there");
+        over.here.file("from-here.txt", "here");
+        over.here.file("typed.txt", "typed");
+        let home = over.connection.home.clone();
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+
+        // There to here: the field starts on the other panel.
+        app.active_panel_mut().select_name("from-there.txt");
+        app.on_key(key(KeyCode::F(5)));
+        assert_eq!(field(app), util::with_trailing_separator(over.here.path()));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert!(app.dialog.is_none());
+        assert_eq!(fs::read_to_string(over.here.path().join("from-there.txt")).unwrap(), "there");
+
+        // Here to there: the field is the address.
+        app.on_key(key(KeyCode::Tab));
+        app.active_panel_mut().select_name("from-here.txt");
+        app.on_key(key(KeyCode::F(6)));
+        assert_eq!(field(app), over.connection.target.place(&format!("{home}/")));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert_eq!(fs::read_to_string(over.there.path().join("from-here.txt")).unwrap(), "here");
+        assert!(!over.here.path().join("from-here.txt").exists());
+        assert!(app.panels[0].entries.iter().any(|e| e.name == "from-here.txt"), "the other panel shows it");
+
+        // With the panels both here: an address in the field goes there, a name stays here.
+        app.panels[0].change_dir(over.here.path().to_path_buf()).unwrap();
+        app.active_panel_mut().select_name("typed.txt");
+        app.on_key(with_mods(KeyCode::F(5), KeyModifiers::SHIFT));
+        typing(app, &over.connection.target.place(&format!("{home}/sub/typed copy.txt")));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert_eq!(fs::read_to_string(over.there.path().join("sub/typed copy.txt")).unwrap(), "typed");
+        assert!(app.history.inputs.list("name").iter().any(|text| text.contains("typed copy")));
+    }
+
+    /// F7, F2, Shift+F5, Shift+F6 and F8 on the other computer. F8 can't go to a trash, and
+    /// says so first.
+    #[test]
+    fn working_on_files_over_ssh() {
+        let Some(mut over) = over_there("app-ssh-files") else { return };
+        over.there.file("a.txt", "a");
+        over.there.file("taken.txt", "taken");
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+
+        app.on_key(key(KeyCode::F(7)));
+        typing(app, "new/deep");
+        app.on_key(key(KeyCode::Enter));
+        assert!(over.there.path().join("new/deep").is_dir());
+        assert_eq!(app.active_panel().current().unwrap().name, "new", "the cursor on what was made");
+        app.on_key(key(KeyCode::F(7)));
+        typing(app, "new");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "it is there already");
+        app.on_key(key(KeyCode::Enter));
+
+        // F2 leaves what is there alone.
+        app.active_panel_mut().select_name("a.txt");
+        app.on_key(key(KeyCode::F(2)));
+        assert_eq!(field(app), "a.txt");
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        typing(app, "taken.txt");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.dialog, Some(Dialog::Message { .. })));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(fs::read_to_string(over.there.path().join("taken.txt")).unwrap(), "taken");
+        app.on_key(key(KeyCode::F(2)));
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        typing(app, "b.txt");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
+
+        // In place: the field empty, the name lands in that folder, the cursor goes along.
+        app.on_key(with_mods(KeyCode::F(5), KeyModifiers::SHIFT));
+        assert_eq!(field(app), "");
+        typing(app, "c.txt");
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert_eq!(fs::read_to_string(over.there.path().join("c.txt")).unwrap(), "a");
+        assert_eq!(app.active_panel().current().unwrap().name, "c.txt");
+        app.on_key(with_mods(KeyCode::F(6), KeyModifiers::SHIFT));
+        typing(app, "d.txt");
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert!(!over.there.path().join("c.txt").exists() && over.there.path().join("d.txt").exists());
+        assert_eq!(app.active_panel().current().unwrap().name, "d.txt");
+
+        // F8: for good, said so, with No as the answer Enter gives.
+        app.on_key(key(KeyCode::F(8)));
+        let Some(Dialog::Confirm { lines, focus, danger, .. }) = &app.dialog else { panic!("no question") };
+        assert!(lines[0].contains("Permanently delete \"d.txt\"") && lines[1].contains("no trash"), "{lines:?}");
+        assert_eq!((*focus, *danger), (1, true));
+        app.on_key(key(KeyCode::Enter));
+        assert!(over.there.path().join("d.txt").exists());
+        app.on_key(key(KeyCode::F(8)));
+        app.on_key(key(KeyCode::Char('y')));
+        wait_for_job(app);
+        assert!(!over.there.path().join("d.txt").exists());
+
+        // The marks: everything marked goes, folders with what is in them.
+        app.active_panel_mut().select_name("new");
+        app.active_panel_mut().toggle_mark();
+        app.active_panel_mut().select_name("taken.txt");
+        app.active_panel_mut().toggle_mark();
+        app.on_key(key(KeyCode::Delete));
+        app.on_key(key(KeyCode::Char('y')));
+        wait_for_job(app);
+        assert_eq!(fs::read_dir(over.there.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>(), ["b.txt"]);
+        assert_eq!(app.active_panel().marked_summary(), None);
+    }
+
+    /// F3 brings a copy here for the viewer. F4 brings one for the editor, and a changed file
+    /// goes back; unchanged, nothing is written.
+    #[test]
+    fn viewing_and_editing_over_ssh() {
+        let Some(mut over) = over_there("app-ssh-edit") else { return };
+        let file = over.there.file("notes.txt", "old notes");
+        let before = fs::metadata(&file).unwrap().modified().unwrap();
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+        app.active_panel_mut().select_name("notes.txt");
+
+        app.on_key(key(KeyCode::F(3)));
+        wait_for_job(app);
+        let Some(External::View(path, None)) = app.external.take() else { panic!("no viewer") };
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old notes");
+        app.after_external(Ok(()), None);
+        assert!(!path.exists(), "gone with the viewer");
+
+        // F4, closed without a change.
+        app.on_key(key(KeyCode::F(4)));
+        wait_for_job(app);
+        let Some(External::Edit(path, None)) = app.external.take() else { panic!("no editor") };
+        app.after_external(Ok(()), None);
+        assert!(app.job.is_none() && !path.exists());
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), before);
+
+        // F4, saved: it goes back.
+        app.on_key(key(KeyCode::F(4)));
+        wait_for_job(app);
+        let Some(External::Edit(path, None)) = app.external.take() else { panic!("no editor") };
+        fs::write(&path, "new notes").unwrap();
+        app.after_external(Ok(()), None);
+        wait_for_job(app);
+        assert!(app.dialog.is_none(), "no question: nothing else changed it");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new notes");
+        assert!(!path.exists());
+    }
+
+    /// The file changes over there while it is in the editor: nothing is replaced unasked, and
+    /// the edit survives either answer.
+    #[test]
+    fn a_file_changed_meanwhile_is_not_simply_replaced() {
+        let Some(mut over) = over_there("app-ssh-conflict") else { return };
+        let file = over.there.file("notes.txt", "old notes");
+        let config = TempDir::new("app-ssh-conflict-config");
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+        app.active_panel_mut().select_name("notes.txt");
+
+        let edit = |app: &mut App, text: &str| {
+            app.on_key(key(KeyCode::F(4)));
+            wait_for_job(app);
+            let Some(External::Edit(path, None)) = app.external.take() else { panic!("no editor") };
+            fs::write(&path, text).unwrap();
+            fs::write(&file, format!("changed there, then {text}")).unwrap();
+            app.after_external(Ok(()), None);
+        };
+        // SAFETY: only this test reads APPDATA or XDG_CONFIG_HOME while it runs, for `rescue`.
+        unsafe { std::env::set_var(if cfg!(windows) { "APPDATA" } else { "XDG_CONFIG_HOME" }, config.path()) };
+        edit(app, "mine");
+        let Some(Dialog::Confirm { lines, focus, .. }) = &app.dialog else { panic!("no question") };
+        assert_eq!(*focus, 1, "No is what Enter gives");
+        assert!(lines[0].contains("changed on"), "{lines:?}");
+        let rescued: Vec<_> = fs::read_dir(config.path().join("rmc/rescued")).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(fs::read_to_string(&rescued[0]).unwrap(), "mine");
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert_eq!(fs::read_to_string(over.there.path().join("notes.txt")).unwrap(), "changed there, then mine", "No leaves it");
+        assert_eq!(fs::read_to_string(&rescued[0]).unwrap(), "mine", "and mine is kept");
+
+        edit(app, "mine again");
+        app.on_key(key(KeyCode::Char('y')));
+        wait_for_job(app);
+        assert_eq!(fs::read_to_string(over.there.path().join("notes.txt")).unwrap(), "mine again");
+    }
+
+    /// The connection goes: the panel comes back to this computer and says so.
+    #[test]
+    fn a_lost_connection_brings_the_panel_back() {
+        let Some(mut over) = over_there("app-ssh-lost") else { return };
+        crate::ssh::tests::kill(&over.connection);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while over.connection.sftp.lost().is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+        app.tick();
+        assert!(app.active_panel().remote.is_none());
+        assert!(util::same_path(&app.active_panel().cwd, over.here.path()));
+        let Some(Dialog::Message { lines, .. }) = &app.dialog else { panic!("nothing said") };
+        assert!(lines[0].contains("is gone"), "{lines:?}");
+    }
+
+    /// A name ending in a space is that name, however it travels: read as typed, it would be
+    /// the file beside it.
+    #[cfg(unix)]
+    #[test]
+    fn names_ending_in_a_space_stay_themselves_over_ssh() {
+        let Some(mut over) = over_there("app-ssh-space") else { return };
+        over.there.file("name", "plain");
+        over.there.file("name ", "with a space");
+        over.there.file("folder ", "x");
+        fs::remove_file(over.there.path().join("folder ")).unwrap();
+        over.there.file("folder /inside.txt", "inside");
+        over.there.dir("folder");
+        let app = &mut over.app;
+        app.on_key(ctrl('r'));
+        app.active_panel_mut().select_name("name ");
+        app.on_key(key(KeyCode::F(6)));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(app);
+        assert_eq!(fs::read_to_string(over.here.path().join("name ")).unwrap(), "with a space");
+        assert_eq!(fs::read_to_string(over.there.path().join("name")).unwrap(), "plain", "the file beside it stays");
+
+        app.active_panel_mut().select_name("name");
+        app.on_key(key(KeyCode::F(2)));
+        app.on_key(ctrl('a'));
+        app.on_key(ctrl('k'));
+        typing(app, "renamed");
+        app.on_key(key(KeyCode::Enter));
+        assert!(over.there.path().join("renamed").exists());
+
+        app.active_panel_mut().select_name("folder ");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(names(app), ["..", "inside.txt"], "into the folder of that name");
+    }
+
+    /// Hosts connected to come back in the drive picker, and a password never gets in anywhere.
+    #[test]
+    fn addresses_are_remembered_but_passwords_are_not() {
+        let Some(mut over) = over_there("app-ssh-hosts") else { return };
+        let address = over.connection.target.place(&over.connection.home);
+        let app = &mut over.app;
+        assert_eq!(app.history.inputs.list("ssh"), [address]);
+        app.on_key(alt(KeyCode::F(1)));
+        let Some(Dialog::Drives { drives, .. }) = &app.dialog else { panic!("no drives") };
+        let row = drives.iter().find(|drive| drive.kind == "ssh").expect("a row for the host");
+        assert_eq!(row.root, PathBuf::from(over.connection.target.place("")));
+        app.dialog = None;
+
+        app.on_key(ctrl('n'));
+        typing(app, "ssh://me:secret@nas/x");
+        app.on_key(key(KeyCode::Enter));
+        let Some(Dialog::Message { lines, .. }) = &app.dialog else { panic!("not refused") };
+        assert!(lines[0].contains("no password"), "{lines:?}");
+        assert_eq!(app.history.inputs.list("ssh").len(), 1, "not kept");
     }
 
     /// A field goes back through what was typed into its kind before, between sessions too,

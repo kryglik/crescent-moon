@@ -1,11 +1,13 @@
 //! Dialogs and the single-line text editor used by them and by the command line.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
+use crate::app::EditedCopy;
 use crate::git::Worktree;
 use crate::ops::Answer;
 use crate::options::OptionsAutomatic;
@@ -13,6 +15,7 @@ use crate::panel::SortBy;
 use crate::platform::DriveInfo;
 use crate::scheme::Choice;
 use crate::settings::Settings;
+use crate::ssh::Connection;
 use crate::survey::Survey;
 use crate::util;
 
@@ -24,6 +27,10 @@ pub enum ConfirmAction {
     View(PathBuf, Option<u64>),
     /// Packing into a zip that is there already: replace it.
     Pack(Vec<PathBuf>, PathBuf),
+    /// These paths on another computer go for good.
+    DeleteThere(Arc<Connection>, Vec<String>),
+    /// A file edited here replaces the one on the other computer, which has changed meanwhile.
+    PutBack(Box<EditedCopy>),
 }
 
 /// What was typed into a kind of field before, for Up and Down to go through. (The fields'
@@ -98,6 +105,8 @@ pub enum InputAction {
     Extract { archive: PathBuf, items: Vec<String> },
     /// Alt+F5: these into the zip typed.
     Pack(Vec<PathBuf>),
+    /// Ctrl+N: the active panel goes to the address typed.
+    Connect,
 }
 
 impl InputAction {
@@ -111,6 +120,7 @@ impl InputAction {
             InputAction::Select | InputAction::Unselect => "pattern",
             InputAction::Filter => "filter",
             InputAction::Pack(_) => "zip",
+            InputAction::Connect => "ssh",
         }
     }
 }
@@ -372,6 +382,7 @@ pub const COMMANDS: &[Command] = &[
     command("Sort by name, extension, size, time", "F9", KeyCode::F(9), NONE),
     command("Unpack the zip under the cursor", "Alt+F9", KeyCode::F(9), ALT),
     command("Quit", "F10", KeyCode::F(10), NONE),
+    command("Connect to another computer over SSH", "Ctrl+N", KeyCode::Char('n'), CTRL),
     command("Drive of the left panel", "Alt+F1", KeyCode::F(1), ALT),
     command("Drive of the right panel", "Alt+F2", KeyCode::F(2), ALT),
     command("Favourite folders (hotlist)", "Ctrl+D", KeyCode::Char('d'), CTRL),
@@ -490,6 +501,16 @@ pub const HELP: &[&str] = &[
     "  Enter        open a zip as a folder (read-only); .. leaves it",
     "  F5           copy out of it    F3, Enter   view, open a file in it",
     "  Alt+F5       pack into a zip   Alt+F9      unpack the zip",
+    "",
+    "SSH: files on another computer",
+    "  Ctrl+N       connect: host, user@host, host:/path, or Up for an",
+    "               earlier one; ssh logs in, with your keys and config",
+    "  Alt+F1/F2    also lists the hosts of ~/.ssh/config",
+    "  cd host:/path    the same from the command line; .. at the top",
+    "               comes back to this computer",
+    "  F5 F6        between the panels, or type host:/path in the field",
+    "  F3 F4        view, edit: changes go back when the editor closes",
+    "  F8           deletes for good: there is no trash over SSH",
     "",
     "Git (in a repository)",
     "  The row below the path: the branch (cyan in a linked worktree),",

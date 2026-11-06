@@ -171,6 +171,21 @@ pub fn create_new_like(path: &Path, meta: &Metadata) -> io::Result<File> {
     }
 }
 
+/// A new file with these permissions, where the system has them; from another computer there
+/// may be no `Metadata` to go by (see `create_new_like`).
+pub fn create_new_with_mode(path: &Path, mode: Option<u32>) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        File::options().write(true).create_new(true).mode(mode.unwrap_or(0o666)).open(literal(path))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        create_new(path)
+    }
+}
+
 /// Closes a file that was written, saying if that failed: a network drive may only now report
 /// that it is full or gone, which dropping a `File` ignores.
 pub fn close(file: File) -> io::Result<()> {

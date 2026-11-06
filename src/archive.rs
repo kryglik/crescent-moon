@@ -177,7 +177,7 @@ fn clean_path(name: &str) -> Option<String> {
 /// One name and nothing else, whatever the system: joined to a folder it stays below it. Not
 /// `..`; on Windows not `C:x`, which replaces the whole path when joined, nor `a:b`, a hidden
 /// stream of the file `a`.
-fn is_plain_name(part: &str) -> bool {
+pub fn is_plain_name(part: &str) -> bool {
     let mut components = Path::new(part).components();
     matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None))
         && !part.contains('\0')

@@ -15,6 +15,8 @@ What it does differently from the Windows port of mc:
 - Total Commander habits: Ctrl+Q quick view, Shift+F2 compare folders, Alt+F5 / Alt+F9 pack and
   unpack zips (and zips open as folders), folder tabs (Ctrl+T), back and forward (Alt+Left /
   Alt+Right), Ctrl+D hotlist, Alt+F7 find.
+- **SSH**: a panel can show a folder on another computer, and F5, F6, F7, F8, F2, F3 and F4 work
+  on it. Your own `ssh` does the login, with your keys, agent and `~/.ssh/config`.
 - **Git** at a glance: a row below each panel's path with the branch, whether it is a
   worktree and what changed, a mark beside every changed, new or conflicting file (ignored
   ones dimmed), and Alt+W jumps between the repository's worktrees, into the same subfolder.
@@ -107,6 +109,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Ctrl+A | mark everything (with an empty command line) |
 | F2 | rename |
 | F5 / F6 / F7 | copy / move / make directory; the progress shows the speed and the time left |
+| Shift+F5 / Shift+F6 | copy / rename the item under the cursor in this folder, as in mc: the field starts empty, and marks don't count |
 | F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
 | Alt+A | attributes of the marked files (or the one under the cursor): read-only, hidden, system, archive on Windows, the permission bits (rwx) on Linux. Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
 | Alt+F5 / Alt+F9 | pack into a zip / unpack the zip under the cursor (see Zip archives) |
@@ -177,6 +180,46 @@ say so.
   use its OEM code page (852 on a Czech Windows), which rmc reads too. Names that would climb
   out of the folder they are unpacked into (`../x`) are left out. Packing writes UTF-8 names,
   deflated, ZIP64 for files over 4 GB.
+
+### SSH
+
+**Ctrl+N** connects the panel to another computer: `host`, `user@host`, `host:/path`, or
+`ssh://user@host:port/path`. `cd host:/path` on the command line does the same, and the drive
+picker (Alt+F1 / Alt+F2) lists the computers connected to lately and the hosts of
+`~/.ssh/config`. Addresses go in the hotlist and the folder history like folders do.
+
+rmc runs your `ssh` program and speaks SFTP through it, so whatever `ssh host` does works here
+too: keys, the agent, aliases from `~/.ssh/config`, ProxyJump. If `ssh` needs to ask something (a
+password, a passphrase, whether to trust a new host), the terminal is handed over for that,
+and Ctrl+C gives up. rmc itself never sees a password; it refuses one written in an address.
+Connections stay open until rmc ends. The server has to offer SFTP, as OpenSSH does.
+
+- **F5 / F6** work between a panel here and a panel there, between two computers, and within one.
+  The field takes an address too, so a local panel can copy straight to `host:/path/`. In a
+  panel on another computer a name counts from the folder there, and a whole path (`C:\x`, `/x`)
+  is one on this computer.
+- It is as careful as a local copy: a file is written under a temporary name and replaces its
+  target in one step, a move deletes the source only once the copy is complete and its size is
+  checked, and nothing is replaced without asking. Times and permissions go along. A move
+  within one computer is a rename.
+- **F3** brings a copy here for the viewer. **F4** brings one for the editor, and if you saved
+  it, it goes back when the editor closes. If the file changed over there meanwhile, rmc asks,
+  and keeps yours in `rescued` beside the settings whichever way you answer. Enter opens a copy
+  in its app (read-only), and a zip as a folder.
+- **F8** deletes for good, as there is no trash over SSH; the question says so, and Enter answers No.
+  Links are never followed, and what is mounted in a folder is left alone.
+- **F2, F7** and Shift+F5 / Shift+F6 work there too, and sorting, filters, marks, quick search
+  and Shift+F2's comparison, which goes by what the panels show.
+- What needs this computer says so: a command typed on the command line isn't run for a panel
+  on another computer (it would run here, in another folder), and neither is Find, Alt+A,
+  packing, the file clipboard, Ctrl+Space or quick view. Ctrl+O is this computer's shell.
+- `..` at the top of the other computer, or a drive from the picker, comes back to this one. If
+  the connection is lost, the panel comes back and says so; a job stops at once and keeps its
+  sources. Ctrl+R reads the folder again: what others change there doesn't show by itself.
+- Links on another computer are copied as links, except to Windows, where what they lead to
+  goes instead (Windows lets only administrators make links). A name that can't exist here
+  (`a:b` on Windows) is skipped and reported. In the field, a name holding a colon that
+  isn't there yet is read as an address, as in scp: `./a:b` is a name.
 
 ### Git
 
@@ -387,13 +430,16 @@ rmc shows the mono scheme.
 | `src/app.rs` | application state and all key handling |
 | `src/panel.rs` | a panel: listing, sorting, cursor, marks, back/forward, filter, a zip shown as a folder |
 | `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |
+| `src/ops/remote.rs` | jobs with an end on another computer: copying, moving, deleting over SSH |
+| `src/ssh.rs` | addresses, and connections through the `ssh` program |
+| `src/sftp.rs` | an SFTP client over any pair of pipes, with many requests under way |
 | `src/lfs.rs` | file calls that give Windows a path literally when it has to be (`foo.`, `nul`), and keeping a copy's flags and mode |
 | `src/sandbox_tests.rs` | the jobs at the edges, on real files: links, odd names, long paths, locked files, crafted zips |
 | `src/sandbox_tests/random.rs` | random colliding trees through every job and way of answering, the whole disk checked after each (`RMC_ROUNDS=2000 cargo test random_` for a long run) |
 | `src/archive.rs` | zip archives: the index, names (none that would land outside the folder), times |
 | `src/git.rs` | git: the branch, operation under way and worktrees from the repository's files; `git status` in the background |
 | `src/watch.rs` | watching the panels' folders for changes (Windows change notifications, inotify) |
-| `src/history.rs` | folders visited and commands typed, kept in `history.txt` |
+| `src/history.rs` | folders visited and commands typed, kept in `history.txt`; what was typed into dialogs, in `inputs.txt` |
 | `src/compare.rs` | Shift+F2's comparison of two folders |
 | `src/preview.rs` | quick view: reading what to show on a background thread |
 | `src/clipboard.rs` | files on the Windows clipboard (as Explorer puts them), OSC 52 elsewhere |
@@ -438,4 +484,5 @@ tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
 
 ## Not there yet
 
-Writing into archives, other archive formats (7z, rar, tar), SFTP, a user menu.
+Writing into archives, other archive formats (7z, rar, tar), running commands over SSH, a user
+menu.

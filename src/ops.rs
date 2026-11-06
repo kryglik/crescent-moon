@@ -1,6 +1,8 @@
 //! Copy, move and delete jobs. They run on a worker thread and talk to the UI over channels,
 //! so the screen stays responsive and the user can answer questions or cancel.
 
+pub mod remote;
+
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,8 +15,10 @@ use std::time::{Duration, Instant, SystemTime};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use self::remote::Place;
 use crate::archive::{self, Archive};
 use crate::lfs as fs;
+use crate::ssh::Connection;
 use crate::{platform, util};
 
 /// Guards against link loops when copying through directory links.
@@ -38,15 +42,20 @@ pub enum Job {
     Extract { archive: PathBuf, items: Vec<String>, dest: PathBuf },
     /// `sources` (with what is below them) into a new zip `dest`, by their names.
     Pack { sources: Vec<PathBuf>, dest: PathBuf },
+    /// Copies or moves with an end on another computer (see `remote`). `replace`: what is at
+    /// the destinations goes without asking, as that was asked already.
+    Transfer { pairs: Vec<(Place, Place)>, moving: bool, replace: bool },
+    /// These paths on another computer, with what is below them, for good.
+    DeleteThere { connection: Arc<Connection>, paths: Vec<String> },
 }
 
 impl Job {
     pub fn title(&self) -> &'static str {
         match self {
-            Job::Copy(_) => "Copy",
-            Job::Move(_) => "Move",
+            Job::Copy(_) | Job::Transfer { moving: false, .. } => "Copy",
+            Job::Move(_) | Job::Transfer { moving: true, .. } => "Move",
             Job::Delete { to_trash: true, .. } => "Delete",
-            Job::Delete { to_trash: false, .. } => "Delete permanently",
+            Job::Delete { to_trash: false, .. } | Job::DeleteThere { .. } => "Delete permanently",
             Job::Extract { .. } => "Extract",
             Job::Pack { .. } => "Pack",
         }
@@ -301,6 +310,8 @@ struct Worker {
     targets: Vec<PathBuf>,
     /// The names this job has put in place (see `name_key`).
     written: std::collections::HashSet<u64>,
+    /// The same on another computer, where they are simply the paths.
+    written_there: std::collections::HashSet<String>,
 }
 
 impl Worker {
@@ -325,6 +336,7 @@ impl Worker {
             mounts: Vec::new(),
             targets: Vec::new(),
             written: std::collections::HashSet::new(),
+            written_there: std::collections::HashSet::new(),
         }
     }
 
@@ -397,6 +409,11 @@ impl Worker {
             }
             Job::Extract { archive, items, dest } => self.extract(&archive, &items, &dest)?,
             Job::Pack { sources, dest } => self.pack(&sources, &dest)?,
+            Job::Transfer { pairs, moving, replace } => {
+                self.overwrite_all = replace.then_some(true);
+                self.transfer(&pairs, moving)?;
+            }
+            Job::DeleteThere { connection, paths } => self.delete_there(&connection, &paths)?,
         }
         self.send_progress(true);
         Ok(())
@@ -711,6 +728,11 @@ impl Worker {
             };
             self.check_cancel()?;
             let message = format!("{}: {error}", path.display());
+            // The connection is gone: nothing more will work, whatever is answered.
+            if error.kind() == io::ErrorKind::ConnectionAborted {
+                self.errors.push(message);
+                return Err(Stop::Cancelled);
+            }
             // "As admin" only where the administrator's rmc can reach the path: a mapped
             // network drive or a subst drive belongs to the user's own logon session.
             let as_admin = self
@@ -799,6 +821,11 @@ impl Worker {
             self.errors.push(format!("{}: another item of this job already took this name here, skipped", target.display()));
             return Ok(false);
         }
+        self.overwrite_agreed(target, source, existing.into())
+    }
+
+    /// Whether the file at `target` may go: agreed to already, or the user is asked.
+    fn overwrite_agreed(&mut self, target: &Path, source: FileInfo, existing: FileInfo) -> Flow<bool> {
         if self.confirmed.as_deref() == Some(target) {
             self.confirmed = None;
             return Ok(true);
@@ -806,7 +833,7 @@ impl Worker {
         if let Some(all) = self.overwrite_all {
             return Ok(all);
         }
-        let question = Question::Overwrite { target: target.to_path_buf(), source, existing: existing.into() };
+        let question = Question::Overwrite { target: target.to_path_buf(), source, existing };
         Ok(match self.ask(question)? {
             Answer::Yes => true,
             Answer::All => {
@@ -1368,10 +1395,14 @@ fn incomplete_name(dest: &Path) -> PathBuf {
 
 /// A name beside `target` to write a copy under before it replaces the target.
 fn temp_name(target: &Path) -> PathBuf {
+    target.with_file_name(temp_leaf())
+}
+
+fn temp_leaf() -> String {
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     // Random too: a crashed rmc's leftover with a reused process id mustn't be in the way.
-    target.with_file_name(format!(".rmc-{}-{n}-{:08x}.part", std::process::id(), util::random() as u32))
+    format!(".rmc-{}-{n}-{:08x}.part", std::process::id(), util::random() as u32)
 }
 
 /// Puts the finished copy `temp` in place of `target` (replacing an existing file).
