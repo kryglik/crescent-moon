@@ -1,6 +1,8 @@
 //! What rmc remembers between sessions, in `history.txt` next to the hotlist: the folders
-//! the panels visited (Alt+H lists them) and the commands typed (Alt+P / Alt+N).
+//! the panels visited (Alt+H lists them) and the commands typed (Alt+P / Alt+N); and in
+//! `inputs.txt` what was typed into the fields of dialogs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,6 +11,7 @@ use crate::util;
 
 const MAX_DIRS: usize = 300;
 const MAX_COMMANDS: usize = 500;
+const MAX_INPUTS: usize = 50;
 
 #[derive(Default)]
 pub struct History {
@@ -22,6 +25,7 @@ pub struct History {
     /// Folders forgotten here (Delete in Alt+H), which what is on disk mustn't bring back.
     forgotten: Vec<PathBuf>,
     file: Option<PathBuf>,
+    pub inputs: Inputs,
 }
 
 impl History {
@@ -32,7 +36,8 @@ impl History {
 
     /// Reads the file; a missing or unreadable one gives an empty history.
     pub fn load(file: Option<PathBuf>) -> History {
-        let mut history = History { file, ..History::default() };
+        let inputs = Inputs::load(file.as_ref().map(|f| f.with_file_name("inputs.txt")));
+        let mut history = History { file, inputs, ..History::default() };
         let Some(text) = history.file.as_ref().and_then(|f| fs::read_to_string(f).ok()) else { return history };
         let mut section = "";
         for line in text.lines() {
@@ -90,7 +95,7 @@ impl History {
         }
         util::write_atomically(file, &text, false)?;
         self.unsaved.clear();
-        Ok(())
+        self.inputs.save()
     }
 
     /// A panel arrived in `dir`: it moves to the front of the list.
@@ -131,10 +136,136 @@ impl History {
     }
 }
 
+/// What was typed into the fields of dialogs, a list for each kind of field
+/// (`InputAction::kind`). In a file of its own: an older rmc still open in another window
+/// would take sections of `history.txt` it doesn't know for commands.
+#[derive(Default)]
+pub struct Inputs {
+    /// By kind, oldest first, each text once.
+    lists: BTreeMap<String, Vec<String>>,
+    /// Typed here since the last save: another window may have saved its own meanwhile.
+    unsaved: Vec<(String, String)>,
+    /// Forgotten here, which what is on disk mustn't bring back.
+    forgotten: Vec<(String, String)>,
+    file: Option<PathBuf>,
+}
+
+impl Inputs {
+    /// Reads the file: `[kind]` lines, each followed by its texts as `=text` lines (so a text
+    /// that looks like a heading stays a text). Missing or unreadable, the lists start empty.
+    fn load(file: Option<PathBuf>) -> Inputs {
+        let mut inputs = Inputs { file, ..Inputs::default() };
+        let Some(text) = inputs.file.as_ref().and_then(|f| fs::read_to_string(f).ok()) else { return inputs };
+        let mut kind = None;
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                kind = Some(name.to_string());
+            } else if let (Some(kind), Some(entry)) = (&kind, line.strip_prefix('=')) {
+                put(inputs.lists.entry(kind.clone()).or_default(), entry);
+            }
+        }
+        inputs
+    }
+
+    /// What was entered in this kind of field, oldest first.
+    pub fn list(&self, kind: &str) -> &[String] {
+        self.lists.get(kind).map_or(&[], Vec::as_slice)
+    }
+
+    /// `text` was entered: it is the newest of its kind now. An empty field says nothing.
+    pub fn add(&mut self, kind: &str, text: &str) {
+        if text.is_empty() || text.contains(['\n', '\r']) {
+            return;
+        }
+        put(self.lists.entry(kind.to_string()).or_default(), text);
+        self.unsaved.push((kind.to_string(), text.to_string()));
+    }
+
+    /// `text` goes from the list, also from what is saved.
+    pub fn forget(&mut self, kind: &str, text: &str) {
+        if let Some(list) = self.lists.get_mut(kind) {
+            list.retain(|t| t != text);
+        }
+        self.unsaved.retain(|(k, t)| k != kind || t != text);
+        self.forgotten.push((kind.to_string(), text.to_string()));
+    }
+
+    /// Saves what other windows saved meanwhile, and after it what was typed here.
+    fn save(&mut self) -> io::Result<()> {
+        let Some(file) = &self.file else { return Ok(()) };
+        if self.unsaved.is_empty() && self.forgotten.is_empty() {
+            return Ok(());
+        }
+        let mut lists = Inputs::load(Some(file.clone())).lists;
+        for (kind, text) in &self.forgotten {
+            if let Some(list) = lists.get_mut(kind) {
+                list.retain(|t| t != text);
+            }
+        }
+        for (kind, text) in &self.unsaved {
+            put(lists.entry(kind.clone()).or_default(), text);
+        }
+        let mut out = String::new();
+        for (kind, list) in &lists {
+            out.push_str(&format!("[{kind}]\n"));
+            for text in list {
+                out.push('=');
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+        util::write_atomically(file, &out, false)?;
+        self.unsaved.clear();
+        self.forgotten.clear();
+        Ok(())
+    }
+}
+
+/// `text` goes to the end of `list`, once; the oldest make way.
+fn put(list: &mut Vec<String>, text: &str) {
+    list.retain(|t| t != text);
+    list.push(text.to_string());
+    let excess = list.len().saturating_sub(MAX_INPUTS);
+    list.drain(..excess);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// Each kind has its own list, a text entered again becomes the newest, and two windows
+    /// keep what the other saved. A forgotten text stays gone.
+    #[test]
+    fn what_is_typed_into_fields_is_kept_by_kind() {
+        let tmp = TempDir::new("history-inputs");
+        let file = tmp.path().join("history.txt");
+        let mut a = History::load(Some(file.clone()));
+        a.inputs.add("folder", "[odd] one");
+        a.inputs.add("folder", "two");
+        a.inputs.add("folder", "[odd] one");
+        a.inputs.add("pattern", "*.jpg");
+        a.inputs.add("pattern", "");
+        a.save().unwrap();
+
+        let mut b = History::load(Some(file.clone()));
+        assert_eq!(b.inputs.list("folder"), ["two", "[odd] one"]);
+        assert_eq!(b.inputs.list("pattern"), ["*.jpg"]);
+        assert!(b.inputs.list("nothing yet").is_empty());
+        a.inputs.add("folder", "from a");
+        b.inputs.add("folder", "from b");
+        b.inputs.forget("folder", "two");
+        a.save().unwrap();
+        b.save().unwrap();
+        let both = History::load(Some(file));
+        assert_eq!(both.inputs.list("folder"), ["[odd] one", "from a", "from b"]);
+
+        let mut long = History::load(None);
+        (0..MAX_INPUTS + 5).for_each(|i| long.inputs.add("x", &i.to_string()));
+        assert_eq!(long.inputs.list("x").len(), MAX_INPUTS);
+        assert_eq!(long.inputs.list("x").first().map(String::as_str), Some("5"));
+    }
 
     #[test]
     fn remembers_folders_and_commands_between_sessions() {

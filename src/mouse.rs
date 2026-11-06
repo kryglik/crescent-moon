@@ -272,6 +272,7 @@ impl App {
                 }
                 let list_len = match &self.dialog {
                     Some(Dialog::History { filter, .. }) => self.history_rows(filter.text()).len(),
+                    Some(Dialog::Earlier { filter, back, .. }) => crate::dialog::earlier_rows(back, filter.text()).len(),
                     Some(Dialog::Commands { filter, .. }) => crate::dialog::matching_commands(filter.text()).len(),
                     Some(Dialog::Worktrees { filter, worktrees, .. }) => {
                         crate::dialog::worktree_rows(worktrees, filter.text()).len()
@@ -282,7 +283,10 @@ impl App {
                     Some(Dialog::Drives { cursor, drives, .. }) if i < drives.len() => *cursor = i,
                     Some(Dialog::Hotlist { cursor }) if i < self.hotlist.dirs.len() => *cursor = i,
                     Some(
-                        Dialog::History { cursor, .. } | Dialog::Commands { cursor, .. } | Dialog::Worktrees { cursor, .. },
+                        Dialog::History { cursor, .. }
+                        | Dialog::Earlier { cursor, .. }
+                        | Dialog::Commands { cursor, .. }
+                        | Dialog::Worktrees { cursor, .. },
                     ) if i < list_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
                     Some(Dialog::Schemes { cursor, choices, .. }) if i < choices.len() => *cursor = i,
@@ -304,6 +308,7 @@ impl App {
                             | Dialog::Drives { .. }
                             | Dialog::Hotlist { .. }
                             | Dialog::History { .. }
+                            | Dialog::Earlier { .. }
                             | Dialog::Commands { .. }
                             | Dialog::Worktrees { .. }
                             | Dialog::Schemes { .. }

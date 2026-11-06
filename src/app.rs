@@ -12,7 +12,7 @@ use crate::admin;
 use crate::archive::{self, Archive};
 use crate::clipboard::{self, Clipboard, Effect};
 use crate::compare;
-use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit};
+use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit, Recall};
 use crate::finder::{Field as FindField, Finder};
 use crate::git::{self, Tracker, Worktree};
 use crate::history::History;
@@ -32,6 +32,10 @@ use crate::subshell::Subshell;
 use crate::survey::{Survey, Tally};
 use crate::util;
 use crate::watch::Watch;
+
+/// The lists of earlier texts of Find's two fields (see `history::Inputs`).
+const FIND_TEXT: &str = "find-text";
+const FIND_FILES: &str = "find-files";
 
 /// A viewer that comes back sooner than this went on by itself, and still reads its file.
 const VIEWER_STAYS: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 0 } else { 3 });
@@ -256,6 +260,8 @@ pub struct App {
     /// Alt+F7, kept when closed so it comes back as it was.
     pub finder: Option<Finder>,
     pub find_shown: bool,
+    /// Alt+P / Alt+N in Find, going through the earlier texts of that field.
+    find_recall: Option<(FindField, Recall)>,
     sizer: Option<Sizer>,
     /// Free space of network/optical drives, arriving while the drive picker is open.
     drive_space: Option<Receiver<(PathBuf, Option<(u64, u64)>)>>,
@@ -313,6 +319,7 @@ impl App {
             mouse_allowed: true,
             finder: None,
             find_shown: false,
+            find_recall: None,
             panels,
             active: 0,
             cmdline: LineEdit::default(),
@@ -800,17 +807,30 @@ impl App {
                     ButtonOutcome::Pending => Some(Dialog::Confirm { title, lines, focus, danger, action }),
                 }
             }
-            Dialog::Input { title, prompt, mut edit, action } => match key.code {
-                KeyCode::Enter => {
-                    self.on_input(action, edit.text().to_string());
-                    None
+            Dialog::Input { title, prompt, mut edit, action, mut recall } => {
+                let alt = key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Enter => {
+                        self.on_input(action, edit.text().to_string());
+                        return;
+                    }
+                    KeyCode::Esc => return,
+                    KeyCode::Char('h') | KeyCode::Down if alt => {
+                        let back = Box::new(Dialog::Input { title, prompt, edit, action, recall });
+                        self.dialog = Some(Dialog::Earlier { filter: LineEdit::default(), cursor: 0, back });
+                        return;
+                    }
+                    KeyCode::Up => recall.older(&mut edit),
+                    KeyCode::Down => recall.newer(&mut edit),
+                    KeyCode::Char('p') if alt => recall.older(&mut edit),
+                    KeyCode::Char('n') if alt => recall.newer(&mut edit),
+                    _ => {
+                        edit.handle_key(&key);
+                    }
                 }
-                KeyCode::Esc => None,
-                _ => {
-                    edit.handle_key(&key);
-                    Some(Dialog::Input { title, prompt, edit, action })
-                }
-            },
+                Some(Dialog::Input { title, prompt, edit, action, recall })
+            }
+            Dialog::Earlier { filter, cursor, back } => self.on_earlier_key(&key, filter, cursor, back),
             Dialog::Drives { side, drives, mut cursor } => match key.code {
                 KeyCode::Up => {
                     cursor = cursor.saturating_sub(1);
@@ -936,6 +956,44 @@ impl App {
         }
     }
 
+    /// Keys in the list of what was typed into a field before. Returns the dialog to show: the
+    /// list, or the field again.
+    fn on_earlier_key(&mut self, key: &KeyEvent, mut filter: LineEdit, mut cursor: usize, mut back: Box<Dialog>) -> Option<Dialog> {
+        let alt = key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        let rows = dialog::earlier_rows(&back, filter.text());
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => return Some(*back),
+            KeyCode::Char('h') if alt => return Some(*back),
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(last),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+            KeyCode::PageDown => cursor = (cursor + 10).min(last),
+            KeyCode::Enter => {
+                if let Some(row) = rows.get(cursor) {
+                    dialog::take_earlier(&mut back, row);
+                }
+                return Some(*back);
+            }
+            KeyCode::Delete => {
+                if let (Some(row), Dialog::Input { action, recall, .. }) = (rows.get(cursor), back.as_mut()) {
+                    self.history.inputs.forget(action.kind(), row);
+                    self.history_changed = true;
+                    recall.rows.retain(|r| r != row);
+                    cursor = cursor.min(rows.len().saturating_sub(2));
+                }
+            }
+            _ => {
+                let before = filter.text().to_string();
+                filter.handle_key(key);
+                if filter.text() != before {
+                    cursor = 0;
+                }
+            }
+        }
+        Some(Dialog::Earlier { filter, cursor, back })
+    }
+
     /// Keys while the shell is shown: Ctrl+O goes back to the panels, Shift+PgUp/PgDn scroll
     /// through its output, everything else is typed into it.
     fn on_shell_key(&mut self, key: KeyEvent) {
@@ -1035,8 +1093,10 @@ impl App {
         };
         let page = finder.page as isize;
         match key.code {
-            KeyCode::Esc | KeyCode::F(10) => self.find_shown = false,
-            KeyCode::F(7) | KeyCode::Char('?') if alt => self.find_shown = false,
+            KeyCode::Esc | KeyCode::F(10) => self.close_find(),
+            KeyCode::F(7) | KeyCode::Char('?') if alt => self.close_find(),
+            KeyCode::Char('p') if alt && !ctrl => self.find_recall(true),
+            KeyCode::Char('n') if alt && !ctrl => self.find_recall(false),
             KeyCode::Tab | KeyCode::BackTab => {
                 finder.field = if finder.field == FindField::Text { FindField::Names } else { FindField::Text };
             }
@@ -1064,11 +1124,40 @@ impl App {
         }
     }
 
+    /// Find closes, or something it found is used: what it looked for joins its fields' lists.
+    fn remember_find(&mut self) {
+        let Some(finder) = &self.finder else { return };
+        self.history.inputs.add(FIND_TEXT, finder.text.text().trim());
+        self.history.inputs.add(FIND_FILES, finder.names.text().trim());
+        self.history_changed = true;
+        self.find_recall = None;
+    }
+
+    fn close_find(&mut self) {
+        self.remember_find();
+        self.find_shown = false;
+    }
+
+    /// Alt+P / Alt+N in Find: the field goes through what was searched for before. (Up and Down
+    /// are the results' there.)
+    fn find_recall(&mut self, older: bool) {
+        let Some(finder) = self.finder.as_mut() else { return };
+        let kind = if finder.field == FindField::Text { FIND_TEXT } else { FIND_FILES };
+        if self.find_recall.as_ref().is_none_or(|(field, _)| *field != finder.field) {
+            self.find_recall = Some((finder.field, Recall::new(self.history.inputs.list(kind))));
+        }
+        let Some((_, recall)) = self.find_recall.as_mut() else { return };
+        let field = finder.field_mut();
+        if older { recall.older(field) } else { recall.newer(field) }
+        finder.changed();
+    }
+
     /// Enter in Find: the panel goes to the folder of the result, the cursor on it.
     pub(crate) fn find_go_to(&mut self) {
         let Some(path) = self.finder.as_ref().and_then(Finder::selected).map(|(path, ..)| path.to_path_buf()) else {
             return;
         };
+        self.remember_find();
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return };
         self.change_dir(self.active, dir.to_path_buf());
         self.active_panel_mut().select_name(&name.to_string_lossy());
@@ -1085,6 +1174,7 @@ impl App {
         if is_dir {
             return self.find_go_to();
         }
+        self.remember_find();
         let size = fs::metadata(&path).map_or(0, |m| m.len());
         if edit { self.edit(path, size, line) } else { self.view(path, size, line) }
     }
@@ -1496,6 +1586,8 @@ impl App {
     }
 
     fn on_input(&mut self, action: InputAction, text: String) {
+        self.history.inputs.add(action.kind(), text.trim());
+        self.history_changed = true;
         let cwd = self.active_panel().cwd.clone();
         match action {
             InputAction::Copy(sources) => self.transfer(&sources, &text, false, false),
@@ -1581,11 +1673,13 @@ impl App {
     }
 
     fn start_input(&mut self, title: &str, prompt: &str, text: &str, action: InputAction) {
+        let recall = Recall::new(self.history.inputs.list(action.kind()));
         self.dialog = Some(Dialog::Input {
             title: title.into(),
             prompt: prompt.into(),
             edit: LineEdit::new(text),
             action,
+            recall,
         });
     }
 
@@ -3967,6 +4061,124 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(tmp.path().join("Gamma.txt").exists());
         assert_eq!(app.active_panel().current().unwrap().name, "Gamma.txt");
+    }
+
+    /// A field goes back through what was typed into its kind before, between sessions too,
+    /// and past the newest it holds what it started with.
+    #[test]
+    fn dialog_fields_remember_what_was_typed() {
+        let tmp = TempDir::new("app-inputs");
+        let left = tmp.dir("left");
+        let right = tmp.dir("right");
+        let history_file = Some(tmp.path().join("history.txt"));
+        let start = |file: &Option<PathBuf>| App::new(left.clone(), right.clone(), Config { history_file: file.clone(), ..crate::testutil::config() });
+        let field = |app: &App| match &app.dialog {
+            Some(Dialog::Input { edit, .. }) => edit.text().to_string(),
+            _ => panic!("no field"),
+        };
+        let mut app = start(&history_file);
+        for name in ["first", "second"] {
+            app.on_key(key(KeyCode::F(7)));
+            typing(&mut app, name);
+            app.on_key(key(KeyCode::Enter));
+        }
+        app.save_history();
+
+        let mut app = start(&history_file);
+        app.on_key(key(KeyCode::F(7)));
+        typing(&mut app, "half typ");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(field(&app), "second");
+        app.on_key(with_mods(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(field(&app), "first");
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(field(&app), "half typ", "what was being typed is still there");
+        app.on_key(key(KeyCode::Esc));
+
+        // Another kind of field has its own list.
+        app.on_key(key(KeyCode::Char('+')));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(field(&app), "*");
+        app.on_key(key(KeyCode::Esc));
+
+        // F5 starts on the other panel, and comes back to it.
+        tmp.file("left/a.txt", "a");
+        app.reload_panels();
+        app.active_panel_mut().select_name("a.txt");
+        app.on_key(key(KeyCode::F(5)));
+        let default = field(&app);
+        app.history.inputs.add("destination", "somewhere/else/");
+        app.dialog = None;
+        app.on_key(key(KeyCode::F(5)));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(field(&app), "somewhere/else/");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(field(&app), default);
+    }
+
+    /// Alt+H in a field lists what was typed there: typing narrows it, Enter takes a row back
+    /// to the field, Delete forgets one, Esc goes back with the field as it was.
+    #[test]
+    fn alt_h_in_a_field_lists_what_was_typed() {
+        let tmp = TempDir::new("app-earlier");
+        let mut app = test_app(tmp.path(), tmp.path());
+        for name in ["reports 2025", "reports 2026", "photos"] {
+            app.history.inputs.add("folder", name);
+        }
+        let alt_h = with_mods(KeyCode::Char('h'), KeyModifiers::ALT);
+        let rows = |app: &App| match &app.dialog {
+            Some(Dialog::Earlier { filter, back, .. }) => dialog::earlier_rows(back, filter.text()),
+            _ => panic!("no list"),
+        };
+        let field = |app: &App| match &app.dialog {
+            Some(Dialog::Input { edit, .. }) => edit.text().to_string(),
+            _ => panic!("no field"),
+        };
+
+        app.on_key(key(KeyCode::F(7)));
+        typing(&mut app, "x");
+        app.on_key(alt_h);
+        assert_eq!(rows(&app), ["photos", "reports 2026", "reports 2025"], "newest first");
+        typing(&mut app, "rep");
+        assert_eq!(rows(&app), ["reports 2026", "reports 2025"]);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(field(&app), "reports 2025");
+
+        app.on_key(alt_h);
+        app.on_key(key(KeyCode::Delete));
+        assert_eq!(rows(&app), ["reports 2026", "reports 2025"]);
+        assert_eq!(app.history.inputs.list("folder"), ["reports 2025", "reports 2026"]);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(field(&app), "reports 2025");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dialog.is_none());
+    }
+
+    /// Find keeps what was searched for, each field its own, for Alt+P to bring back.
+    #[test]
+    fn find_remembers_what_was_searched_for() {
+        let tmp = TempDir::new("app-find-recall");
+        let mut app = test_app(tmp.path(), tmp.path());
+        let alt = |c| with_mods(KeyCode::Char(c), KeyModifiers::ALT);
+        app.on_key(with_mods(KeyCode::F(7), KeyModifiers::ALT));
+        typing(&mut app, "needle");
+        app.on_key(key(KeyCode::Tab));
+        typing(&mut app, "*.rs");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.history.inputs.list(FIND_TEXT), ["needle"]);
+        assert_eq!(app.history.inputs.list(FIND_FILES), ["*.rs"]);
+
+        app.finder = None;
+        app.on_key(with_mods(KeyCode::F(7), KeyModifiers::ALT));
+        app.on_key(alt('p'));
+        assert_eq!(app.finder.as_ref().unwrap().text.text(), "needle");
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(alt('p'));
+        assert_eq!(app.finder.as_ref().unwrap().names.text(), "*.rs");
+        app.on_key(alt('n'));
+        assert_eq!(app.finder.as_ref().unwrap().names.text(), "");
     }
 
     /// Shift+F5 and Shift+F6 take the file under the cursor, whatever is marked, and stay in

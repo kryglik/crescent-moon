@@ -26,6 +26,59 @@ pub enum ConfirmAction {
     Pack(Vec<PathBuf>, PathBuf),
 }
 
+/// What was typed into a kind of field before, for Up and Down to go through. (The fields'
+/// Alt+P and Alt+N do the same, as on the command line.)
+#[derive(Clone, Debug, Default)]
+pub struct Recall {
+    /// Oldest first.
+    pub rows: Vec<String>,
+    /// The row in the field; None: what the field held before.
+    at: Option<usize>,
+    draft: String,
+}
+
+impl Recall {
+    pub fn new(rows: &[String]) -> Recall {
+        Recall { rows: rows.to_vec(), ..Recall::default() }
+    }
+
+    /// An earlier text, past any that reads as what the field holds now (a destination used
+    /// last time is what F5 starts with anyway).
+    pub fn older(&mut self, edit: &mut LineEdit) {
+        let before = self.at.unwrap_or(self.rows.len());
+        let Some(at) = (0..before).rev().find(|&i| self.rows[i] != edit.text()) else { return };
+        if self.at.is_none() {
+            self.draft = edit.text().to_string();
+        }
+        self.at = Some(at);
+        edit.set(self.rows[at].clone());
+    }
+
+    /// A later text; past the newest, what the field held before.
+    pub fn newer(&mut self, edit: &mut LineEdit) {
+        let Some(at) = self.at else { return };
+        match (at + 1..self.rows.len()).find(|&i| self.rows[i] != edit.text()) {
+            Some(next) => {
+                self.at = Some(next);
+                edit.set(self.rows[next].clone());
+            }
+            None => {
+                self.at = None;
+                edit.set(std::mem::take(&mut self.draft));
+            }
+        }
+    }
+
+    /// A row picked from the list: Down goes back to what the field held.
+    fn picked(&mut self, edit: &mut LineEdit, row: &str) {
+        if self.at.is_none() {
+            self.draft = edit.text().to_string();
+        }
+        self.at = self.rows.iter().position(|r| r == row);
+        edit.set(row);
+    }
+}
+
 /// What happens with the text of an input dialog.
 pub enum InputAction {
     Copy(Vec<PathBuf>),
@@ -47,10 +100,28 @@ pub enum InputAction {
     Pack(Vec<PathBuf>),
 }
 
+impl InputAction {
+    /// Which list of earlier texts the field goes by.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            InputAction::Copy(_) | InputAction::Move(_) | InputAction::Extract { .. } => "destination",
+            InputAction::CopyHere(_) | InputAction::MoveHere(_) | InputAction::Rename(_) => "name",
+            InputAction::Mkdir => "folder",
+            InputAction::NewFile => "file",
+            InputAction::Select | InputAction::Unselect => "pattern",
+            InputAction::Filter => "filter",
+            InputAction::Pack(_) => "zip",
+        }
+    }
+}
+
 pub enum Dialog {
     Message { title: String, lines: Vec<String>, error: bool },
     Confirm { title: String, lines: Vec<String>, focus: usize, danger: bool, action: ConfirmAction },
-    Input { title: String, prompt: String, edit: LineEdit, action: InputAction },
+    Input { title: String, prompt: String, edit: LineEdit, action: InputAction, recall: Recall },
+    /// Alt+H in an input field: what was typed there before (`earlier_rows`), narrowed by what
+    /// is typed; Enter puts a row in the field of `back`.
+    Earlier { filter: LineEdit, cursor: usize, back: Box<Dialog> },
     Drives { side: usize, drives: Vec<DriveInfo>, cursor: usize },
     /// The list itself lives in `App::hotlist`.
     Hotlist { cursor: usize },
@@ -345,6 +416,20 @@ fn matches_words(text: &str, filter: &str) -> bool {
     filter.split_whitespace().all(|word| text.contains(&word.to_lowercase().replace("colour", "color")))
 }
 
+/// The earlier texts of the input dialog `back`, newest first, each holding every word of
+/// `filter`.
+pub fn earlier_rows(back: &Dialog, filter: &str) -> Vec<String> {
+    let Dialog::Input { recall, .. } = back else { return Vec::new() };
+    recall.rows.iter().rev().filter(|row| matches_words(row, filter)).cloned().collect()
+}
+
+/// Enter in the list of earlier texts: `row` goes into the field of the input dialog `back`.
+pub fn take_earlier(back: &mut Dialog, row: &str) {
+    if let Dialog::Input { edit, recall, .. } = back {
+        recall.picked(edit, row);
+    }
+}
+
 /// The worktrees whose branch or folder holds every word of `filter`.
 pub fn worktree_rows<'a>(worktrees: &'a [Worktree], filter: &str) -> Vec<&'a Worktree> {
     worktrees.iter().filter(|w| matches_words(&format!("{} {}", w.head.label(), w.path.display()), filter)).collect()
@@ -398,6 +483,8 @@ pub const HELP: &[&str] = &[
     "  The question counts what goes; As admin deletes protected files",
     "  (Windows asks for administrator rights first)",
     "  Esc          close a dialog, stop a copy/move/delete",
+    "  In a field   Up/Down (or Alt+P/Alt+N) go through what was typed",
+    "               there before, Alt+H lists it (kept between sessions)",
     "",
     "Zip archives",
     "  Enter        open a zip as a folder (read-only); .. leaves it",
@@ -442,6 +529,7 @@ pub const HELP: &[&str] = &[
     "  Files: *.rs *.toml, !*test* to leave out, or part of a name",
     "  Tab switches field   Up/Down, PgUp/PgDn move   Alt+U all files",
     "  Enter goes there   F3/F4 view/edit at the line   Esc closes",
+    "  Alt+P/Alt+N  what was searched for before",
     "",
     "  F10          quit",
     "",
@@ -456,6 +544,32 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Up goes back through what was typed, past what the field holds already; Down comes
+    /// forward again, and past the newest brings back what the field held.
+    #[test]
+    fn going_through_what_was_typed_before() {
+        let rows: Vec<String> = ["old", "same", "new"].map(String::from).to_vec();
+        let mut recall = Recall::new(&rows);
+        let mut edit = LineEdit::new("new");
+        recall.older(&mut edit);
+        assert_eq!(edit.text(), "same", "not \"new\" again");
+        recall.older(&mut edit);
+        assert_eq!(edit.text(), "old");
+        recall.older(&mut edit);
+        assert_eq!(edit.text(), "old", "the oldest stays");
+        recall.newer(&mut edit);
+        recall.newer(&mut edit);
+        assert_eq!(edit.text(), "new");
+        recall.newer(&mut edit);
+        assert_eq!(edit.text(), "new", "what it held");
+        recall.newer(&mut edit);
+        assert_eq!(edit.text(), "new", "nothing further");
+
+        let mut empty = Recall::default();
+        empty.older(&mut edit);
+        assert_eq!(edit.text(), "new");
     }
 
     #[test]

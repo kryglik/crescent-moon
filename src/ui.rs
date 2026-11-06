@@ -121,6 +121,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let (position, dialog_hit) = draw_filtered_list(frame, area, "Folder history", &rows, filter, *cursor, HISTORY_HINT, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
+    } else if let Some(Dialog::Earlier { filter, cursor, back }) = &app.dialog {
+        let rows = dialog::earlier_rows(back, filter.text());
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Typed here before", &rows, filter, *cursor, EARLIER_HINT, t);
+        frame.set_cursor_position(position);
+        hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Commands { filter, cursor }) = &app.dialog {
         let commands = dialog::matching_commands(filter.text());
         let label_w = commands.iter().map(|c| util::width(c.label)).max().unwrap_or(0);
@@ -902,17 +907,18 @@ fn draw_dialog(
         Dialog::Question { title, lines, buttons, focus, error, .. } => {
             (None, draw_message(frame, area, title, lines, buttons, *focus, *error, t))
         }
-        Dialog::Input { title, prompt, edit, .. } => {
+        Dialog::Input { title, prompt, edit, recall, .. } => {
             let width = (area.width * 2 / 3).clamp(40, 90).min(area.width);
             let (outer, inner) = dialog_frame(frame, area, width, 6, title, false, t);
             let style = t.dialog;
             let field_w = inner.width as usize;
             let (text, cursor) = edit.view(field_w.saturating_sub(1));
+            let hint = if recall.rows.is_empty() { "Enter = OK   Esc = cancel" } else { "↑ earlier   Enter = OK   Esc = cancel" };
             let lines = vec![
                 Line::from(util::fit_left(prompt, field_w)),
                 Line::from(Span::styled(util::pad(&text, field_w), t.on_dialog(t.input))),
                 Line::default(),
-                Line::from(Span::styled("Enter = OK   Esc = cancel", t.on_dialog(t.dialog_dim))).right_aligned(),
+                Line::from(Span::styled(hint, t.on_dialog(t.dialog_dim))).right_aligned(),
             ];
             frame.render_widget(Paragraph::new(lines).style(style), inner);
             let cursor = Position::new(inner.x + cursor as u16, inner.y + 1);
@@ -930,7 +936,7 @@ fn draw_dialog(
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor, t)),
         // Drawn by `draw`, which has the rows.
-        Dialog::History { .. } | Dialog::Commands { .. } | Dialog::Worktrees { .. } | Dialog::Schemes { .. } => {
+        Dialog::History { .. } | Dialog::Earlier { .. } | Dialog::Commands { .. } | Dialog::Worktrees { .. } | Dialog::Schemes { .. } => {
             (None, DialogHit::default())
         }
         Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor, t)),
@@ -1205,6 +1211,7 @@ fn draw_attributes(
 
 const HISTORY_HINT: &str = "type to narrow · Enter goes there · Del forgets · Esc";
 const COMMANDS_HINT: &str = "type to narrow · Enter runs it · Esc";
+const EARLIER_HINT: &str = "type to narrow · Enter takes it · Del forgets · Esc";
 const WORKTREES_HINT: &str = "type to narrow · Enter goes there (same subfolder) · Esc";
 
 /// The Alt+W list's rows: `*` on the one the panel is in, the branch, then the folder (which
