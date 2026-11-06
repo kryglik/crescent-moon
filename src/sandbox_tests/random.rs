@@ -13,6 +13,9 @@ use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::ops::Question;
+use crate::ops::remote::{self, Place};
+use crate::ssh::{self, Connection};
+use std::sync::Arc;
 
 type Tree = BTreeMap<String, String>;
 
@@ -156,12 +159,14 @@ struct Garden<'a> {
     #[cfg_attr(unix, allow(dead_code))]
     junctions_left: usize,
     one_spelling: bool,
+    /// Only names every server can reach.
+    plain: bool,
 }
 
 impl Garden<'_> {
     fn name(&mut self, depth: usize) -> String {
         let name = match self.dice.roll(10) {
-            0 | 1 => self.dice.pick(ODD_NAMES).to_string(),
+            0 | 1 if !self.plain => self.dice.pick(ODD_NAMES).to_string(),
             2 if depth < 3 => format!("{}{depth}", "l".repeat(100)),
             3 | 4 | 5 => self.dice.pick(COLLIDING).to_string(),
             _ => self.dice.pick(NAMES).to_string(),
@@ -286,12 +291,19 @@ impl Places {
     fn key(&self, path: &Path) -> String {
         for (label, root) in self.0.iter().chain(&self.1) {
             if let Ok(rest) = path.strip_prefix(root) {
+                // As `snapshot` writes them.
                 let rest = rest.to_string_lossy().replace('\\', "/");
                 return folded(format!("{label}/{rest}").trim_end_matches('/'));
             }
         }
         panic!("{} is outside the round", path.display());
     }
+}
+
+/// A relative path with `/` between its parts. On Linux a backslash is part of a name.
+fn slashed(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { text.replace('\\', "/") } else { text.into_owned() }
 }
 
 fn folded(path: &str) -> String {
@@ -461,9 +473,9 @@ fn round(seed: u64, counts: &mut Counts) {
     #[cfg(unix)]
     let one_spelling = ignores_case(&dst);
 
-    let mut garden = Garden { dice, root: src.clone(), tag: "src", serial: 0, outside: outside.clone(), twin: None, junctions_left: 0, one_spelling };
+    let mut garden = Garden { dice, root: src.clone(), tag: "src", serial: 0, outside: outside.clone(), twin: None, junctions_left: 0, one_spelling, plain: false };
     garden.grow(&src, 0);
-    let mut garden = Garden { dice, root: dst.clone(), tag: "dst", serial: 0, outside: outside.clone(), twin: Some(src.clone()), junctions_left: 3, one_spelling };
+    let mut garden = Garden { dice, root: dst.clone(), tag: "dst", serial: 0, outside: outside.clone(), twin: Some(src.clone()), junctions_left: 3, one_spelling, plain: false };
     garden.echo(&src, &dst);
     garden.grow(&dst, 0);
 
@@ -575,6 +587,129 @@ fn round(seed: u64, counts: &mut Counts) {
     }
 }
 
+/// `path`, which is in the folder `home`-on-this-disk stands for: on this computer, or the same
+/// file as the server sees it. Both ends of a job are on this disk, so the whole of it can be
+/// checked afterwards as ever.
+fn seen(path: &Path, root: &Path, connection: &Arc<Connection>, there: bool) -> Place {
+    if !there {
+        return Place::Here(path.to_path_buf());
+    }
+    Place::There(connection.clone(), ssh::join(&connection.home, &slashed(path.strip_prefix(root).unwrap())))
+}
+
+/// The disk path of a place of a round.
+fn on_disk(place: &Place, root: &Path, connection: &Arc<Connection>) -> PathBuf {
+    match place {
+        Place::Here(path) => path.clone(),
+        Place::There(_, path) => root.join(path.strip_prefix(&ssh::join(&connection.home, "")).unwrap_or(path)),
+    }
+}
+
+/// A round with an end of the job, or both, on "another computer": a real server program
+/// started in the round's folder. Trees, answers and what must hold after are those of `round`.
+fn round_over_ssh(seed: u64, counts: &mut Counts) {
+    let dice = &mut Dice::new(seed);
+    let near = TempDir::new("random-ssh");
+    let Some(connection) = ssh::tests::local_connection(near.path()) else { return };
+    let src = near.dir("src");
+    let dst = near.dir("dst");
+    let outside = near.dir("outside");
+    near.file("outside/one.txt", "one");
+    near.file("outside/deep/two.txt", "two");
+    let places = Places(vec![("src", src.clone()), ("dst", dst.clone()), ("outside", outside.clone())], Vec::new());
+    // Git's server on Windows can't reach odd names, nor read them back.
+    let plain = cfg!(windows);
+    #[cfg(windows)]
+    let one_spelling = false;
+    #[cfg(unix)]
+    let one_spelling = ignores_case(&dst);
+    let mut garden = Garden { dice, root: src.clone(), tag: "src", serial: 0, outside: outside.clone(), twin: None, junctions_left: 0, one_spelling, plain };
+    garden.grow(&src, 0);
+    let mut garden = Garden { dice, root: dst.clone(), tag: "dst", serial: 0, outside: outside.clone(), twin: Some(src.clone()), junctions_left: 0, one_spelling, plain };
+    garden.echo(&src, &dst);
+    garden.grow(&dst, 0);
+
+    // Which ends are over there: here to there, there to here, or there to there.
+    let (from_there, to_there) = [(false, true), (true, false), (true, true)][dice.roll(3)];
+    let moving = dice.chance(50);
+    let way = Way::random(dice);
+    let root = near.path();
+    let mut chosen: Vec<PathBuf> = top_level(&src).into_iter().filter(|_| dice.chance(60)).collect();
+    let shape = dice.roll(10);
+    if shape < 3 {
+        chosen.truncate(1);
+    }
+    if let Some(first) = chosen.first().cloned() {
+        // Here both ends are one disk. Into itself across computers nobody can see that, and it
+        // goes down to the depth limit and says so; in life that takes a folder mounted here
+        // and moved into itself from over there.
+        let shape = if from_there != to_there && (3..=4).contains(&shape) { 5 } else { shape };
+        let (dest, as_folder) = match shape {
+            0 | 1 => (dst.join("new name"), false),
+            2 => (src.join("beside it"), false),
+            3 => (first.join("inner"), false),
+            4 => (first.clone(), true),
+            _ => (dst.clone(), true),
+        };
+        let sources: Vec<Place> = chosen.iter().map(|path| seen(path, root, &connection, from_there)).collect();
+        let dest = seen(&dest, root, &connection, to_there);
+        let before = places.look();
+        match remote::plan(&sources, &dest, as_folder) {
+            Err(_) => counts.refused += 1,
+            Ok(pairs) => {
+                let job = Job::Transfer { pairs: pairs.clone(), moving, replace: false };
+                let (errors, cancelled, asked) = drive(job, way, dice);
+                let pairs: Vec<(String, String)> = pairs
+                    .iter()
+                    .map(|(from, to)| (places.key(&on_disk(from, root, &connection)), places.key(&on_disk(to, root, &connection))))
+                    .collect();
+                let failed = |what: String| {
+                    panic!(
+                        "seed {seed}: {what}\n{} {from_there} to {to_there}, {way:?}, cancelled {cancelled}\npairs {pairs:#?}\nerrors {errors:#?}",
+                        if moving { "move" } else { "copy" }
+                    )
+                };
+                check_job(&failed, moving, way, &pairs, &errors, cancelled, &before, &places.look());
+                counts.jobs += 1;
+                for error in &errors {
+                    let said = error.rsplit(": ").next().unwrap_or(error);
+                    *counts.errors.entry(said.chars().take(70).collect()).or_default() += 1;
+                }
+                counts.questions += asked;
+                counts.with_errors += !errors.is_empty() as usize;
+                counts.cancelled += cancelled as usize;
+            }
+        }
+    }
+
+    // A delete over there takes what it was given and nothing else.
+    let chosen: Vec<PathBuf> = top_level(&src).into_iter().filter(|_| dice.chance(50)).collect();
+    if !chosen.is_empty() {
+        let before = places.look();
+        let keys: Vec<String> = chosen.iter().map(|path| places.key(path)).collect();
+        let expected: Tree = before
+            .iter()
+            .filter(|(key, _)| !keys.iter().any(|gone| *key == gone || key.starts_with(&format!("{gone}/"))))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let paths: Vec<String> = chosen
+            .iter()
+            .map(|path| match seen(path, root, &connection, true) {
+                Place::There(_, path) => path,
+                Place::Here(_) => unreachable!(),
+            })
+            .collect();
+        let (errors, cancelled, _) = drive(Job::DeleteThere { connection: connection.clone(), paths }, Way::Yes, dice);
+        assert!(errors.is_empty() && !cancelled, "seed {seed}: delete: {errors:#?}");
+        let after = places.look();
+        if after != expected {
+            let gone: Vec<&String> = expected.keys().filter(|key| !after.contains_key(*key)).collect();
+            let stayed: Vec<&String> = after.keys().filter(|key| !expected.contains_key(*key)).collect();
+            panic!("seed {seed}: delete of {keys:#?}\nalso took {gone:#?}\nleft {stayed:#?}");
+        }
+    }
+}
+
 fn number(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|text| text.parse().ok()).unwrap_or(default)
 }
@@ -592,4 +727,18 @@ fn random_trees_lose_nothing() {
     );
     println!("{:#?}", counts.errors);
     assert!(counts.jobs > 0);
+}
+
+#[test]
+fn random_trees_lose_nothing_over_ssh() {
+    let (first, rounds) = (number("RMC_SEED", 1), number("RMC_ROUNDS", 4));
+    let mut counts = Counts::default();
+    for seed in first..first + rounds {
+        round_over_ssh(seed, &mut counts);
+    }
+    println!(
+        "{rounds} rounds over ssh: {} jobs, {} questions, {} with errors, {} cancelled, {} refused by the plan",
+        counts.jobs, counts.questions, counts.with_errors, counts.cancelled, counts.refused
+    );
+    println!("{:#?}", counts.errors);
 }
