@@ -914,6 +914,11 @@ impl App {
                     cursor = (cursor + 1).min(drives.len().saturating_sub(1));
                     Some(Dialog::Drives { side, drives, cursor })
                 }
+                KeyCode::Home | KeyCode::PageUp => Some(Dialog::Drives { side, drives, cursor: 0 }),
+                KeyCode::End | KeyCode::PageDown => {
+                    cursor = drives.len().saturating_sub(1);
+                    Some(Dialog::Drives { side, drives, cursor })
+                }
                 KeyCode::Enter => {
                     if let Some(drive) = drives.get(cursor) {
                         self.switch_drive(side, &drive.root);
@@ -1685,6 +1690,9 @@ impl App {
     }
 
     fn on_input(&mut self, action: InputAction, text: String) {
+        if action.keeps_the_name(&text) {
+            return;
+        }
         // A password in an address is refused, and isn't kept either, as nothing that isn't
         // an address rmc can read is: what looks like a path may hold one too.
         if ssh::parse_typed(&text).is_ok() {
@@ -1887,14 +1895,17 @@ impl App {
     }
 
     fn start_input(&mut self, title: &str, prompt: &str, text: &str, action: InputAction) {
+        self.open_input(title, prompt, LineEdit::new(text), action);
+    }
+
+    /// For a name: it is all selected, so typing replaces it and the arrows edit it.
+    fn start_name_input(&mut self, title: &str, prompt: &str, name: &str, action: InputAction) {
+        self.open_input(title, prompt, LineEdit::selected(name), action);
+    }
+
+    fn open_input(&mut self, title: &str, prompt: &str, edit: LineEdit, action: InputAction) {
         let recall = Recall::new(self.history.inputs.list(action.kind()));
-        self.dialog = Some(Dialog::Input {
-            title: title.into(),
-            prompt: prompt.into(),
-            edit: LineEdit::new(text),
-            action,
-            recall,
-        });
+        self.dialog = Some(Dialog::Input { title: title.into(), prompt: prompt.into(), edit, action, recall });
     }
 
     fn start_job(&mut self, job: Job) {
@@ -2880,7 +2891,7 @@ impl App {
     }
 
     /// Shift+F5 / Shift+F6, as in mc: the item under the cursor, marks or not, in this folder.
-    /// The field starts empty, and what is typed counts from this folder.
+    /// The field starts with its name, selected, and what is typed counts from this folder.
     fn start_in_place(&mut self, is_move: bool) {
         if self.refuse_in_archive(self.active) {
             return;
@@ -2888,9 +2899,9 @@ impl App {
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
         let (name, path) = (entry.name.clone(), entry.path.clone());
         if is_move {
-            self.start_input("Rename", &format!("Rename \"{name}\" to:"), "", InputAction::MoveHere(path));
+            self.start_name_input("Rename", &format!("Rename \"{name}\" to:"), &name, InputAction::MoveHere(path));
         } else {
-            self.start_input("Copy", &format!("Copy \"{name}\" to:"), "", InputAction::CopyHere(path));
+            self.start_name_input("Copy", &format!("Copy \"{name}\" to:"), &name, InputAction::CopyHere(path));
         }
     }
 
@@ -2900,7 +2911,7 @@ impl App {
         }
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
         let (name, path) = (entry.name.clone(), entry.path.clone());
-        self.start_input("Rename", &format!("Rename \"{name}\" to:"), &name, InputAction::Rename(path));
+        self.start_name_input("Rename", &format!("Rename \"{name}\" to:"), &name, InputAction::Rename(path));
     }
 
     /// F2 on another computer. As here, what is there stays.
@@ -4759,9 +4770,9 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
 
-        // In place: the field empty, the name lands in that folder, the cursor goes along.
+        // In place: the name offered, the new one lands in that folder, the cursor goes along.
         app.on_key(with_mods(KeyCode::F(5), KeyModifiers::SHIFT));
-        assert_eq!(field(app), "");
+        assert_eq!(field(app), "b.txt");
         typing(app, "c.txt");
         app.on_key(key(KeyCode::Enter));
         wait_for_job(app);
@@ -4989,6 +5000,45 @@ mod tests {
         assert!(over.there.path().join("[slug]/plain.txt").exists());
     }
 
+    /// F2 offers the name selected too: typing replaces it.
+    #[test]
+    fn f2_replaces_the_name_by_typing() {
+        let tmp = TempDir::new("app-f2-selected");
+        tmp.file("old name.txt", "x");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("old name.txt");
+        app.on_key(key(KeyCode::F(2)));
+        assert_eq!(field(&app), "old name.txt");
+        typing(&mut app, "new.txt");
+        app.on_key(key(KeyCode::Enter));
+        assert!(tmp.path().join("new.txt").exists() && !tmp.path().join("old name.txt").exists());
+    }
+
+    /// The drive picker goes to its ends by Home and End, and by the page keys.
+    #[test]
+    fn home_and_end_in_the_drive_picker() {
+        let tmp = TempDir::new("app-drives");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.history.inputs.add("ssh", "first-host");
+        app.history.inputs.add("ssh", "second-host");
+        let cursor = |app: &App| match &app.dialog {
+            Some(Dialog::Drives { cursor, drives, .. }) => (*cursor, drives.len()),
+            _ => panic!("no drives"),
+        };
+        app.on_key(with_mods(KeyCode::F(1), KeyModifiers::ALT));
+        let (_, count) = cursor(&app);
+        assert!(count >= 3, "a drive and two hosts");
+        for (press, at) in [
+            (KeyCode::End, count - 1),
+            (KeyCode::Home, 0),
+            (KeyCode::PageDown, count - 1),
+            (KeyCode::PageUp, 0),
+        ] {
+            app.on_key(key(press));
+            assert_eq!(cursor(&app).0, at, "{press:?}");
+        }
+    }
+
     /// Shift+F5 and Shift+F6 stay on the panel's computer, also for a whole path. F5 starts on
     /// the other panel, where a whole path is one of this computer.
     #[test]
@@ -5207,8 +5257,8 @@ mod tests {
     }
 
     /// Shift+F5 and Shift+F6 take the file under the cursor, whatever is marked, and stay in
-    /// its folder: the field starts empty (not on the other panel), the cursor follows the new
-    /// name, the marks stay for the next job.
+    /// its folder: the field starts on its name, selected (not on the other panel), the cursor
+    /// follows the new name, the marks stay for the next job.
     #[test]
     fn shift_f5_and_shift_f6_work_in_place() {
         let left = TempDir::new("app-here-left");
@@ -5223,7 +5273,8 @@ mod tests {
 
         app.on_key(shift(5));
         let Some(Dialog::Input { edit, prompt, .. }) = &app.dialog else { panic!("no dialog") };
-        assert_eq!((edit.text(), prompt.as_str()), ("", "Copy \"b.txt\" to:"));
+        assert_eq!((edit.text(), prompt.as_str()), ("b.txt", "Copy \"b.txt\" to:"));
+        assert!(edit.is_selected(), "typing replaces it");
         typing(&mut app, "b copy.txt");
         app.on_key(key(KeyCode::Enter));
         wait_for_job(&mut app);
@@ -5240,10 +5291,31 @@ mod tests {
         assert_eq!(app.active_panel().current().unwrap().name, "c.txt");
         assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
 
-        // Nothing typed, nothing done, and no box to say so.
-        app.on_key(shift(5));
+        // Enter on the name as it is, or on an emptied field: nothing to do, and no box to say so.
+        let remembered = app.history.inputs.list("name").len();
+        for n in [5, 6] {
+            app.on_key(shift(n));
+            app.on_key(key(KeyCode::Enter));
+            assert!(app.dialog.is_none() && app.job.is_none());
+            assert_eq!(app.history.inputs.list("name").len(), remembered, "nor anything to remember");
+            app.on_key(shift(n));
+            app.on_key(key(KeyCode::Backspace));
+            app.on_key(key(KeyCode::Enter));
+            assert!(app.dialog.is_none() && app.job.is_none());
+        }
+
+        // The arrows edit the name instead of replacing it.
+        app.on_key(shift(6));
+        app.on_key(key(KeyCode::Home));
+        typing(&mut app, "old ");
         app.on_key(key(KeyCode::Enter));
-        assert!(app.dialog.is_none() && app.job.is_none());
+        wait_for_job(&mut app);
+        assert!(left.path().join("old c.txt").exists());
+        app.active_panel_mut().select_name("old c.txt");
+        app.on_key(shift(6));
+        typing(&mut app, "c.txt");
+        app.on_key(key(KeyCode::Enter));
+        wait_for_job(&mut app);
 
         // A name that is there: the usual question, here too.
         app.active_panel_mut().select_name("c.txt");

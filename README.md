@@ -107,9 +107,9 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | --- | --- |
 | Insert, Shift+Up/Down, `+` `-` `*` | mark files |
 | Ctrl+A | mark everything (with an empty command line) |
-| F2 | rename |
+| F2 | rename: the name is selected, so typing replaces it and the arrows edit it |
 | F5 / F6 / F7 | copy / move / make directory; the progress shows the speed and the time left |
-| Shift+F5 / Shift+F6 | copy / rename the item under the cursor in this folder, as in mc: the field starts empty, and marks don't count |
+| Shift+F5 / Shift+F6 | copy / rename the item under the cursor in this folder, as in mc, whatever is marked. The name is selected, as with F2, and a name that is taken gets the usual question |
 | F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
 | Alt+A | attributes of the marked files (or the one under the cursor): read-only, hidden, system, archive on Windows, the permission bits (rwx) on Linux. Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
 | Alt+F5 / Alt+F9 | pack into a zip / unpack the zip under the cursor (see Zip archives) |

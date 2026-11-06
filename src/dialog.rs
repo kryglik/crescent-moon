@@ -134,6 +134,15 @@ impl InputAction {
             InputAction::Connect => "ssh",
         }
     }
+
+    /// Whether `text` is the name the item has: for F2, Shift+F5 and Shift+F6, which start with
+    /// it, Enter on it is nothing to do.
+    pub fn keeps_the_name(&self, text: &str) -> bool {
+        let (InputAction::CopyHere(path) | InputAction::MoveHere(path) | InputAction::Rename(path)) = self else {
+            return false;
+        };
+        path.file_name().is_some_and(|name| name == text)
+    }
 }
 
 pub enum Dialog {
@@ -262,13 +271,25 @@ pub fn is_text_input(key: &KeyEvent) -> bool {
 pub struct LineEdit {
     text: String,
     cursor: usize,
+    /// All of the text is selected, as mc offers a name to rename: the first character typed
+    /// replaces it, and anything that moves the cursor leaves it to be edited.
+    selected: bool,
 }
 
 impl LineEdit {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let cursor = text.chars().count();
-        LineEdit { text, cursor }
+        LineEdit { text, cursor, selected: false }
+    }
+
+    /// A field holding `text`, all of it selected.
+    pub fn selected(text: impl Into<String>) -> Self {
+        LineEdit { selected: true, ..LineEdit::new(text) }
+    }
+
+    pub fn is_selected(&self) -> bool {
+        self.selected && !self.text.is_empty()
     }
 
     pub fn text(&self) -> &str {
@@ -300,6 +321,10 @@ impl LineEdit {
     /// Applies an editing key; false if the key is not an editing key.
     pub fn handle_key(&mut self, key: &KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let was_selected = std::mem::take(&mut self.selected);
+        if was_selected && (is_text_input(key) || matches!(key.code, KeyCode::Backspace | KeyCode::Delete)) {
+            self.clear();
+        }
         let len = self.text.chars().count();
         match key.code {
             KeyCode::Char(c) if is_text_input(key) => self.insert_str(c.encode_utf8(&mut [0; 4])),
@@ -337,7 +362,10 @@ impl LineEdit {
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = len,
             KeyCode::Backspace | KeyCode::Delete => {}
-            _ => return false,
+            _ => {
+                self.selected = was_selected;
+                return false;
+            }
         }
         true
     }
@@ -382,10 +410,10 @@ pub const COMMANDS: &[Command] = &[
     command("Edit the file", "F4", KeyCode::F(4), NONE),
     command("New file", "Shift+F4", KeyCode::F(4), SHIFT),
     command("Copy", "F5", KeyCode::F(5), NONE),
-    command("Copy the file here, under a name typed", "Shift+F5", KeyCode::F(5), SHIFT),
+    command("Copy the file here, under another name", "Shift+F5", KeyCode::F(5), SHIFT),
     command("Pack into a zip", "Alt+F5", KeyCode::F(5), ALT),
     command("Move", "F6", KeyCode::F(6), NONE),
-    command("Rename the file, the name typed from nothing", "Shift+F6", KeyCode::F(6), SHIFT),
+    command("Rename the file (asks if the name is taken)", "Shift+F6", KeyCode::F(6), SHIFT),
     command("Make a folder", "F7", KeyCode::F(7), NONE),
     command("Find text in files below (like ag)", "Alt+F7", KeyCode::F(7), ALT),
     command("Delete to the Recycle Bin", "F8", KeyCode::F(8), NONE),
@@ -496,7 +524,9 @@ pub const HELP: &[&str] = &[
     "               over 10 MB: F3 shows it in less, F4 asks first",
     "  F5 copy      F6 move    F7 make directory",
     "  Shift+F5/F6  copy / rename the file under the cursor in this",
-    "               folder: the field starts empty, marks don't count",
+    "               folder, whatever is marked",
+    "  F2, Shift+F5/F6   the name is selected: typing replaces it, the",
+    "               arrows edit it",
     "  Ctrl+C/Ctrl+X  copy/cut files to the clipboard (Explorer pastes)",
     "  Ctrl+Shift+C   their full paths to the clipboard, as text",
     "  Alt+V        paste files copied or cut here or in Explorer",
@@ -576,6 +606,53 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A selected text goes with the first character typed, or Backspace or Delete. Anything
+    /// that moves the cursor leaves it to be edited, and other keys leave it selected.
+    #[test]
+    fn a_selected_text_is_replaced_or_edited() {
+        let mut edit = LineEdit::selected("report.txt");
+        assert!(edit.is_selected());
+        edit.handle_key(&key(KeyCode::Char('n')));
+        edit.handle_key(&key(KeyCode::Char('e')));
+        assert_eq!(edit.text(), "ne");
+        assert!(!edit.is_selected());
+
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut edit = LineEdit::selected("report.txt");
+            edit.handle_key(&key(code));
+            assert_eq!(edit.text(), "");
+        }
+
+        let mut edit = LineEdit::selected("report.txt");
+        edit.handle_key(&key(KeyCode::Left));
+        edit.handle_key(&key(KeyCode::Char('X')));
+        assert_eq!(edit.text(), "report.txXt", "from where the cursor was, at the end");
+
+        let mut edit = LineEdit::selected("report.txt");
+        edit.handle_key(&key(KeyCode::Home));
+        edit.handle_key(&key(KeyCode::Char('X')));
+        assert_eq!(edit.text(), "Xreport.txt");
+
+        let mut edit = LineEdit::selected("report.txt");
+        edit.handle_key(&key(KeyCode::End));
+        edit.handle_key(&key(KeyCode::Char('2')));
+        assert_eq!(edit.text(), "report.txt2");
+
+        let mut edit = LineEdit::selected("report.txt");
+        assert!(!edit.handle_key(&key(KeyCode::F(9))), "not an editing key");
+        assert!(edit.is_selected());
+        edit.handle_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(!edit.is_selected() && edit.text() == "report.txt", "Ctrl+A goes to the start");
+
+        // AltGr types, so it replaces too.
+        let mut edit = LineEdit::selected("x");
+        edit.handle_key(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(edit.text(), "@");
+
+        // Nothing to select in an empty field.
+        assert!(!LineEdit::selected("").is_selected());
     }
 
     /// Up goes back through what was typed, past what the field holds already; Down comes

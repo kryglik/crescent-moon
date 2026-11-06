@@ -918,9 +918,18 @@ fn draw_dialog(
             let field_w = inner.width as usize;
             let (text, cursor) = edit.view(field_w.saturating_sub(1));
             let hint = if recall.rows.is_empty() { "Enter = OK   Esc = cancel" } else { "↑ earlier   Enter = OK   Esc = cancel" };
+            // A selected text looks it: the next character replaces it. Reversed, as a scheme's
+            // focus colour may be the field's own.
+            let field = if edit.is_selected() {
+                let rest = " ".repeat(field_w.saturating_sub(util::width(&text)));
+                let selected = t.on_dialog(t.input).add_modifier(Modifier::REVERSED);
+                Line::from(vec![Span::styled(text, selected), Span::styled(rest, t.on_dialog(t.input))])
+            } else {
+                Line::from(Span::styled(util::pad(&text, field_w), t.on_dialog(t.input)))
+            };
             let lines = vec![
                 Line::from(util::fit_left(prompt, field_w)),
-                Line::from(Span::styled(util::pad(&text, field_w), t.on_dialog(t.input))),
+                field,
                 Line::default(),
                 Line::from(Span::styled(hint, t.on_dialog(t.dialog_dim))).right_aligned(),
             ];
