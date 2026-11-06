@@ -415,6 +415,13 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
 fn window_title(app: &App) -> String {
     let location = app.active_panel().location();
     let name = location.file_name().map_or_else(|| location.display().to_string(), |n| n.to_string_lossy().into_owned());
+    title_text(&name)
+}
+
+/// A title for the terminal. It goes there raw, and a name (from another computer, too) may
+/// hold what ends the title and starts a command to the terminal.
+fn title_text(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
     format!("{name} - rmc")
 }
 
@@ -605,4 +612,16 @@ fn wait_for_key() -> io::Result<()> {
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name can't end the title and go on as a command to the terminal.
+    #[test]
+    fn a_title_holds_no_control_characters() {
+        assert_eq!(title_text("photos"), "photos - rmc");
+        assert_eq!(title_text("x\u{7}\u{1b}]52;c;AAAA\u{7}\u{9b}2J"), "x]52;c;AAAA2J - rmc");
+    }
 }

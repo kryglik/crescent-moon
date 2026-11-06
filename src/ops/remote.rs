@@ -370,12 +370,48 @@ pub fn plan(sources: &[Place], dest: &Place, as_folder: bool) -> Result<Vec<(Pla
         if source.same_place(&target) {
             return Err(format!("\"{}\" is the same as its destination.", source.shown().display()));
         }
-        if target.is_inside(source) && source.follow().is_ok_and(|item| item.kind == Kind::Folder) {
+        // Names over SFTP are UTF-8: another name would arrive, and this one find no way back.
+        if let Place::Here(path) = source
+            && path.file_name().is_some_and(|name| name.to_str().is_none())
+        {
+            return Err(format!("\"{}\": this name can't be written over SFTP (it isn't UTF-8).", source.shown().display()));
+        }
+        // By what it leads to, as `check_pair` goes: a link to a folder isn't put in that folder.
+        let folder = source.follow().is_ok_and(|item| item.kind == Kind::Folder);
+        if folder && (target.is_inside(source) || really_inside(&target, source)) {
             return Err(format!("\"{}\" cannot be put inside itself.", source.shown().display()));
         }
         pairs.push((source.clone(), target));
     }
     Ok(pairs)
+}
+
+/// Whether `target`, through the links on its way, lies inside folder `source` on one computer:
+/// the folder would be copied into itself, ever deeper.
+fn really_inside(target: &Place, source: &Place) -> bool {
+    let (Place::There(connection, to), Place::There(_, from)) = (target, source) else { return false };
+    if !source.same_host(target) {
+        return false;
+    }
+    let sftp = &connection.sftp;
+    // The nearest folder of the way that is there.
+    let mut there = to.clone();
+    while sftp.stat(&there).is_err() {
+        let Some(parent) = ssh::parent(&there) else { return false };
+        there = parent;
+    }
+    match (sftp.realpath(&there), sftp.realpath(from)) {
+        (Ok(there), Ok(from)) => there == from || there.starts_with(&ssh::join(&from, "")),
+        _ => false,
+    }
+}
+
+/// Whether `a` and `b`, by a link, are one file on one computer: a link replacing what it leads
+/// to would leave nothing to lead to.
+fn one_file(a: &Place, b: &Place) -> bool {
+    let (Place::There(connection, first), Place::There(_, second)) = (a, b) else { return false };
+    let real = |path: &str| connection.sftp.realpath(path).ok();
+    a.same_host(b) && matches!((real(first), real(second)), (Some(a), Some(b)) if a == b)
 }
 
 /// A file being read, here or there.
@@ -420,6 +456,14 @@ impl Reading {
             download.close();
         }
     }
+}
+
+/// The permissions a copy gets. A file from Windows has none of its own, and takes those of
+/// what it replaces; one put back after editing stays what it was, as its copy here was only
+/// as open as this computer's umask lets it be. A link's aren't anybody's.
+fn mode_of_copy(item: &Item, existing: Option<&Item>, putting_back: bool) -> Option<u32> {
+    let existing = existing.filter(|existing| existing.kind == Kind::File).and_then(|existing| existing.mode);
+    if putting_back { existing.or(item.mode) } else { item.mode.or(existing) }
 }
 
 /// A new file being written, here or there.
@@ -482,19 +526,18 @@ impl Writing {
     }
 }
 
-/// What a file over there still needs: the size checked, then the looks. Those of the original
-/// if it has any, else of the file it replaces. A copy replacing another person's file stays
-/// theirs if the server lets it (as root).
+/// What a file over there still needs: the size checked, then the looks. A copy replacing
+/// another person's file stays theirs if the server lets it (as root).
 fn finish_there(sftp: &Sftp, upload: &Upload, written: u64, item: &Item, existing: Option<&Item>, flush: bool) -> io::Result<()> {
     let attrs = sftp.fstat(&upload.handle)?;
     if attrs.size != Some(written) {
         return Err(io::Error::other("it came out shorter than the original"));
     }
-    if let Some(owner) = existing.and_then(|item| item.owner).filter(|owner| attrs.owner != Some(*owner)) {
+    let replaced = existing.filter(|existing| existing.kind == Kind::File);
+    if let Some(owner) = replaced.and_then(|item| item.owner).filter(|owner| attrs.owner != Some(*owner)) {
         let _ = sftp.set_handle_attrs(&upload.handle, &Attrs { owner: Some(owner), ..Attrs::default() });
     }
-    let mode = item.mode.or(existing.and_then(|item| item.mode)).map(|mode| mode & 0o777);
-    let look = Attrs { mode, ..Attrs::default() };
+    let look = Attrs { mode: item.mode.map(|mode| mode & 0o777), ..Attrs::default() };
     let look = item.modified.map_or(look, |time| look.with_modified(time));
     let _ = sftp.set_handle_attrs(&upload.handle, &look);
     if flush { sftp.sync(&upload.handle) } else { Ok(()) }
@@ -551,7 +594,7 @@ impl Worker {
         }
         self.progress.scanning = false;
         for place in &places {
-            self.remove_there(place)?;
+            self.remove_there(place, 0)?;
         }
         Ok(())
     }
@@ -616,7 +659,7 @@ impl Worker {
     fn taken(&self, place: &Place) -> bool {
         match place {
             Place::Here(path) => self.written.contains(&name_key(path)),
-            Place::There(_, path) => self.written_there.contains(path),
+            Place::There(_, path) => self.written_there.contains(&path.to_lowercase()),
         }
     }
 
@@ -626,17 +669,24 @@ impl Worker {
                 self.written.insert(name_key(path));
             }
             Place::There(_, path) => {
-                self.written_there.insert(path.clone());
+                self.written_there.insert(path.to_lowercase());
             }
         }
     }
 
-    /// Whether what is at `dst` may go for a copy of `item`, which is told if it is a folder or
-    /// this job put it there.
-    fn may_replace(&mut self, dst: &Place, item: &Item, existing: &Item) -> Flow<bool> {
+    /// Whether what is at `dst` may go for a copy of `src`, as `item`, which is told if it is a
+    /// folder, if it is the source itself by a link, or if this job put it there. Where a server
+    /// doesn't tell one file from another, a name that is there and that this job wrote in
+    /// another letter case counts as that: on a server that ignores case it is that file, and
+    /// the worst this does elsewhere is to leave a source where it was, and say so.
+    fn may_replace(&mut self, src: &Place, dst: &Place, item: &Item, existing: &Item) -> Flow<bool> {
         let shown = dst.shown();
         if existing.kind == Kind::Folder {
             self.errors.push(format!("{}: a directory with this name already exists", shown.display()));
+            return Ok(false);
+        }
+        if one_file(src, dst) {
+            self.errors.push(format!("{}: a link to its destination (or the other way round), skipped", src.shown().display()));
             return Ok(false);
         }
         if self.taken(dst) {
@@ -669,7 +719,7 @@ impl Worker {
         match item.kind {
             Kind::File => self.send_file(src, dst, item, remove),
             Kind::Folder => self.send_folder(src, dst, item, ancestors, remove),
-            Kind::Link => self.send_link(src, dst, item, ancestors, remove),
+            Kind::Link => self.send_link(src, dst, item, remove),
             Kind::Other => {
                 self.errors.push(format!("{}: not a regular file (a pipe, socket or device), skipped", shown.display()));
                 self.skip_file(0);
@@ -705,7 +755,7 @@ impl Worker {
             return Ok(false);
         }
         let Some(children) = self.attempt(&shown, |_| src.children())? else { return Ok(false) };
-        ancestors.push(self.known_as(src));
+        ancestors.push(src.shown());
         let mut complete = true;
         for name in children {
             if !dst.can_hold(&name) {
@@ -723,21 +773,14 @@ impl Worker {
         Ok(complete && (!remove || self.attempt(&shown, |_| src.remove_folder())?.is_some()))
     }
 
-    /// How a folder being sent is told from a link leading back to it.
-    fn known_as(&self, place: &Place) -> PathBuf {
-        match place {
-            Place::Here(path) => path.clone(),
-            Place::There(connection, path) => PathBuf::from(connection.sftp.realpath(path).unwrap_or_else(|_| path.clone())),
-        }
-    }
-
     /// A link is sent as a link, as `cp -a` and mc do, even a broken one. Where no link can
-    /// be made (Windows) what it leads to goes instead, as Windows' own copies do.
-    fn send_link(&mut self, src: &Place, dst: &Place, item: Item, ancestors: &mut Vec<PathBuf>, remove: bool) -> Flow<bool> {
+    /// be made (Windows) the file it leads to goes instead; a link to a folder is skipped and
+    /// said so: it may lead to the top of the disk.
+    fn send_link(&mut self, src: &Place, dst: &Place, item: Item, remove: bool) -> Flow<bool> {
         let shown = src.shown();
         self.progress.current = shown.display().to_string();
         if !dst.can_hold_links() {
-            return self.send_through_link(src, dst, ancestors, remove);
+            return self.send_through_link(src, dst, remove);
         }
         let Some(target) = self.attempt(&shown, |_| src.read_link())? else {
             self.skip_file(0);
@@ -745,7 +788,7 @@ impl Worker {
         };
         let existing = dst.look_at_itself().ok();
         if let Some(existing) = &existing
-            && !self.may_replace(dst, &item, existing)?
+            && !self.may_replace(src, dst, &item, existing)?
         {
             self.skip_file(0);
             return Ok(false);
@@ -766,8 +809,8 @@ impl Worker {
         Ok(!remove || self.attempt(&shown, |_| src.remove_file())?.is_some())
     }
 
-    /// What a link leads to goes in its place; moving, the link goes and that stays.
-    fn send_through_link(&mut self, src: &Place, dst: &Place, ancestors: &mut Vec<PathBuf>, remove: bool) -> Flow<bool> {
+    /// The file a link leads to goes in its place; moving, the link goes and that stays.
+    fn send_through_link(&mut self, src: &Place, dst: &Place, remove: bool) -> Flow<bool> {
         let shown = src.shown();
         let Some(item) = self.attempt(&shown, |_| src.follow())? else {
             self.skip_file(0);
@@ -775,11 +818,11 @@ impl Worker {
         };
         let sent = match item.kind {
             Kind::File => self.send_file(src, dst, item, false)?,
-            Kind::Folder if ancestors.contains(&self.known_as(src)) => {
-                self.errors.push(format!("{}: a link back to a folder above it, skipped", shown.display()));
+            Kind::Folder => {
+                self.errors.push(format!("{}: a link to a folder, which can't be made here, skipped", shown.display()));
+                self.skip_file(0);
                 false
             }
-            Kind::Folder => self.send_folder(src, dst, item, ancestors, false)?,
             _ => {
                 self.errors.push(format!("{}: a link to something that can't be copied, skipped", shown.display()));
                 self.skip_file(0);
@@ -794,7 +837,7 @@ impl Worker {
         self.progress.current = shown.display().to_string();
         let existing = dst.look_at_itself().ok();
         if let Some(existing) = &existing {
-            if !self.may_replace(dst, &item, existing)? {
+            if !self.may_replace(src, dst, &item, existing)? {
                 self.skip_file(item.size);
                 return Ok(false);
             }
@@ -829,8 +872,15 @@ impl Worker {
     }
 
     fn fill(&mut self, src: &Place, temp: &Place, item: &Item, existing: Option<&Item>, flush: bool) -> io::Result<()> {
+        let item = &Item { mode: mode_of_copy(item, existing, self.putting_back), ..*item };
         let mut input = Reading::open(src, item)?;
-        let mut output = Writing::create(temp, item).map_err(writing)?;
+        let mut output = match Writing::create(temp, item) {
+            Ok(output) => output,
+            Err(e) => {
+                input.close();
+                return Err(writing(e));
+            }
+        };
         let mut written = 0;
         let pumped = (|| {
             while let Some(piece) = input.next_piece()? {
@@ -878,7 +928,7 @@ impl Worker {
                 self.errors.push(format!("{}: cannot replace a file with a directory or the other way round", dst.shown().display()));
                 return Ok(false);
             }
-            if !self.may_replace(dst, &item, existing)? {
+            if !self.may_replace(src, dst, &item, existing)? {
                 return Ok(false);
             }
         }
@@ -924,11 +974,15 @@ impl Worker {
     }
 
     /// Deletes `place` and everything below it, without following links.
-    fn remove_there(&mut self, place: &Place) -> Flow<bool> {
+    fn remove_there(&mut self, place: &Place, depth: usize) -> Flow<bool> {
         self.check_cancel()?;
         let shown = place.shown();
         let Some(item) = self.attempt(&shown, |_| place.look_at_itself())? else { return Ok(false) };
         let removed = if item.kind == Kind::Folder {
+            if depth >= MAX_DEPTH {
+                self.errors.push(format!("{}: nested too deeply, skipped", shown.display()));
+                return Ok(false);
+            }
             if place.is_mounted(&self.mounts) {
                 self.errors.push(format!("{}: a file system is mounted here, skipped", shown.display()));
                 return Ok(false);
@@ -936,7 +990,7 @@ impl Worker {
             let Some(children) = self.attempt(&shown, |_| place.children())? else { return Ok(false) };
             let mut complete = true;
             for name in children {
-                complete &= self.remove_there(&place.join(&name))?;
+                complete &= self.remove_there(&place.join(&name), depth + 1)?;
             }
             complete && self.attempt(&shown, |_| place.remove_folder())?.is_some()
         } else {
@@ -1175,6 +1229,90 @@ mod tests {
         assert_eq!(fs::read_to_string(two.on_server("link/kept.txt")).unwrap(), "kept");
         assert_eq!(fs::read_to_string(real.join("kept.txt")).unwrap(), "kept", "what it leads to stays");
         assert!(fs::symlink_metadata(&link).is_err(), "the junction went");
+    }
+
+    /// A link copied or moved onto what it leads to would leave nothing: refused, unasked, as
+    /// local jobs do. The same in a folder merged. And the other way round.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_doesnt_replace_what_it_leads_to() {
+        use std::os::unix::fs::symlink;
+        let Some(two) = Two::new("remote-link-onto") else { return };
+        two.there.file("data.txt", "precious");
+        symlink("data.txt", two.on_server("link")).unwrap();
+        for (errors, _, questions) in [
+            copy(two.remote("link"), two.remote("data.txt"), Answer::Yes),
+            take(two.remote("link"), two.remote("data.txt"), Answer::Yes),
+            take(two.remote("data.txt"), two.remote("link"), Answer::Yes),
+        ] {
+            assert_eq!(questions, 0, "{errors:?}");
+            assert!(errors[0].contains("a link to its destination"), "{errors:?}");
+            assert_eq!(fs::read_to_string(two.on_server("data.txt")).unwrap(), "precious");
+            assert!(fs::symlink_metadata(two.on_server("link")).unwrap().file_type().is_symlink());
+        }
+        two.there.file("to/data.txt", "precious too");
+        two.there.dir("from");
+        symlink("../to/data.txt", two.on_server("from/data.txt")).unwrap();
+        let (errors, ..) = take(two.remote("from"), two.remote("to"), Answer::Yes);
+        assert!(errors[0].contains("a link to its destination"), "{errors:?}");
+        assert_eq!(fs::read_to_string(two.on_server("to/data.txt")).unwrap(), "precious too");
+    }
+
+    /// Into itself through a link: the text of the paths doesn't show it, the server does.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_isnt_copied_into_itself_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let Some(two) = Two::new("remote-into-itself") else { return };
+        two.there.file("real/tree/a.txt", "a");
+        symlink("real/tree", two.on_server("alias")).unwrap();
+        let source = two.remote("real/tree");
+        let error = plan(std::slice::from_ref(&source), &two.remote("alias/sub"), false).unwrap_err();
+        assert!(error.contains("inside itself"), "{error}");
+        // A link to it doesn't go in there either, as locally.
+        assert!(plan(&[two.remote("alias")], &two.remote("real/tree/copy"), false).unwrap_err().contains("inside itself"));
+    }
+
+    /// A name this job wrote comes back in another letter case: on a server ignoring case that
+    /// is the same file, and a move's source has gone. Nothing may go unnoticed, on any disk.
+    #[cfg(unix)]
+    #[test]
+    fn two_names_landing_on_one_lose_nothing() {
+        let here = TempDir::new("remote-case-here");
+        let there = TempDir::in_target("remote-case-there");
+        let Some(connection) = local_connection(there.path()) else { return };
+        here.file("tree/Makefile", "capital");
+        here.file("tree/makefile", "small");
+        let to = Place::There(connection.clone(), ssh::join(&connection.home, "tree"));
+        let (errors, ..) = take(Place::Here(here.path().join("tree")), to, Answer::All);
+        let arrived = tree(&there.path().join("tree"));
+        let left = tree(&here.path().join("tree"));
+        assert_eq!(arrived.len() + left.len(), 2, "arrived {arrived:?}, left {left:?}, {errors:?}");
+        assert_eq!(errors.is_empty(), left.is_empty(), "{errors:?}");
+    }
+
+    /// What a copy's permissions are.
+    #[test]
+    fn modes_of_copies() {
+        let file = |mode: Option<u32>| Item { kind: Kind::File, size: 0, modified: None, mode, owner: None };
+        let link = Item { kind: Kind::Link, ..file(Some(0o777)) };
+        assert_eq!(mode_of_copy(&file(Some(0o640)), Some(&file(Some(0o600))), false), Some(0o640), "the original's");
+        assert_eq!(mode_of_copy(&file(None), Some(&file(Some(0o600))), false), Some(0o600), "from Windows");
+        assert_eq!(mode_of_copy(&file(None), None, false), None);
+        assert_eq!(mode_of_copy(&file(None), Some(&link), false), None, "a link's mean nothing");
+        assert_eq!(mode_of_copy(&file(Some(0o644)), Some(&file(Some(0o664))), true), Some(0o664), "put back after editing");
+        assert_eq!(mode_of_copy(&file(Some(0o644)), None, true), Some(0o644));
+    }
+
+    /// A folder with no bottom: the delete gives up, and says so.
+    #[test]
+    fn a_folder_without_a_bottom_ends() {
+        let connection = scripted_connection(server_listing(&["inner"]));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut worker = Worker::new(tx, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let place = Place::There(connection, "/box".to_string());
+        let _ = worker.remove_there(&place, MAX_DEPTH);
+        assert!(worker.errors[0].contains("nested too deeply"), "{:?}", worker.errors);
     }
 
     /// A folder that refuses new files: the move keeps its source, and says why.

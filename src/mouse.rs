@@ -103,7 +103,7 @@ impl App {
             self.on_find_mouse(event.kind, pos);
             return;
         }
-        if self.job.is_some() {
+        if self.job.is_some() || self.connecting.is_some() {
             return;
         }
         self.quicksearch = None;

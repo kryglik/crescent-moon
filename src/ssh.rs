@@ -39,6 +39,8 @@ impl Target {
     pub fn place(&self, path: &str) -> String {
         match self.port {
             Some(port) => format!("ssh://{self}:{port}{path}"),
+            // `d:` would be a drive.
+            None if self.host.len() < 2 => format!("ssh://{self}{path}"),
             None => format!("{self}:{path}"),
         }
     }
@@ -91,8 +93,15 @@ pub fn parse_exact(text: &str) -> Option<(Target, String)> {
         let target = Target { port, ..Target::from_text(who)? };
         return Some((target, path.to_string()));
     }
-    // After a closing bracket, or the first one: an address in brackets holds colons itself.
-    let colon = text.find(']').map_or(Some(0), |at| Some(at + 1)).and_then(|from| text[from..].find(':').map(|at| from + at))?;
+    // An address in brackets holds colons itself. (A bracket after the colon is in the path.)
+    let first = text.find(':')?;
+    let colon = match text[..first].find('[') {
+        Some(_) => {
+            let close = text.find(']')?;
+            close + 1 + text[close + 1..].find(':')?
+        }
+        None => first,
+    };
     let (who, path) = (&text[..colon], &text[colon + 1..]);
     let host_length = who.rsplit('@').next().map_or(0, str::len);
     if host_length < 2 {
@@ -332,15 +341,67 @@ fn start_ssh(target: &Target, login: Login, fast: bool) -> io::Result<(Child, Bo
 fn ssh_command(target: &Target, login: Login) -> Command {
     let mut command = Command::new(ssh_program());
     command.args(ssh_arguments(target, login));
-    // Behind the panels it stays off the console rmc draws on and reads keys from.
+    // Ctrl+C in a viewer rmc runs is for the viewer; it mustn't end every connection too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        // Stopped at a prompt, it would keep the terminal with nobody to take it back.
+        if login == Login::AtTheTerminal {
+            // SAFETY: only changes a signal's handling, between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+    }
+    // Behind the panels it stays off the console rmc draws on and reads keys from; at the
+    // terminal it has to be on it, in a group of its own (Ctrl+C reaches it as a key there).
     #[cfg(windows)]
-    if login == Login::Quiet {
+    {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(if login == Login::Quiet { CREATE_NO_WINDOW } else { CREATE_NEW_PROCESS_GROUP });
     }
     command
 }
+
+/// While `ssh` asks at the terminal the terminal is its: as a process group of its own it
+/// couldn't read from it otherwise, and Ctrl+C is then for it alone.
+#[cfg(unix)]
+struct TerminalLent(libc::pid_t);
+
+#[cfg(unix)]
+impl TerminalLent {
+    fn to(child: &Child) -> TerminalLent {
+        let group = child.id() as libc::pid_t;
+        // SAFETY: plain calls on the terminal and on `ssh`'s group, which it was started in.
+        unsafe {
+            let ours = libc::getpgrp();
+            libc::tcsetpgrp(libc::STDIN_FILENO, group);
+            // It may have tried to read already, which stopped it.
+            libc::kill(-group, libc::SIGCONT);
+            TerminalLent(ours)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalLent {
+    fn drop(&mut self) {
+        // SAFETY: as above. From the background this would stop rmc, unless ignored.
+        unsafe {
+            let before = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(libc::STDIN_FILENO, self.0);
+            libc::signal(libc::SIGTTOU, before);
+        }
+    }
+}
+
+const KEY_CHANGED: &str = "HOST IDENTIFICATION HAS CHANGED";
 
 /// How an attempt to connect ended, for `Connection::open`.
 enum Refused {
@@ -354,7 +415,7 @@ enum Refused {
 /// A changed host key isn't one of those: `ssh` refuses that at the terminal too.
 fn needs_the_user(said: &str) -> bool {
     let wanted = ["Permission denied", "Host key verification failed", "passphrase", "No more authentication methods", "Too many authentication failures"];
-    wanted.iter().any(|word| said.contains(word)) && !said.contains("HOST IDENTIFICATION HAS CHANGED")
+    wanted.iter().any(|word| said.contains(word)) && !said.contains(KEY_CHANGED)
 }
 
 impl Connection {
@@ -371,6 +432,8 @@ impl Connection {
                 io::ErrorKind::NotFound => Refused::Said("The ssh program was not found. rmc connects through it.".into()),
                 _ => Refused::Said(format!("Cannot run ssh:\n{e}")),
             })?;
+            #[cfg(unix)]
+            let _lent = (login == Login::AtTheTerminal).then(|| TerminalLent::to(&child));
             if let Some(started) = started.take() {
                 started();
             }
@@ -420,7 +483,13 @@ impl Connection {
                 // The banner, and notes that a host was added, aren't what went wrong.
                 let lines: Vec<&str> = said.iter().map(String::as_str).filter(|line| !line.starts_with("Warning:") && !line.starts_with("**")).collect();
                 let last = &lines[lines.len().saturating_sub(4)..];
-                Err(if last.is_empty() { Refused::Silent(e.to_string()) } else { Refused::Said(last.join("\n")) })
+                // Far above the end of what it says, and what `needs_the_user` goes by.
+                let changed = lines.iter().find(|line| line.contains(KEY_CHANGED));
+                Err(match changed {
+                    Some(line) => Refused::Said(format!("{}\n{}", line.trim_matches(['@', ' ']), last.join("\n"))),
+                    None if last.is_empty() => Refused::Silent(e.to_string()),
+                    None => Refused::Said(last.join("\n")),
+                })
             }
         }
     }
@@ -484,6 +553,11 @@ pub mod tests {
         Some(connection)
     }
 
+    /// A connection ends with its test: the pool would hold on to it.
+    pub fn forget(connection: &Arc<Connection>) {
+        lock(&POOL).retain(|kept| !Arc::ptr_eq(kept, connection));
+    }
+
     /// A connection to a scripted server.
     pub fn scripted_connection(sftp: Arc<Sftp>) -> Arc<Connection> {
         let target = Target { user: None, host: "scripted".to_string(), port: None };
@@ -516,6 +590,10 @@ pub mod tests {
         assert_eq!(parsed("ssh://[fe80::1]:2222/x"), Some((target(None, "[fe80::1]", Some(2222)), "/x".into())));
         assert_eq!(parsed("ssh://[fe80::1]/x"), Some((target(None, "[fe80::1]", None), "/x".into())));
 
+        // A bracket in a path is a bracket in a path.
+        assert_eq!(parsed("nas:/x/report[1].pdf"), Some((target(None, "nas", None), "/x/report[1].pdf".into())));
+        assert_eq!(parsed("me@nas:[site]/a:b"), Some((target(Some("me"), "nas", None), "[site]/a:b".into())));
+
         // Places on this computer.
         for local in [r"C:\Users\me", "c:", "e:foo", "/home/me", "./a:b", "sub/a:b", r"\\server\share", "plain", "a b:c", "ssh://", "ssh://me:secret@nas/x"] {
             assert_eq!(parsed(local), None, "{local}");
@@ -527,8 +605,9 @@ pub mod tests {
 
         assert_eq!(target(Some("me"), "nas", None).place("/srv"), "me@nas:/srv");
         assert_eq!(target(None, "nas", Some(2222)).place("/srv"), "ssh://nas:2222/srv");
+        assert_eq!(target(None, "d", None).place("/srv"), "ssh://d/srv", "d: is a drive");
         // What a place says reads back as the same place.
-        for place in ["me@nas:/srv", "ssh://nas:2222/srv", "[fe80::1]:/x"] {
+        for place in ["me@nas:/srv", "ssh://nas:2222/srv", "[fe80::1]:/x", "nas:/a[1]/b", "ssh://d/srv"] {
             let (target, path) = parse(place).unwrap();
             assert_eq!(target.place(&path), place);
         }
@@ -597,6 +676,7 @@ pub mod tests {
         assert!(!needs_the_user("ssh: Could not resolve hostname nowhere: Name or service not known"));
         assert!(!needs_the_user("connect to host nas port 22: Connection refused"));
         assert!(!needs_the_user("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed."));
+        assert_eq!(parse_connect("d").map(|(target, _)| target.place("")), Ok("ssh://d".to_string()));
     }
 
     #[test]

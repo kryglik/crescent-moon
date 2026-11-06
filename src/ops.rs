@@ -310,8 +310,11 @@ struct Worker {
     targets: Vec<PathBuf>,
     /// The names this job has put in place (see `name_key`).
     written: std::collections::HashSet<u64>,
-    /// The same on another computer, where they are simply the paths.
+    /// The same on another computer, in lower case: nothing there tells one file from another
+    /// (see `remote`).
     written_there: std::collections::HashSet<String>,
+    /// The job puts an edited file back in the place it came from, and it stays what that was.
+    putting_back: bool,
 }
 
 impl Worker {
@@ -337,6 +340,7 @@ impl Worker {
             targets: Vec::new(),
             written: std::collections::HashSet::new(),
             written_there: std::collections::HashSet::new(),
+            putting_back: false,
         }
     }
 
@@ -411,6 +415,7 @@ impl Worker {
             Job::Pack { sources, dest } => self.pack(&sources, &dest)?,
             Job::Transfer { pairs, moving, replace } => {
                 self.overwrite_all = replace.then_some(true);
+                self.putting_back = replace;
                 self.transfer(&pairs, moving)?;
             }
             Job::DeleteThere { connection, paths } => self.delete_there(&connection, &paths)?,

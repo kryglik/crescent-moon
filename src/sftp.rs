@@ -66,6 +66,8 @@ const LINK: u32 = 0o120000;
 /// The size of a piece of a file, and how many may be under way: as OpenSSH's own client.
 const PIECE: usize = 32 * 1024;
 const WINDOW: usize = 64;
+/// The most names of a folder rmc takes: a server may go on listing for ever.
+const MOST_NAMES: usize = 2_000_000;
 /// What the first answer tells a server from a program printing text: OpenSSH's own limit is a
 /// quarter of this, and text reads as a length far beyond it.
 const LONGEST_PACKET: usize = 1 << 20;
@@ -497,6 +499,44 @@ impl Sftp {
         self.call(LSTAT, Body::default().text(path))?.attrs()
     }
 
+    /// What each of `paths` is, following links, with many requests under way: one at a time,
+    /// a folder of links takes as many times there and back.
+    pub fn stat_all(&self, paths: &[String]) -> Vec<io::Result<Attrs>> {
+        let (tx, rx) = mpsc::channel();
+        let mut found: Vec<Option<io::Result<Attrs>>> = paths.iter().map(|_| None).collect();
+        let mut asked: HashMap<u32, usize> = HashMap::new();
+        let mut next = 0;
+        let failure = loop {
+            let mut packets = Vec::new();
+            while next < paths.len() && asked.len() < WINDOW {
+                match self.queue(STAT, &Body::default().text(&paths[next]).0, tx.clone(), &mut packets) {
+                    Ok(id) => asked.insert(id, next),
+                    // `self.gone` below says why.
+                    Err(_) => break,
+                };
+                next += 1;
+            }
+            if let Err(e) = self.send_queued(&packets) {
+                break e;
+            }
+            if asked.is_empty() {
+                if next >= paths.len() {
+                    return found.into_iter().map(|one| one.unwrap_or_else(|| Err(self.gone()))).collect();
+                }
+                break self.gone();
+            }
+            match self.wait(&rx) {
+                Ok(reply) => {
+                    if let Some(at) = asked.remove(&reply.id) {
+                        found[at] = Some(reply.attrs());
+                    }
+                }
+                Err(e) => break e,
+            }
+        };
+        found.into_iter().map(|one| one.unwrap_or_else(|| Err(io::Error::new(failure.kind(), failure.to_string())))).collect()
+    }
+
     pub fn fstat(&self, handle: &Handle) -> io::Result<Attrs> {
         self.call(FSTAT, Body::default().bytes(&handle.0))?.attrs()
     }
@@ -519,8 +559,16 @@ impl Sftp {
     }
 
     fn read_names(&self, handle: &Handle) -> io::Result<Vec<Name>> {
+        // Each answer may come in time, and the list still never end.
+        let deadline = PATIENCE.get().map(|limit| Instant::now() + limit * 6);
         let mut names = Vec::new();
         loop {
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "the server doesn't finish listing this folder"));
+            }
+            if names.len() > MOST_NAMES {
+                return Err(io::Error::other("the server lists more names than rmc takes in one folder"));
+            }
             let reply = self.call(READDIR, Body::default().bytes(&handle.0))?;
             if reply.is_eof() {
                 return Ok(names);
@@ -952,6 +1000,50 @@ pub mod tests {
                 _ => status(STATUS_FAILURE),
             }]
         })
+    }
+
+    /// `stat_all` gives each path its own answer, in the order asked, for more than a window's
+    /// worth of paths.
+    #[test]
+    fn many_stats_at_once() {
+        let tmp = TempDir::new("sftp-stats");
+        let count = WINDOW * 2 + 3;
+        for i in (0..count).step_by(2) {
+            tmp.file(&format!("{i}.txt"), &"x".repeat(i));
+        }
+        let Some((mut child, sftp)) = server(tmp.path()) else { return };
+        let home = sftp.realpath(".").unwrap();
+        let paths: Vec<String> = (0..count).map(|i| format!("{home}/{i}.txt")).collect();
+        let found = sftp.stat_all(&paths);
+        assert_eq!(found.len(), count);
+        for (i, one) in found.iter().enumerate() {
+            match one {
+                Ok(attrs) => assert_eq!((i % 2, attrs.size), (0, Some(i as u64))),
+                Err(e) => assert_eq!((i % 2, e.kind()), (1, io::ErrorKind::NotFound)),
+            }
+        }
+        assert!(sftp.stat_all(&[]).is_empty());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A server that keeps listing doesn't hold the screen, whose every request is answered.
+    #[test]
+    fn a_listing_that_never_ends_is_given_up() {
+        let sftp = scripted(move |kind, id, _| {
+            let list = Body::default().u32(1).text("again").text("").attrs(&Attrs::default());
+            vec![match kind {
+                OPENDIR => answer(HANDLE, id, Body::default().bytes(b"h")),
+                READDIR => answer(NAME, id, list),
+                _ => answer(STATUS, id, Body::default().u32(STATUS_OK).text("").text("")),
+            }]
+        });
+        let finished = thread::spawn(move || {
+            be_impatient(Duration::from_millis(50));
+            sftp.read_dir("/").map(|names| names.len())
+        });
+        let error = finished.join().unwrap().expect_err("it never ends");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
     }
 
     /// Pipes that do what a test says: `script` answers each request by hand, so a server's

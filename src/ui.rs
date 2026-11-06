@@ -774,7 +774,7 @@ fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool, ignored: bo
 
 fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
     let t = &app.scheme;
-    let cwd = app.active_panel().cwd.display().to_string();
+    let cwd = app.active_panel().place().display().to_string();
     let prompt = format!("{}>", util::fit_left(&cwd, (area.width as usize / 3).max(10)));
     let prompt_w = util::width(&prompt) + 1;
     let room = (area.width as usize).saturating_sub(prompt_w + 1);

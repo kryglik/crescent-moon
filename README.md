@@ -197,17 +197,21 @@ Connections stay open until rmc ends. The server has to offer SFTP, as OpenSSH d
 - **F5 / F6** work between a panel here and a panel there, between two computers, and within one.
   The field takes an address too, so a local panel can copy straight to `host:/path/`. In a
   panel on another computer a name counts from the folder there, and a whole path (`C:\x`, `/x`)
-  is one on this computer.
+  is one on this computer, as the field starts on the other panel. Shift+F5 and Shift+F6 stay on
+  the panel's computer, unless a drive is named.
 - It is as careful as a local copy: a file is written under a temporary name and replaces its
   target in one step, a move deletes the source only once the copy is complete and its size is
   checked, and nothing is replaced without asking. Times and permissions go along. A move
   within one computer is a rename.
 - **F3** brings a copy here for the viewer. **F4** brings one for the editor, and if you saved
-  it, it goes back when the editor closes. If the file changed over there meanwhile, rmc asks,
-  and keeps yours in `rescued` beside the settings whichever way you answer. Enter opens a copy
-  in its app (read-only), and a zip as a folder.
-- **F8** deletes for good, as there is no trash over SSH; the question says so, and Enter answers No.
-  Links are never followed, and what is mounted in a folder is left alone.
+  it, it goes back when the editor closes, keeping the permissions the file had. On a link
+  both go to what it leads to, and the link stays. If the file changed over there meanwhile,
+  rmc asks, and keeps yours in `rescued` beside the settings whichever way you answer. An editor
+  that goes on by itself (gvim, code) can't be followed: what it saves stays here until rmc ends,
+  and rmc says so. Enter opens a copy in its app (read-only), and a zip as a folder.
+- **F8** deletes for good, as there is no trash over SSH; the question says so, and Enter answers
+  No. Links are never followed. What is mounted in a folder is left alone as far as a server
+  shows it: another disk is seen, a bind mount of the same disk isn't.
 - **F2, F7** and Shift+F5 / Shift+F6 work there too, and sorting, filters, marks, quick search
   and Shift+F2's comparison, which goes by what the panels show.
 - What needs this computer says so: a command typed on the command line isn't run for a panel
@@ -216,10 +220,17 @@ Connections stay open until rmc ends. The server has to offer SFTP, as OpenSSH d
 - `..` at the top of the other computer, or a drive from the picker, comes back to this one. If
   the connection is lost, the panel comes back and says so; a job stops at once and keeps its
   sources. Ctrl+R reads the folder again: what others change there doesn't show by itself.
-- Links on another computer are copied as links, except to Windows, where what they lead to
-  goes instead (Windows lets only administrators make links). A name that can't exist here
-  (`a:b` on Windows) is skipped and reported. In the field, a name holding a colon that
-  isn't there yet is read as an address, as in scp: `./a:b` is a name.
+- Links on another computer are copied as links, except to Windows (where only administrators
+  may make them): a link to a file brings the file, and a link to a folder is skipped and
+  reported, as it may lead to the top of the disk. A name that can't exist here (`a:b` on
+  Windows) is skipped and reported, and so is a name that isn't UTF-8 going over SFTP. In the
+  field, a name holding a colon that isn't there yet is read as an address, as in scp: `./a:b`
+  is a name.
+- A replaced file is a new file with the old one's permissions. As in a local copy, it belongs to
+  you unless you are root, and hard links to the old one stay with the old contents.
+- A folder reached both over SSH and through a share mounted here is two folders to rmc. A file
+  moved onto itself that way is noticed and left in place; a whole folder moved into itself goes
+  down to the depth limit and says so, with nothing lost.
 
 ### Git
 

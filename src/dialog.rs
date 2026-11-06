@@ -76,6 +76,17 @@ impl Recall {
         }
     }
 
+    /// A row forgotten: the place in the list stays on the row it was on.
+    pub fn forget(&mut self, row: &str) {
+        let Some(gone) = self.rows.iter().position(|r| r == row) else { return };
+        self.rows.remove(gone);
+        self.at = match self.at {
+            Some(at) if at == gone => None,
+            Some(at) if at > gone => Some(at - 1),
+            at => at,
+        };
+    }
+
     /// A row picked from the list: Down goes back to what the field held.
     fn picked(&mut self, edit: &mut LineEdit, row: &str) {
         if self.at.is_none() {
@@ -591,6 +602,24 @@ mod tests {
         let mut empty = Recall::default();
         empty.older(&mut edit);
         assert_eq!(edit.text(), "new");
+    }
+
+    /// Rows forgotten under the place in the list don't leave it pointing past the end.
+    #[test]
+    fn forgetting_rows_while_going_through_them() {
+        let rows: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let mut recall = Recall::new(&rows);
+        let mut edit = LineEdit::new("typing");
+        recall.older(&mut edit);
+        assert_eq!(edit.text(), "c");
+        recall.forget("a");
+        recall.forget("c");
+        recall.older(&mut edit);
+        assert_eq!(edit.text(), "b");
+        recall.forget("b");
+        recall.older(&mut edit);
+        recall.newer(&mut edit);
+        assert_eq!(recall.rows.len(), 0);
     }
 
     #[test]

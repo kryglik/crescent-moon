@@ -379,6 +379,9 @@ impl Panel {
             while let Some(view) = self.remote.as_mut() {
                 let Some(parent) = ssh::parent(&view.dir) else { break };
                 view.dir = parent;
+                // Marks are by name, and these names mean something else here.
+                self.marked.clear();
+                self.dir_sizes.clear();
                 if self.load().is_ok() {
                     return;
                 }
@@ -386,6 +389,8 @@ impl Panel {
         }
         self.remote = None;
         self.archive = None;
+        self.marked.clear();
+        self.dir_sizes.clear();
         self.lost = Some(format!("The connection to {target} is gone."));
         self.reload();
     }
@@ -819,15 +824,18 @@ fn archive_entries(view: &ArchiveView, filter: Option<&NameFilter>) -> Vec<Entry
 /// The entries of a folder on another computer. A link shows what it points to, as here.
 fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {
     let sftp = &view.connection.sftp;
+    let mut items = sftp.read_dir(&view.dir)?;
+    items.retain(|item| show_hidden || !item.name.starts_with('.'));
+    // What the links lead to, all at once: one by one, a folder of them takes seconds.
+    let links: Vec<usize> = (0..items.len()).filter(|&i| items[i].attrs.is_link()).collect();
+    let paths: Vec<String> = links.iter().map(|&i| ssh::join(&view.dir, &items[i].name)).collect();
+    let led_to: HashMap<usize, _> = links.into_iter().zip(sftp.stat_all(&paths)).collect();
     let mut out = Vec::new();
-    for item in sftp.read_dir(&view.dir)? {
+    for (i, item) in items.into_iter().enumerate() {
         let is_hidden = item.name.starts_with('.');
-        if !show_hidden && is_hidden {
-            continue;
-        }
         let path = ssh::join(&view.dir, &item.name);
         let is_link = item.attrs.is_link();
-        let attrs = if is_link { sftp.stat(&path).unwrap_or(item.attrs) } else { item.attrs };
+        let attrs = led_to.get(&i).and_then(|attrs| attrs.as_ref().ok()).copied().unwrap_or(item.attrs);
         let is_dir = attrs.is_dir();
         if !is_dir && filter.is_some_and(|f| !f.matches(&item.name)) {
             continue;

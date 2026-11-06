@@ -446,6 +446,7 @@ fn held_open(dice: &mut Dice, trees: [&Path; 2]) -> Vec<fs::File> {
 /// What a round did, for the counts at the end.
 #[derive(Default)]
 struct Counts {
+    rounds: usize,
     /// What errors said, without the paths.
     errors: BTreeMap<String, usize>,
     jobs: usize,
@@ -611,6 +612,7 @@ fn round_over_ssh(seed: u64, counts: &mut Counts) {
     let dice = &mut Dice::new(seed);
     let near = TempDir::new("random-ssh");
     let Some(connection) = ssh::tests::local_connection(near.path()) else { return };
+    counts.rounds += 1;
     let src = near.dir("src");
     let dst = near.dir("dst");
     let outside = near.dir("outside");
@@ -708,6 +710,7 @@ fn round_over_ssh(seed: u64, counts: &mut Counts) {
             panic!("seed {seed}: delete of {keys:#?}\nalso took {gone:#?}\nleft {stayed:#?}");
         }
     }
+    ssh::tests::forget(&connection);
 }
 
 fn number(name: &str, default: u64) -> u64 {
@@ -737,8 +740,10 @@ fn random_trees_lose_nothing_over_ssh() {
         round_over_ssh(seed, &mut counts);
     }
     println!(
-        "{rounds} rounds over ssh: {} jobs, {} questions, {} with errors, {} cancelled, {} refused by the plan",
-        counts.jobs, counts.questions, counts.with_errors, counts.cancelled, counts.refused
+        "{} of {rounds} rounds over ssh: {} jobs, {} questions, {} with errors, {} cancelled, {} refused by the plan",
+        counts.rounds, counts.jobs, counts.questions, counts.with_errors, counts.cancelled, counts.refused
     );
     println!("{:#?}", counts.errors);
+    // Without a server program nothing runs; with one, none may be skipped.
+    assert!(counts.rounds == 0 || counts.rounds == rounds as usize);
 }
