@@ -50,6 +50,22 @@ pub enum Job {
 }
 
 impl Job {
+    /// What the job moves away or deletes on this computer.
+    pub fn takes_away(&self) -> Vec<&Path> {
+        match self {
+            Job::Move(pairs) => pairs.iter().map(|(from, _)| from.as_path()).collect(),
+            Job::Delete { paths, .. } => paths.iter().map(PathBuf::as_path).collect(),
+            Job::Transfer { pairs, moving: true, .. } => pairs
+                .iter()
+                .filter_map(|(from, _)| match from {
+                    Place::Here(path) => Some(path.as_path()),
+                    Place::There(..) => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn title(&self) -> &'static str {
         match self {
             Job::Copy(_) | Job::Transfer { moving: false, .. } => "Copy",

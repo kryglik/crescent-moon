@@ -592,9 +592,11 @@ impl App {
             .collect();
         let quiet = self.shell_shown || job_running;
         let arrived = self.git.tick(&shown, Instant::now(), quiet);
-        for panel in &mut self.panels {
-            if let Some(repo) = panel.repo.as_mut().filter(|repo| arrived.contains(&repo.root)) {
-                repo.reload();
+        for fresh in &arrived {
+            for panel in &mut self.panels {
+                if let (Some(repo), Some(now)) = (panel.repo.as_mut().filter(|repo| repo.root == fresh.root), &fresh.repo) {
+                    *repo = now.clone();
+                }
             }
         }
         !arrived.is_empty()
@@ -1001,7 +1003,8 @@ impl App {
                         None
                     }
                     ButtonOutcome::Pressed(2) => {
-                        self.prepare_for_job();
+                        let going: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+                        self.prepare_for_job(&going);
                         self.job = Some(admin::start(paths, Vec::new()));
                         None
                     }
@@ -1942,17 +1945,21 @@ impl App {
     }
 
     fn start_job(&mut self, job: Job) {
-        self.prepare_for_job();
+        self.prepare_for_job(&job.takes_away());
         self.job = Some(ops::start(job));
     }
 
     /// Before any job: it works for the active panel. An open watch keeps Windows from moving
-    /// a folder above it (the other panel inside what is moved). A job reloads the panels at
-    /// its end, so none is needed until then.
-    fn prepare_for_job(&mut self) {
+    /// a folder above it (the other panel inside what is moved), and so does a listing under
+    /// way in what goes (`going`). A job reloads the panels at its end, so none is needed
+    /// until then.
+    fn prepare_for_job(&mut self, going: &[&Path]) {
         self.job_side = self.active;
         self.watches = [None, None];
         self.git.close_watches();
+        for panel in self.panels.iter_mut().chain(self.tabs.iter_mut().flatten()) {
+            panel.let_go_of(going);
+        }
     }
 
     /// Picks up directory sizes, drive space, the end of the shell, and the progress, questions
@@ -2029,7 +2036,12 @@ impl App {
             changed |= panel.poll();
         }
         for side in 0..2 {
-            self.settle(side);
+            // Bad news that comes by itself doesn't take the keys of someone typing: a box
+            // would swallow them, and Enter under it would run what is left of the line.
+            let bad_news = matches!(self.panels[side].came, Some(Came::Failed(_) | Came::NoFurther { .. }));
+            if !bad_news || !self.is_typing() {
+                self.settle(side);
+            }
         }
         while !self.active_panel().is_going() && self.external.is_none() && !self.quit {
             let Some(key) = self.typed_ahead.pop_front() else { break };
@@ -2043,13 +2055,14 @@ impl App {
         changed
     }
 
+    /// Whether the keys are going somewhere a box shouldn't come between: a question, a field,
+    /// the command line, a search.
+    fn is_typing(&self) -> bool {
+        self.dialog.is_some() || self.job.is_some() || self.find_shown || self.quicksearch.is_some() || !self.cmdline.is_empty()
+    }
+
     /// How going somewhere ended, once it has.
     fn settle(&mut self, side: usize) {
-        let failed = matches!(self.panels[side].came, Some(Came::Failed(_) | Came::NoFurther { .. }));
-        // Not over a question or a field being typed in: it comes when that one is done.
-        if failed && (self.dialog.is_some() || self.job.is_some()) {
-            return;
-        }
         match self.panels[side].came.take() {
             Some(Came::There) => self.visited(side),
             Some(Came::Zip) => self.notice = self.panels[side].archive.as_ref().and_then(|view| view.archive.left_out_note()),
@@ -2057,6 +2070,7 @@ impl App {
                 self.typed_ahead.clear();
                 self.error(why);
             }
+            Some(Came::Stayed) => self.typed_ahead.clear(),
             Some(Came::NoFurther { back }) => {
                 self.typed_ahead.clear();
                 self.notice = Some(if back { "No folder to go back to" } else { "No folder to go forward to" }.into());

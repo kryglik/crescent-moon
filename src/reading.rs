@@ -73,6 +73,9 @@ pub struct Asked {
     pub spots: Vec<Spot>,
     /// With none of them readable, the nearest place that is (see `refuge`).
     pub refuge: bool,
+    /// Only a folder that isn't there gives way to the next spot. One that is, and can't be
+    /// read, is worth saying.
+    pub past_gone_only: bool,
     pub show_hidden: bool,
     pub filter: Option<String>,
     pub sort: SortBy,
@@ -100,6 +103,8 @@ pub struct Refused {
     pub error: io::Error,
     /// Which of the spots it stopped at.
     pub tried: usize,
+    /// It stopped for a reason worth saying, not for having run out of places.
+    pub gave_up: bool,
 }
 
 impl Refused {
@@ -131,7 +136,7 @@ pub struct Reading {
     pub place: PathBuf,
     pub started: Instant,
     answer: Receiver<Answer>,
-    _stop: Stop,
+    stop: Stop,
     /// The seconds on the panel (see `Panel::poll`).
     said: Option<u64>,
 }
@@ -160,7 +165,7 @@ impl Reading {
             // Nobody takes it if the panel has moved on.
             let _ = tx.send(read(&asked, &stopping));
         });
-        Reading { purpose, place, started: Instant::now(), answer, _stop: Stop(stop), said: None }
+        Reading { purpose, place, started: Instant::now(), answer, stop: Stop(stop), said: None }
     }
 
     /// The answer, if it comes within a moment.
@@ -181,8 +186,14 @@ impl Reading {
         }
     }
 
+    /// Over, and a moment for the thread to let go of the folder.
+    pub fn stop_and_wait(self) {
+        self.stop.0.store(true, Ordering::Relaxed);
+        let _ = self.answer.recv_timeout(a_moment());
+    }
+
     fn ended_without_a_word(&self) -> Refused {
-        Refused { place: self.place.clone(), error: io::Error::other("the reading ended without a word"), tried: 0 }
+        Refused { place: self.place.clone(), error: io::Error::other("the reading ended without a word"), tried: 0, gave_up: true }
     }
 
     /// Whether the wait has gone on long enough to be said.
@@ -215,8 +226,8 @@ fn read(asked: &Asked, stop: &AtomicBool) -> Answer {
         match list(spot, asked, stop) {
             Ok(listing) => return Ok(Listing { tried, ..listing }),
             Err(error) => {
-                let over = no_use_going_on(spot, &error);
-                refused = Some(Refused { place: spot.place(), error, tried });
+                let over = no_use_going_on(spot, &error) || (asked.past_gone_only && is_there(spot));
+                refused = Some(Refused { place: spot.place(), error, tried, gave_up: over });
                 if over {
                     break;
                 }
@@ -235,7 +246,15 @@ fn read(asked: &Asked, stop: &AtomicBool) -> Answer {
             }
         }
     }
-    Err(refused.unwrap_or_else(|| Refused { place: PathBuf::new(), error: io::Error::other("nowhere to read"), tried: 0 }))
+    Err(refused.unwrap_or_else(|| Refused { place: PathBuf::new(), error: io::Error::other("nowhere to read"), tried: 0, gave_up: true }))
+}
+
+/// Whether a spot that couldn't be read exists all the same.
+fn is_there(spot: &Spot) -> bool {
+    match spot {
+        Spot::Here(dir) => crate::lfs::is_dir(dir),
+        _ => true,
+    }
 }
 
 /// A server that doesn't answer, or a connection that has gone, won't do better for the folder
@@ -885,6 +904,201 @@ pub mod tests {
         assert_eq!(app.panels[0].remote.as_ref().map(|view| view.dir.ends_with("slow")), Some(true));
         assert_eq!(names(&app), ["..", "inside.txt"]);
         crate::ssh::tests::forget(&connection);
+    }
+
+    /// Keys typed for a folder that quietly can't be read aren't for the folder left.
+    #[test]
+    fn keys_typed_for_a_folder_that_quietly_fails_go() {
+        let tmp = TempDir::new("reading-quiet-keys");
+        tmp.file("a.txt", "x");
+        tmp.file("b.txt", "x");
+        let missing = tmp.path().join("missing");
+        let (mut app, _other) = app_in(tmp.path());
+        select(&mut app, "a.txt");
+        let held = hold(&missing);
+        app.panels[0].go_to_first(std::slice::from_ref(&missing), true);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(8));
+        drop(held);
+        settle(&mut app);
+        assert_eq!(here(&app), tmp.path());
+        assert_eq!(on(&app), "a.txt");
+        assert!(app.dialog.is_none(), "F8 would have asked about a file in the folder left");
+    }
+
+    /// A job ended on the other panel, and Esc stops the wait: what the job did still shows.
+    #[test]
+    fn esc_keeps_the_look_that_was_owed() {
+        let tmp = TempDir::new("reading-esc-owed");
+        let slow = tmp.dir("slow");
+        tmp.file("old.txt", "x");
+        let (mut app, _other) = app_in(tmp.path());
+        let held = hold(&slow);
+        app.panels[0].go_to_first(std::slice::from_ref(&slow), false);
+        tmp.file("new.txt", "x");
+        app.panels[0].reload();
+        press(&mut app, KeyCode::Esc);
+        drop(held);
+        settle(&mut app);
+        assert_eq!(here(&app), tmp.path());
+        assert!(names(&app).contains(&"new.txt".to_string()), "{:?}", names(&app));
+    }
+
+    /// A look under way, then a folder that can't be read: the look isn't lost with it.
+    #[test]
+    fn a_failed_go_keeps_the_look_under_way() {
+        let tmp = TempDir::new("reading-go-owed");
+        let missing = tmp.path().join("missing");
+        tmp.file("old.txt", "x");
+        let (mut app, _other) = app_in(tmp.path());
+        let held = hold(tmp.path());
+        app.panels[0].reload();
+        thread::sleep(Duration::from_millis(50));
+        tmp.file("new.txt", "x");
+        assert!(app.panels[0].is_reading());
+        app.panels[0].go_to_first(std::slice::from_ref(&missing), false);
+        drop(held);
+        settle(&mut app);
+        assert!(matches!(&app.dialog, Some(Dialog::Message { error: true, .. })));
+        assert!(names(&app).contains(&"new.txt".to_string()), "{:?}", names(&app));
+    }
+
+    /// The connection goes while the folder here is slow: until that is in, the panel stays as
+    /// it was, its place and its list together.
+    #[test]
+    fn a_lost_connection_keeps_place_and_list_together() {
+        let there = TempDir::new("reading-lost-there");
+        let home = TempDir::new("reading-lost-here");
+        there.file("over-there.txt", "x");
+        let Some(connection) = crate::ssh::tests::local_connection(there.path()) else { return };
+        let top = PathBuf::from(connection.target.place(&connection.home));
+        let mut app = App::new(home.path().to_path_buf(), home.path().to_path_buf(), config());
+        app.panels[0].go_to_first(&[top], false);
+        assert!(app.panels[0].remote.is_some());
+        wait_for_nothing();
+        crate::ssh::tests::kill(&connection);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while connection.sftp.lost().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let held = hold(home.path());
+        app.panels[0].reload();
+        // The list over there has failed, and the folder here is on its way.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.panels[0].lost.is_none() {
+            assert!(Instant::now() < deadline);
+            app.panels[0].poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.panels[0].remote.is_some());
+        assert!(names(&app).contains(&"over-there.txt".to_string()));
+        drop(held);
+        settle(&mut app);
+        crate::ssh::tests::forget(&connection);
+        assert!(app.panels[0].remote.is_none());
+        assert_eq!(app.active_panel().location(), home.path());
+        assert!(!names(&app).contains(&"over-there.txt".to_string()), "{:?}", names(&app));
+    }
+
+    /// The other panel's bad news waits for the command being typed on this one.
+    #[test]
+    fn a_late_failure_leaves_the_command_line_alone() {
+        let tmp = TempDir::new("reading-cmdline");
+        let missing = tmp.path().join("missing");
+        let (mut app, _other) = app_in(tmp.path());
+        let held = hold(&missing);
+        app.panels[1].go_to_first(std::slice::from_ref(&missing), false);
+        let typing = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                press(app, KeyCode::Char(c));
+            }
+        };
+        typing(&mut app, "tool push ");
+        drop(held);
+        settle(&mut app);
+        typing(&mut app, "--dry-run origin");
+        assert_eq!(app.cmdline.text(), "tool push --dry-run origin");
+        assert!(app.dialog.is_none());
+        press(&mut app, KeyCode::Esc);
+        app.tick();
+        assert!(matches!(&app.dialog, Some(Dialog::Message { error: true, .. })), "and comes when the line is empty");
+    }
+
+    /// A listing keeps its folder open, which on Windows keeps what is above it from moving:
+    /// a job moving that lets go of it.
+    #[test]
+    fn a_job_moving_a_folder_lets_go_of_what_is_read_below_it() {
+        let tmp = TempDir::new("reading-job");
+        let (top, deep) = (tmp.dir("top"), tmp.dir("top/deep"));
+        let elsewhere = tmp.dir("elsewhere");
+        tmp.file("top/deep/x.txt", "x");
+        let (mut app, _other) = app_in(tmp.path());
+        let held = hold(&deep);
+        app.panels[1].go_to_first(std::slice::from_ref(&deep), false);
+        assert!(app.panels[1].is_reading());
+        app.panels[1].let_go_of(&[elsewhere.as_path()]);
+        assert!(app.panels[1].is_reading(), "this job has nothing to do with it");
+        app.panels[1].let_go_of(&[top.as_path()]);
+        assert!(!app.panels[1].is_reading());
+        drop(held);
+    }
+
+    /// `git status` ending says nothing about how quick the files are: what follows it is read
+    /// where the status was, not on the screen's thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_status_arriving_doesnt_hold_the_screen() {
+        let tmp = TempDir::new("reading-git");
+        let made = std::process::Command::new("git").arg("init").arg("-q").arg(tmp.path()).status().unwrap();
+        assert!(made.success());
+        let mut settings = config();
+        settings.settings.git_status = true;
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), settings);
+        wait_for_nothing();
+        assert!(app.panels[0].repo.is_some());
+        // A file that doesn't answer for a while, as on a share gone away.
+        let merge = tmp.path().join(".git/rebase-merge");
+        fs::create_dir(&merge).unwrap();
+        let hanging = merge.join("msgnum");
+        let name = std::ffi::CString::new(hanging.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+        let answers = hanging.clone();
+        thread::spawn(move || {
+            for _ in 0..3 {
+                thread::sleep(Duration::from_millis(900));
+                let _ = fs::write(&answers, b"1");
+            }
+        });
+        let begun = Instant::now();
+        let mut longest = Duration::ZERO;
+        while begun.elapsed() < Duration::from_millis(1500) {
+            let tick = Instant::now();
+            app.tick();
+            longest = longest.max(tick.elapsed());
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(longest < Duration::from_millis(500), "one tick held the screen for {longest:?}");
+    }
+
+    /// A folder that can't be read isn't gone: Alt+Left says why it stayed.
+    #[cfg(unix)]
+    #[test]
+    fn alt_left_says_why_a_folder_cant_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("reading-back-denied");
+        let (one, two) = (tmp.dir("one"), tmp.dir("two"));
+        let (mut app, _other) = app_in(tmp.path());
+        app.panels[0].go_to_first(std::slice::from_ref(&one), false);
+        settle(&mut app);
+        app.panels[0].go_to_first(std::slice::from_ref(&two), false);
+        settle(&mut app);
+        fs::set_permissions(&one, fs::Permissions::from_mode(0o000)).unwrap();
+        press_alt(&mut app, KeyCode::Left);
+        settle(&mut app);
+        let (place, said) = (here(&app), app.dialog.is_some());
+        fs::set_permissions(&one, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!((place, said), (two.clone(), true));
     }
 
     #[test]

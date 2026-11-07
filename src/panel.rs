@@ -177,6 +177,8 @@ pub enum Came {
     Zip,
     /// It stayed where it was, and this is why.
     Failed(String),
+    /// It stayed where it was, which isn't worth a word.
+    Stayed,
     /// Alt+Left or Alt+Right with nowhere left to go.
     NoFurther { back: bool },
 }
@@ -305,7 +307,8 @@ impl Panel {
     /// Starts reading `spots` for `purpose`; whatever was being read goes.
     fn begin(&mut self, spots: Vec<Spot>, refuge: bool, purpose: Purpose) {
         let refreshing = matches!(purpose, Purpose::Refresh);
-        self.read_again = false;
+        // A look at the place that this replaces is still owed: going elsewhere may fail.
+        self.read_again |= self.reading.as_ref().is_some_and(|reading| matches!(reading.purpose, Purpose::Refresh));
         if !refreshing {
             self.cursor_to = None;
         }
@@ -314,6 +317,7 @@ impl Panel {
         let asked = Asked {
             spots,
             refuge,
+            past_gone_only: matches!(purpose, Purpose::Go { .. } | Purpose::Step { .. }),
             show_hidden: self.show_hidden,
             filter: self.filter.clone(),
             sort: self.sort,
@@ -376,7 +380,6 @@ impl Panel {
     /// nothing to stay at goes home instead.
     pub fn stop_reading(&mut self) {
         let Some(reading) = self.reading.take() else { return };
-        self.read_again = false;
         self.cursor_to = None;
         if matches!(reading.purpose, Purpose::Start) {
             let next = util::home_dir().filter(|home| *home != self.cwd).unwrap_or_else(system_root);
@@ -385,6 +388,22 @@ impl Panel {
                 self.begin(vec![Spot::Here(self.cwd.clone())], true, Purpose::Start);
                 self.wait_a_moment();
             }
+        } else if std::mem::take(&mut self.read_again) {
+            // Only the wait is over: what changed meanwhile still has to show.
+            self.look_again();
+        }
+    }
+
+    /// A job is about to move or delete `paths`. A folder being listed is open, and on Windows
+    /// that keeps anything above it from moving, as an open watch does: what is being read
+    /// below them goes. The job's end reads the panels again.
+    pub fn let_go_of(&mut self, paths: &[&Path]) {
+        let below = |reading: &Reading| paths.iter().any(|path| util::is_inside(&reading.place, path));
+        if self.reading.as_ref().is_some_and(below)
+            && let Some(reading) = self.reading.take()
+        {
+            reading.stop_and_wait();
+            self.cursor_to = None;
         }
     }
 
@@ -414,9 +433,7 @@ impl Panel {
                 self.came = Some(Came::There);
             }
             (Purpose::Go { quiet }, Err(refused)) => {
-                if !quiet {
-                    self.came = Some(Came::Failed(refused.message()));
-                }
+                self.came = Some(if quiet { Came::Stayed } else { Came::Failed(refused.message()) });
             }
             (Purpose::Step { back, depths }, Ok(listing)) => {
                 self.steps(back).truncate(depths[listing.tried]);
@@ -427,11 +444,7 @@ impl Panel {
             }
             (Purpose::Step { back, depths }, Err(refused)) => {
                 self.steps(back).truncate(depths[refused.tried]);
-                self.came = Some(if refused.error.kind() == io::ErrorKind::TimedOut {
-                    Came::Failed(refused.message())
-                } else {
-                    Came::NoFurther { back }
-                });
+                self.came = Some(if refused.gave_up { Came::Failed(refused.message()) } else { Came::NoFurther { back } });
             }
             (Purpose::OpenZip, Ok(listing)) => {
                 self.go_in(listing);
@@ -588,12 +601,10 @@ impl Panel {
             self.lost = Some(format!("{target} doesn't answer: the panel shows what it last read."));
             return;
         }
-        self.remote = None;
-        self.archive = None;
-        self.marked.clear();
-        self.dir_sizes.clear();
         self.lost = Some(format!("The connection to {target} is gone."));
-        self.reload();
+        // Place and list change together, however long the folder here takes.
+        self.begin(vec![Spot::Here(self.cwd.clone())], true, Purpose::Refresh);
+        self.wait_a_moment();
     }
 
     /// The folder under any zip on show.

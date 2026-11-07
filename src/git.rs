@@ -87,6 +87,7 @@ impl Repo {
     }
 
     /// Reads HEAD and any operation under way again (a checkout changes them).
+    #[cfg(test)]
     pub fn reload(&mut self) {
         (self.head, self.state) = head_of(&self.git_dir);
     }
@@ -469,7 +470,14 @@ fn run_status(root: &Path, ignored: bool) -> Outcome {
 /// Runs `git status` on a thread of its own, one working tree after another.
 struct Runner {
     requests: Sender<PathBuf>,
-    results: Receiver<(PathBuf, Outcome, Duration)>,
+    results: Receiver<(PathBuf, Outcome, Duration, Option<Repo>)>,
+}
+
+/// A status has arrived for the working tree at `root`; `repo` is that tree as it was read
+/// afterwards, as a status can follow a checkout.
+pub struct Arrived {
+    pub root: PathBuf,
+    pub repo: Option<Repo>,
 }
 
 impl Runner {
@@ -480,7 +488,10 @@ impl Runner {
             while let Ok(root) = wanted.recv() {
                 let start = Instant::now();
                 let outcome = status_of(&root);
-                if done.send((root, outcome, start.elapsed())).is_err() {
+                let took = start.elapsed();
+                // Here too: a share that has gone away takes its time over every file.
+                let repo = Repo::find(&root);
+                if done.send((root, outcome, took, repo)).is_err() {
                     break;
                 }
             }
@@ -656,12 +667,12 @@ impl Tracker {
 
     /// Takes the results that arrived and starts the runs that are due for `shown`, the
     /// repositories the panels show. Nothing starts while `quiet` (the shell is on screen, a
-    /// job runs). Returns the working trees (their roots) whose status arrived.
-    pub fn tick(&mut self, shown: &[&Repo], now: Instant, quiet: bool) -> Vec<PathBuf> {
+    /// job runs). Returns the working trees whose status arrived.
+    pub fn tick(&mut self, shown: &[&Repo], now: Instant, quiet: bool) -> Vec<Arrived> {
         let mut arrived = Vec::new();
         if let Some(runner) = &self.runner {
-            while let Ok((root, outcome, took)) = runner.results.try_recv() {
-                arrived.push(root.clone());
+            while let Ok((root, outcome, took, repo)) = runner.results.try_recv() {
+                arrived.push(Arrived { root: root.clone(), repo });
                 let Some(tracked) = self.repos.get_mut(&root) else { continue };
                 tracked.running = false;
                 tracked.finished = Some(now);
@@ -932,7 +943,7 @@ pub mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let arrived = tracker.tick(&[repo], Instant::now(), false);
-            if arrived.contains(&repo.root)
+            if arrived.iter().any(|fresh| fresh.root == repo.root)
                 && let Some(status) = tracker.status(&repo.root)
             {
                 return status.clone();
