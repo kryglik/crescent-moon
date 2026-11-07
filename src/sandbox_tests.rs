@@ -108,7 +108,7 @@ fn junction(link: &Path, target: &Path) {
 }
 
 /// A link to a folder: a junction on Windows (no privilege needed), a symlink elsewhere.
-fn folder_link(link: &Path, target: &Path) {
+pub fn folder_link(link: &Path, target: &Path) {
     #[cfg(windows)]
     junction(link, target);
     #[cfg(unix)]

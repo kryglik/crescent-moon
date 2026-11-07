@@ -48,7 +48,8 @@ pub fn is_archive(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
 }
 
-fn stamp(file: &Path) -> (u64, Option<SystemTime>) {
+/// A zip's size and time, to notice it changing.
+pub fn stamp(file: &Path) -> (u64, Option<SystemTime>) {
     fs::metadata(file).map_or((0, None), |m| (m.len(), m.modified().ok()))
 }
 
@@ -117,11 +118,6 @@ impl Archive {
         let count = self.left_out.len();
         let names = if count == 1 { "name" } else { "names" };
         Some(format!("Left out {count} {names} that would land outside the folder: {first}"))
-    }
-
-    /// Whether the zip on disk changed since it was read.
-    pub fn changed(&self) -> bool {
-        stamp(&self.file) != self.stamp
     }
 
     /// The items directly inside folder `inner` ("" for the top).
@@ -308,7 +304,7 @@ pub mod tests {
         assert_eq!(readme.size, 19);
         let time = to_zip_time(readme.modified.unwrap()).unwrap();
         assert_eq!((time.year(), time.month(), time.day(), time.hour(), time.minute()), (2024, 5, 17, 10, 30));
-        assert!(!archive.changed());
+        assert_eq!(stamp(&path), archive.stamp, "as it was read");
 
         let data = read_start(&path, readme.index.unwrap(), 5).unwrap();
         assert_eq!(data, b"hello");

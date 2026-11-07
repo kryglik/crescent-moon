@@ -19,6 +19,7 @@ mod options;
 mod panel;
 mod platform;
 mod preview;
+mod reading;
 #[cfg(test)]
 mod sandbox_tests;
 mod scheme;
@@ -326,7 +327,8 @@ fn init_terminal() -> io::Result<Tui> {
 }
 
 fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
-    // Panels on another computer are read from here: a silent network mustn't hold the screen.
+    // Single steps on another computer (a rename, say) are done from here: a silent network
+    // mustn't hold the screen for long.
     sftp::be_impatient(Duration::from_secs(10));
     // The options editor can turn the mouse on and off; this follows `app.mouse`.
     let mut mouse = Mouse(app.mouse);

@@ -121,7 +121,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 
 | Key | Action |
 | --- | --- |
-| Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss) |
+| Esc | close any dialog; stop a running copy, move or delete (no extra box to dismiss); stop waiting for a slow folder |
 | Ctrl+O | switch between the panels and the shell (one pwsh for the whole session) |
 | Ctrl+P | options (see Settings) |
 | Alt+C | colour scheme: the list shows the one under the cursor on the whole screen; Enter keeps it, Esc goes back, F4 edits it as a file (see Colour schemes) |
@@ -140,6 +140,13 @@ Each panel remembers where it was on every drive: picking E: in the drive picker
 returns to that folder, and picking the drive the panel is already on goes to its root.
 Network drives show the share they are mapped to and their free space, which is fetched in
 the background so an unreachable share can't freeze the screen.
+
+Folders are read in the background too. A slow one keeps out of the way: the panel goes on
+showing what it showed until the new folder is in, and after half a second says what it is
+waiting for. Esc stops the wait, Tab goes to the other panel, and F10 leaves. Keys typed in that
+first half second are for the folder that is coming, as they would be behind a quick one; once
+the wait shows, other keys do nothing. The same goes for a zip on a share, and for a server that
+has gone quiet over SSH, which gets 30 seconds per request.
 
 ### Deleting as administrator
 
@@ -440,6 +447,7 @@ rmc shows the mono scheme.
 | `src/main.rs` | arguments, terminal setup, event loop, running nvim/shell/commands |
 | `src/app.rs` | application state and all key handling |
 | `src/panel.rs` | a panel: listing, sorting, cursor, marks, back/forward, filter, a zip shown as a folder |
+| `src/reading.rs` | reading a folder for a panel on a thread of its own, so a slow share can't hold the screen |
 | `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |
 | `src/ops/remote.rs` | jobs with an end on another computer: copying, moving, deleting over SSH |
 | `src/ssh.rs` | addresses, and connections through the `ssh` program |

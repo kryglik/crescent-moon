@@ -76,6 +76,10 @@ impl App {
             return;
         }
         self.notice = None;
+        // A click says where to be now, whatever was typed for a folder on its way.
+        if matches!(event.kind, MouseEventKind::Down(_)) {
+            self.typed_ahead.clear();
+        }
         if event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some((at, place)) = self.closing_click.take()
             && place == pos

@@ -83,6 +83,11 @@ pub fn be_impatient(limit: Duration) {
     PATIENCE.set(Some(limit));
 }
 
+/// How long a request of this thread may take.
+pub fn patience() -> Option<Duration> {
+    PATIENCE.get()
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

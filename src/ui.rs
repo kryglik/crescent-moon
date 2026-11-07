@@ -444,16 +444,14 @@ fn draw_panel(
         let x = util::width(&text).min(inner_w.saturating_sub(1)) as u16;
         return (Some(Position::new(inner.x + x, status_y)), hit);
     }
+    if let Some(waiting) = panel.waiting_for() {
+        buf.set_string(inner.x, status_y, util::fit(&waiting, inner_w), t.on_panel(t.notice));
+        return (None, hit);
+    }
     let status = match panel.current() {
         Some(e) if e.is_parent => "UP--DIR".to_string(),
         // Where a link or a junction leads, as mc shows it.
-        Some(e) if e.is_link => match std::fs::read_link(&e.path) {
-            Ok(target) => {
-                let target = target.display().to_string();
-                format!("{} -> {}", e.name, target.strip_prefix(r"\\?\").unwrap_or(&target))
-            }
-            Err(_) => e.name.clone(),
-        },
+        Some(Entry { name, leads_to: Some(target), .. }) => format!("{name} -> {target}"),
         Some(e) => e.name.clone(),
         None => String::new(),
     };
@@ -1395,6 +1393,33 @@ mod tests {
     /// In a repository: the branch and the counts on the bottom line (fewer words when
     /// narrow), a mark beside each changed or new name, folders with changes inside marked
     /// `•`, ignored ones dimmed; and the Alt+W list.
+    /// A wait that goes on is said where the name under the cursor is; a moment isn't.
+    #[test]
+    fn renders_the_wait_for_a_folder() {
+        let tmp = TempDir::new("ui-wait");
+        let slow = tmp.dir("slow");
+        let mut app = app_for(&tmp);
+        crate::reading::tests::wait_for_nothing();
+        let _held = crate::reading::tests::hold(&slow);
+        app.panels[0].go_to_first(std::slice::from_ref(&slow), false);
+        assert!(!render(&mut app, 100, 16).contains("Reading"));
+        app.panels[0].age_the_wait();
+        assert!(render(&mut app, 100, 16).contains("Reading slow… Esc stops"));
+    }
+
+    /// Where a link leads comes with the list: drawing asks nothing of a share.
+    #[test]
+    fn renders_where_a_link_leads() {
+        let tmp = TempDir::new("ui-link");
+        let real = tmp.dir("real");
+        crate::sandbox_tests::folder_link(&tmp.path().join("link"), &real);
+        let mut app = app_for(&tmp);
+        assert!(app.panels[0].select_name("link"));
+        let screen = render(&mut app, 100, 16);
+        assert!(screen.contains("link -> "), "{screen}");
+        assert!(!screen.contains(r"\\?\"), "{screen}");
+    }
+
     #[test]
     fn renders_the_branch_and_git_marks() {
         use crate::git::{Repo, Status, tests::{fake_repo, fake_worktree}};

@@ -143,7 +143,6 @@ pub fn set_permissions(path: &Path, permissions: Permissions) -> io::Result<()> 
     fs::set_permissions(literal(path), permissions)
 }
 
-#[cfg(unix)]
 pub fn read_link(path: &Path) -> io::Result<PathBuf> {
     fs::read_link(literal(path))
 }

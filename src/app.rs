@@ -1,5 +1,6 @@
 //! Application state and keyboard handling.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use crate::mouse::{HitAreas, LastClick};
 use crate::ops::remote;
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
-use crate::panel::{DirSize, Entry, Panel, RemoteView, SortBy};
+use crate::panel::{Came, DirSize, Entry, Panel, RemoteView, SortBy};
 use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
 use crate::scheme::{self, Choice, Colours, Scheme};
@@ -346,6 +347,8 @@ pub struct App {
     /// The colour scheme on screen, as the terminal shows it: the one the settings name, or
     /// while Alt+C's list is open the one under its cursor.
     pub scheme: Scheme,
+    /// Keys typed for a folder that is on its way (see `on_key_on_the_way`).
+    pub(crate) typed_ahead: VecDeque<KeyEvent>,
 }
 
 impl App {
@@ -418,6 +421,7 @@ impl App {
             tabs: [Vec::new(), Vec::new()],
             tab_index: [0, 0],
             scheme,
+            typed_ahead: VecDeque::new(),
         }
     }
 
@@ -489,6 +493,7 @@ impl App {
         self.watches.iter().flatten().any(Watch::pending)
             || self.previewer.as_ref().is_some_and(Previewer::loading)
             || self.git.running()
+            || self.panels.iter().any(Panel::is_reading)
     }
 
     /// Ctrl+Q: the quick view on or off.
@@ -561,7 +566,7 @@ impl App {
             }
             let due = self.watches[side].as_mut().is_some_and(|w| w.due(now));
             if due && !self.shell_shown {
-                self.panels[side].reload();
+                self.panels[side].look_again();
                 // Files changed in a repository: its status may have too.
                 if let Some(repo) = &self.panels[side].repo {
                     self.git.nudge(&repo.root);
@@ -683,8 +688,31 @@ impl App {
                 _ => {}
             }
         } else if self.quick_view && self.preview_focus && self.on_preview_key(&key) {
+        } else if self.active_panel().is_going() {
+            self.on_key_on_the_way(key);
         } else if !self.on_quicksearch_key(&key) {
             self.on_panel_key(key);
+        }
+    }
+
+    /// A key while the active panel is on its way to another folder: it would act on a list
+    /// that is about to go. For a moment the key is typed for what is coming, and waits for it,
+    /// as keys wait in the terminal behind a folder that is quick. Once the wait is on the
+    /// panel, a key that does nothing can be seen to do nothing, and nothing is left to be
+    /// let loose when the folder comes, however many are pressed: Esc stops the wait, Tab
+    /// goes to the other panel and F10 leaves.
+    fn on_key_on_the_way(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.typed_ahead.clear();
+                self.active_panel_mut().stop_reading();
+            }
+            _ if !self.active_panel().waits_visibly() => self.typed_ahead.push_back(key),
+            KeyCode::Tab | KeyCode::F(10) => {
+                self.typed_ahead.clear();
+                self.on_panel_key(key);
+            }
+            _ => {}
         }
     }
 
@@ -770,6 +798,7 @@ impl App {
             KeyCode::Enter if !cmd_empty => self.run_cmdline(),
             KeyCode::Enter => self.open_current(),
             KeyCode::Backspace if cmd_empty => self.go_up(),
+            KeyCode::Esc if cmd_empty => self.active_panel_mut().stop_reading(),
             KeyCode::Esc => self.cmdline.clear(),
             KeyCode::Char('r') if ctrl && !alt => {
                 self.reload_panels();
@@ -1124,20 +1153,20 @@ impl App {
         // The shell may have created, changed or deleted files.
         self.reload_panels();
         if let Some(dir) = moved_to
-            && dir.is_dir()
             && !util::same_path(&dir, &self.active_panel().cwd)
         {
             self.follow_shell(dir);
         }
     }
 
-    /// The shell has moved to `dir`: the active panel follows, unless it shows another computer,
-    /// whose folder the shell has nothing to do with.
+    /// The shell has moved to `dir`: the active panel follows if it is still there, unless it
+    /// shows another computer, whose folder the shell has nothing to do with.
     fn follow_shell(&mut self, dir: PathBuf) {
-        if self.active_panel().remote.is_some() {
+        if self.active_panel().remote.is_none() {
+            self.panels[self.active].go_to_first(&[dir], true);
+            self.settle(self.active);
+        } else if dir.is_dir() {
             self.active_panel_mut().cwd = dir;
-        } else {
-            self.change_dir(self.active, dir);
         }
     }
 
@@ -1962,6 +1991,7 @@ impl App {
             changed |= finder.tick();
         }
         changed |= self.tick_connecting();
+        changed |= self.tick_readings();
         // Not over a dialog: it may say where a file went. It comes when that one is read.
         for side in 0..2 {
             if self.dialog.is_none()
@@ -1985,6 +2015,50 @@ impl App {
             self.save_history();
         }
         self.tick_job() || changed
+    }
+
+    /// What the panels had read, the hidden tabs' too, and the keys that waited for it.
+    /// Returns whether the screen should change.
+    fn tick_readings(&mut self) -> bool {
+        let mut changed = false;
+        for panel in self.panels.iter_mut().chain(self.tabs.iter_mut().flatten()) {
+            changed |= panel.poll();
+        }
+        for side in 0..2 {
+            self.settle(side);
+        }
+        while !self.active_panel().is_going() && self.external.is_none() && !self.quit {
+            let Some(key) = self.typed_ahead.pop_front() else { break };
+            self.on_key(key);
+            changed = true;
+        }
+        // An editor has the terminal now, and these were never meant for it.
+        if self.external.is_some() {
+            self.typed_ahead.clear();
+        }
+        changed
+    }
+
+    /// How going somewhere ended, once it has.
+    fn settle(&mut self, side: usize) {
+        let failed = matches!(self.panels[side].came, Some(Came::Failed(_) | Came::NoFurther { .. }));
+        // Not over a question or a field being typed in: it comes when that one is done.
+        if failed && (self.dialog.is_some() || self.job.is_some()) {
+            return;
+        }
+        match self.panels[side].came.take() {
+            Some(Came::There) => self.visited(side),
+            Some(Came::Zip) => self.notice = self.panels[side].archive.as_ref().and_then(|view| view.archive.left_out_note()),
+            Some(Came::Failed(why)) => {
+                self.typed_ahead.clear();
+                self.error(why);
+            }
+            Some(Came::NoFurther { back }) => {
+                self.typed_ahead.clear();
+                self.notice = Some(if back { "No folder to go back to" } else { "No folder to go forward to" }.into());
+            }
+            None => {}
+        }
     }
 
     /// The running job's progress, questions and end. Returns whether any of them arrived.
@@ -2109,7 +2183,6 @@ impl App {
     pub fn after_external(&mut self, result: Result<(), String>, shell_cwd: Option<PathBuf>) {
         self.reload_panels();
         if let Some(dir) = shell_cwd
-            && dir.is_dir()
             && !util::same_path(&dir, &self.active_panel().cwd)
         {
             self.follow_shell(dir);
@@ -2195,10 +2268,13 @@ impl App {
         {
             return self.connect(target, AfterConnect::Go { side, place: dir });
         }
-        match self.panels[side].change_dir(dir) {
-            Ok(()) => self.visited(side),
-            Err(e) => self.error(e),
-        }
+        self.go_to_first(side, vec![dir]);
+    }
+
+    /// The panel goes to the first of `places` that can be read.
+    fn go_to_first(&mut self, side: usize, places: Vec<PathBuf>) {
+        self.panels[side].go_to_first(&places, false);
+        self.settle(side);
     }
 
     /// The panel arrived in a folder: it goes to the top of the folder history (Alt+H).
@@ -2212,14 +2288,8 @@ impl App {
     /// the active panel has been in.
     fn step_back(&mut self, back: bool) {
         let panel = &mut self.panels[self.active];
-        let stepped = if back { panel.go_back() } else { panel.go_forward() };
-        match stepped {
-            Ok(true) => self.visited(self.active),
-            Ok(false) => {
-                self.notice = Some(if back { "No folder to go back to" } else { "No folder to go forward to" }.into());
-            }
-            Err(e) => self.error(e),
-        }
+        if back { panel.go_back() } else { panel.go_forward() }
+        self.settle(self.active);
     }
 
     /// Ctrl+C / Ctrl+X: the marked files (or the one under the cursor) to the clipboard, as
@@ -2529,12 +2599,9 @@ impl App {
             return self.error(format!("The worktree's folder is gone:\n{path}\n(git worktree prune forgets it)"));
         }
         let inside = self.active_panel().cwd.strip_prefix(here).map(Path::to_path_buf).unwrap_or_default();
-        let mut target = worktree.path.join(inside);
-        while !target.is_dir() && target.pop() && target.starts_with(&worktree.path) {}
-        if !target.starts_with(&worktree.path) {
-            target = worktree.path.clone();
-        }
-        self.change_dir(self.active, target);
+        let target = worktree.path.join(inside);
+        let places = target.ancestors().take_while(|dir| dir.starts_with(&worktree.path)).map(Path::to_path_buf).collect();
+        self.go_to_first(self.active, places);
     }
 
     /// Into the folder under the cursor (on `..`, up); nothing on a file.
@@ -2602,8 +2669,8 @@ impl App {
         }
         let panel = &self.panels[side];
         let here = util::volume_key(root) == util::volume_key(&panel.cwd);
-        let target = if here { root.to_path_buf() } else { panel.dir_on_drive(root) };
-        self.change_dir(side, target);
+        let places = if here { vec![root.to_path_buf()] } else { panel.places_on_drive(root) };
+        self.go_to_first(side, places);
     }
 
     pub(crate) fn open_current(&mut self) {
@@ -2643,10 +2710,8 @@ impl App {
     /// `path`, a zip, opens in the active panel as `shown`; names in it that aren't safe to
     /// unpack are left out, and said so.
     fn open_zip_here(&mut self, path: &Path, shown: PathBuf) {
-        match self.panels[self.active].open_archive(path, shown) {
-            Ok(()) => self.notice = self.active_panel().archive.as_ref().and_then(|view| view.archive.left_out_note()),
-            Err(e) => self.error(e),
-        }
+        self.panels[self.active].open_archive(path, shown);
+        self.settle(self.active);
     }
 
     /// Shift+Enter: Windows' "How do you want to open this file?" for the file under the cursor.
@@ -3124,14 +3189,14 @@ impl App {
             Some(Some(arg)) => {
                 let panel = self.active_panel();
                 let cwd = panel.cwd.clone();
-                let target = match util::bare_drive(&arg) {
+                let places = match util::bare_drive(&arg) {
                     // "cd e:" returns to where this panel was on E: (and stays put when already there).
                     Some(root) if util::same_volume(&root, &cwd) => return,
-                    Some(root) => panel.dir_on_drive(&root),
-                    None if arg.is_empty() => util::home_dir().unwrap_or(cwd),
-                    None => util::resolve(&cwd, &arg),
+                    Some(root) => panel.places_on_drive(&root),
+                    None if arg.is_empty() => vec![util::home_dir().unwrap_or(cwd)],
+                    None => vec![util::resolve(&cwd, &arg)],
                 };
-                self.change_dir(self.active, target);
+                self.go_to_first(self.active, places);
             }
             // A command would run on this computer, and not in the folder shown: `rm *` there
             // is no place to find out.
@@ -3348,12 +3413,11 @@ mod tests {
         let names = |app: &App| app.panels[0].entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
         tmp.file("new.txt", "n");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !names(&app).contains(&"new.txt".to_string()) {
+        while !names(&app).contains(&"new.txt".to_string()) || !app.panels[1].entries.iter().any(|e| e.name == "new.txt") {
             assert!(Instant::now() < deadline, "the new file never showed up: {:?}", names(&app));
             std::thread::sleep(Duration::from_millis(20));
             app.tick();
         }
-        assert!(names(&app).contains(&"new.txt".to_string()) && app.panels[1].entries.iter().any(|e| e.name == "new.txt"));
         assert_eq!(app.active_panel().current().unwrap().name, "b.txt");
         assert_eq!(app.active_panel().marked_summary(), Some((1, 1)));
     }
@@ -4721,7 +4785,7 @@ mod tests {
         assert!(app.panels[0].entries.iter().any(|e| e.name == "from-here.txt"), "the other panel shows it");
 
         // With the panels both here: an address in the field goes there, a name stays here.
-        app.panels[0].change_dir(over.here.path().to_path_buf()).unwrap();
+        app.panels[0].change_dir(over.here.path().to_path_buf());
         app.active_panel_mut().select_name("typed.txt");
         app.on_key(with_mods(KeyCode::F(5), KeyModifiers::SHIFT));
         typing(app, &over.connection.target.place(&format!("{home}/sub/typed copy.txt")));

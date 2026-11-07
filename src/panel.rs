@@ -2,15 +2,16 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as Atomic};
 use std::time::SystemTime;
 
 use crate::archive::{self, Archive};
 use crate::find::NameFilter;
 use crate::git::Repo;
+use crate::reading::{Answer, Asked, Listing, Purpose, Reading, Refused, Spot};
 use crate::ssh::{self, Connection};
 use crate::{platform, util};
 
@@ -86,21 +87,25 @@ pub struct Entry {
     pub is_hidden: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// Where a link or a junction leads, as the system words it.
+    pub leads_to: Option<String>,
     sort_name: String,
 }
 
 impl Entry {
-    fn parent(cwd: &Path) -> Entry {
+    /// The `..` row, leading to `path`.
+    pub fn up(path: PathBuf, modified: Option<SystemTime>) -> Entry {
         Entry {
             name: "..".into(),
-            path: cwd.parent().unwrap_or(cwd).to_path_buf(),
+            path,
             is_dir: true,
             is_link: false,
             is_exec: false,
             is_parent: true,
             is_hidden: false,
             size: 0,
-            modified: fs::metadata(cwd).and_then(|m| m.modified()).ok(),
+            modified,
+            leads_to: None,
             sort_name: String::new(),
         }
     }
@@ -153,6 +158,27 @@ pub struct Panel {
     pub remote: Option<RemoteView>,
     /// A reload couldn't reach the other computer, and why; for the user to be told.
     pub lost: Option<String>,
+    /// What is being read (see `reading`). Until it is in, the panel shows what it showed.
+    reading: Option<Reading>,
+    /// Something changed since that reading started: read again once it is in.
+    read_again: bool,
+    /// Where the cursor goes when the reading is in.
+    cursor_to: Option<String>,
+    /// How going somewhere ended, for `App` to act on.
+    pub came: Option<Came>,
+}
+
+/// How going somewhere ended.
+#[derive(Debug, PartialEq)]
+pub enum Came {
+    /// The panel is there.
+    There,
+    /// The panel shows the zip.
+    Zip,
+    /// It stayed where it was, and this is why.
+    Failed(String),
+    /// Alt+Left or Alt+Right with nowhere left to go.
+    NoFurther { back: bool },
 }
 
 /// The folder of another computer a panel shows.
@@ -212,20 +238,9 @@ impl Panel {
     /// Opens `cwd`, falling back to its parents, the home directory or the system root.
     pub fn new(cwd: PathBuf, show_hidden: bool) -> Panel {
         let mut panel = Panel::blank(show_hidden);
-        let cwd = util::normalize(&cwd);
-        let candidates: Vec<PathBuf> = cwd
-            .ancestors()
-            .map(Path::to_path_buf)
-            .chain(util::home_dir())
-            .chain([system_root()])
-            .collect();
-        for dir in candidates {
-            panel.cwd = dir;
-            if panel.load().is_ok() {
-                break;
-            }
-        }
-        panel.remember_drive();
+        panel.cwd = util::normalize(&cwd);
+        panel.begin(vec![Spot::Here(panel.cwd.clone())], true, Purpose::Start);
+        panel.wait_a_moment();
         panel
     }
 
@@ -252,15 +267,24 @@ impl Panel {
             repo: None,
             remote: None,
             lost: None,
+            reading: None,
+            read_again: false,
+            cursor_to: None,
+            came: None,
         }
     }
 
     /// A new tab of this panel: the same folder, order, filter and memory of drives.
     pub fn new_tab(&self) -> Panel {
-        let mut tab = Panel::new(self.cwd.clone(), self.show_hidden);
+        let mut tab = Panel::blank(self.show_hidden);
+        tab.cwd = self.cwd.clone();
         (tab.sort, tab.reverse, tab.filter) = (self.sort, self.reverse, self.filter.clone());
         tab.drive_dirs = self.drive_dirs.clone();
         tab.remote = self.remote.clone();
+        // It shows the folder at once, while that is read again. A zip stays in its own tab.
+        if self.archive.is_none() {
+            (tab.entries, tab.space, tab.repo) = (self.entries.clone(), self.space, self.repo.clone());
+        }
         tab.reload();
         tab
     }
@@ -271,52 +295,310 @@ impl Panel {
         }
     }
 
-    /// Where this panel last was on the drive of `root`, if that folder still exists;
-    /// otherwise the root itself.
-    pub fn dir_on_drive(&self, root: &Path) -> PathBuf {
-        util::volume_key(root)
-            .and_then(|key| self.drive_dirs.get(&key))
-            .filter(|dir| dir.is_dir())
-            .cloned()
-            .unwrap_or_else(|| root.to_path_buf())
+    /// Where to go on the drive of `root`: where this panel last was there if that can still
+    /// be read, otherwise the root itself.
+    pub fn places_on_drive(&self, root: &Path) -> Vec<PathBuf> {
+        let last = util::volume_key(root).and_then(|key| self.drive_dirs.get(&key)).cloned();
+        last.into_iter().chain([root.to_path_buf()]).collect()
     }
 
-    /// Re-reads the directory. Marks of entries that still exist are kept.
-    pub fn load(&mut self) -> io::Result<()> {
-        let filter = self.filter.as_deref().map(NameFilter::parse);
-        let mut entries = match (&self.archive, &self.remote) {
-            (Some(view), _) => archive_entries(view, filter.as_ref()),
-            (None, Some(view)) => remote_entries(view, self.show_hidden, filter.as_ref())?,
-            (None, None) => read_entries(&self.cwd, self.show_hidden, filter.as_ref())?,
-        };
-        sort_entries(&mut entries, self.sort, self.reverse, &self.dir_sizes);
-        // On Windows a drive root gets ".." too: it opens the drive picker. In an archive ".."
-        // goes up inside it, and out of it at its top.
-        if let Some(view) = &self.archive {
-            let mut up = Entry::parent(&self.cwd);
-            up.path = view.location().parent().map_or_else(|| self.cwd.clone(), Path::to_path_buf);
-            entries.insert(0, up);
-        } else if let Some(view) = &self.remote {
-            // At the top of the other computer, ".." leads back to this one.
-            let path = ssh::parent(&view.dir).map_or_else(|| self.cwd.clone(), |parent| view.place(&parent));
-            entries.insert(0, Entry { path, modified: None, ..Entry::parent(Path::new("")) });
-        } else if self.cwd.parent().is_some() || cfg!(windows) {
-            entries.insert(0, Entry::parent(&self.cwd));
+    /// Starts reading `spots` for `purpose`; whatever was being read goes.
+    fn begin(&mut self, spots: Vec<Spot>, refuge: bool, purpose: Purpose) {
+        let refreshing = matches!(purpose, Purpose::Refresh);
+        self.read_again = false;
+        if !refreshing {
+            self.cursor_to = None;
         }
-        self.entries = entries;
-        self.space = match &self.remote {
-            Some(view) => view.connection.sftp.space(&view.dir).map(|space| (space.free, space.total)),
-            None => platform::disk_space(&self.cwd),
+        // Sizes are of this folder's folders.
+        let sizes = if refreshing && self.sort == SortBy::Size { self.dir_sizes.clone() } else { HashMap::new() };
+        let asked = Asked {
+            spots,
+            refuge,
+            show_hidden: self.show_hidden,
+            filter: self.filter.clone(),
+            sort: self.sort,
+            reverse: self.reverse,
+            sizes,
         };
-        self.repo = if self.archive.is_none() && self.remote.is_none() { Repo::find(&self.cwd) } else { None };
-        // Marks and sizes of entries that are gone go too (looked up by name: a folder of
-        // 50,000 photos with all of them marked must not take seconds).
+        self.reading = Some(Reading::start(asked, purpose));
+    }
+
+    /// A folder that is quick is in when this returns.
+    fn wait_a_moment(&mut self) {
+        if let Some(answer) = self.reading.as_ref().and_then(Reading::wait) {
+            self.land(answer);
+        }
+    }
+
+    /// Takes in what is being read, if that has come. Returns whether the screen should
+    /// change: it has, or the wait has gone on long enough to say so.
+    pub fn poll(&mut self) -> bool {
+        let Some(reading) = self.reading.as_mut() else { return false };
+        match reading.take() {
+            Some(answer) => {
+                self.land(answer);
+                true
+            }
+            None => reading.shows_anew(),
+        }
+    }
+
+    /// The wait is as old as if it had gone on for a while.
+    #[cfg(test)]
+    pub fn age_the_wait(&mut self) {
+        if let Some(reading) = &mut self.reading {
+            crate::reading::tests::age(reading);
+        }
+    }
+
+    /// Whether something is being read.
+    pub fn is_reading(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    /// Whether the list is about to go, or the cursor to move: a key now would act on what is
+    /// shown instead of on what is coming.
+    pub fn is_going(&self) -> bool {
+        self.cursor_to.is_some() || self.reading.as_ref().is_some_and(|reading| !matches!(reading.purpose, Purpose::Refresh))
+    }
+
+    /// Whether the wait has gone on long enough to show.
+    pub fn waits_visibly(&self) -> bool {
+        self.reading.as_ref().is_some_and(Reading::is_long)
+    }
+
+    /// What the panel is waiting for, once it is long enough to say so.
+    pub fn waiting_for(&self) -> Option<String> {
+        self.reading.as_ref().and_then(Reading::note)
+    }
+
+    /// Esc: the panel stays as it is, and nobody takes what is being read. A panel that has
+    /// nothing to stay at goes home instead.
+    pub fn stop_reading(&mut self) {
+        let Some(reading) = self.reading.take() else { return };
+        self.read_again = false;
+        self.cursor_to = None;
+        if matches!(reading.purpose, Purpose::Start) {
+            let next = util::home_dir().filter(|home| *home != self.cwd).unwrap_or_else(system_root);
+            if next != self.cwd {
+                self.cwd = next;
+                self.begin(vec![Spot::Here(self.cwd.clone())], true, Purpose::Start);
+                self.wait_a_moment();
+            }
+        }
+    }
+
+    /// What was read is in: the panel takes it, and what it means.
+    fn land(&mut self, answer: Answer) {
+        let Some(reading) = self.reading.take() else { return };
+        let arrived = answer.is_ok();
+        match (reading.purpose, answer) {
+            (Purpose::Start, Ok(listing)) => {
+                self.take_in(listing);
+                self.remember_drive();
+            }
+            // Not even the top of the system: an empty panel.
+            (Purpose::Start, Err(_)) => {}
+            (Purpose::Refresh, Ok(listing)) => self.refreshed(listing),
+            (Purpose::Refresh, Err(refused)) => self.not_refreshed(&refused),
+            (Purpose::Go { .. }, Ok(listing)) => {
+                let from = self.place();
+                self.go_in(listing);
+                if !util::same_path(&from, &self.place()) {
+                    self.back.push(from);
+                    if self.back.len() > BACK_LIMIT {
+                        self.back.remove(0);
+                    }
+                    self.forward.clear();
+                }
+                self.came = Some(Came::There);
+            }
+            (Purpose::Go { quiet }, Err(refused)) => {
+                if !quiet {
+                    self.came = Some(Came::Failed(refused.message()));
+                }
+            }
+            (Purpose::Step { back, depths }, Ok(listing)) => {
+                self.steps(back).truncate(depths[listing.tried]);
+                let here = self.place();
+                self.go_in(listing);
+                self.steps(!back).push(here);
+                self.came = Some(Came::There);
+            }
+            (Purpose::Step { back, depths }, Err(refused)) => {
+                self.steps(back).truncate(depths[refused.tried]);
+                self.came = Some(if refused.error.kind() == io::ErrorKind::TimedOut {
+                    Came::Failed(refused.message())
+                } else {
+                    Came::NoFurther { back }
+                });
+            }
+            (Purpose::OpenZip, Ok(listing)) => {
+                self.go_in(listing);
+                self.came = Some(Came::Zip);
+            }
+            (Purpose::OpenZip, Err(refused)) => self.came = Some(Came::Failed(refused.message())),
+        }
+        // The name may be only in what the next reading finds.
+        if let Some(name) = self.cursor_to.take().filter(|_| arrived)
+            && !self.put_cursor_on(&name)
+            && self.read_again
+        {
+            self.cursor_to = Some(name);
+        }
+        if std::mem::take(&mut self.read_again) {
+            self.look_again();
+        }
+    }
+
+    /// The list of folders to go back to, or forward to.
+    fn steps(&mut self, back: bool) -> &mut Vec<PathBuf> {
+        if back { &mut self.back } else { &mut self.forward }
+    }
+
+    /// Puts what was read on show. Marks of entries that still exist are kept.
+    fn take_in(&mut self, listing: Listing) {
+        match listing.spot {
+            Spot::Here(dir) => {
+                self.cwd = dir;
+                self.remote = None;
+                self.archive = None;
+            }
+            Spot::There(view) => {
+                self.remote = Some(view);
+                self.archive = None;
+            }
+            Spot::Zip { shown, .. } => {
+                if let Some(archive) = listing.zip {
+                    let outer = self.archive.take().map(Box::new);
+                    self.archive = Some(ArchiveView { archive, inner: String::new(), shown, outer });
+                }
+            }
+            Spot::ZipAgain { .. } => {
+                if let (Some(view), Some(archive)) = (self.archive.as_mut(), listing.zip) {
+                    if !view.inner.is_empty() && archive.find(&view.inner).is_none() {
+                        view.inner.clear();
+                    }
+                    view.archive = archive;
+                }
+            }
+        }
+        if self.archive.is_some() {
+            return self.list_zip();
+        }
+        self.entries = listing.entries;
+        // At the top of the other computer, ".." leads back to this one.
+        if let (Some(up), true) = (self.entries.first_mut(), self.remote.is_some())
+            && up.is_parent
+            && up.path.as_os_str().is_empty()
+        {
+            up.path = self.cwd.clone();
+        }
+        self.space = listing.space;
+        self.repo = listing.repo;
+        self.keep_what_is_still_there();
+        if listing.order != (self.sort, self.reverse) {
+            self.resort();
+        }
+    }
+
+    /// What is in the zip's folder on show: all of that is in memory.
+    fn list_zip(&mut self) {
+        let Some(view) = &self.archive else { return };
+        let filter = self.filter.as_deref().map(NameFilter::parse);
+        let mut entries = archive_entries(view, filter.as_ref());
+        sort_entries(&mut entries, self.sort, self.reverse, &self.dir_sizes);
+        // ".." goes up inside it, and out of it at its top.
+        let up = view.location().parent().map_or_else(|| self.cwd.clone(), Path::to_path_buf);
+        entries.insert(0, Entry::up(up, view.archive.stamp.1));
+        self.entries = entries;
+        self.repo = None;
+        self.keep_what_is_still_there();
+    }
+
+    /// Marks and sizes of entries that are gone go too (looked up by name: a folder of 50,000
+    /// photos with all of them marked must not take seconds).
+    fn keep_what_is_still_there(&mut self) {
         let names: HashSet<&str> = self.entries.iter().filter(|e| !e.is_parent).map(|e| e.name.as_str()).collect();
         let dirs: HashSet<&str> = self.entries.iter().filter(|e| e.is_dir && !e.is_parent).map(|e| e.name.as_str()).collect();
         self.marked.retain(|name| names.contains(name.as_str()));
         self.dir_sizes.retain(|name, _| dirs.contains(name.as_str()));
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
-        Ok(())
+    }
+
+    /// The panel moves to what was read: a new place, with nothing marked. Coming back up, the
+    /// cursor goes on the folder just left.
+    fn go_in(&mut self, listing: Listing) {
+        let left = match &listing.spot {
+            Spot::Here(dir) => util::child_name(dir, &self.cwd),
+            Spot::There(view) => self.remote.as_ref().and_then(|left| {
+                let below = left.dir.strip_prefix(&ssh::join(&view.dir, ""))?;
+                below.split('/').next().map(String::from)
+            }),
+            Spot::Zip { .. } | Spot::ZipAgain { .. } => None,
+        };
+        let here = matches!(listing.spot, Spot::Here(_));
+        self.marked.clear();
+        self.dir_sizes.clear();
+        (self.cursor, self.offset) = (0, 0);
+        self.take_in(listing);
+        if here {
+            self.remember_drive();
+        }
+        if let Some(name) = left {
+            self.put_cursor_on(&name);
+        }
+    }
+
+    /// The place on show, read again. The cursor stays on its name.
+    fn refreshed(&mut self, listing: Listing) {
+        let same = match &listing.spot {
+            Spot::Here(dir) => self.remote.is_none() && util::same_path(dir, &self.cwd),
+            Spot::There(view) => self.remote.as_ref().is_some_and(|here| here.dir == view.dir),
+            Spot::Zip { .. } | Spot::ZipAgain { .. } => true,
+        };
+        if same {
+            let name = self.current().map(|e| e.name.clone());
+            self.take_in(listing);
+            if let Some(name) = name {
+                self.put_cursor_on(&name);
+            }
+            return;
+        }
+        // The folder has gone (deleted, drive removed), and this is the nearest one that hasn't.
+        if self.remote.is_none() {
+            self.back.push(self.cwd.clone());
+        }
+        // Marks are by name, and these names mean something else here.
+        self.marked.clear();
+        self.dir_sizes.clear();
+        (self.cursor, self.offset) = (0, 0);
+        self.take_in(listing);
+        if self.remote.is_none() {
+            self.remember_drive();
+        }
+    }
+
+    /// A folder on another computer can't be read. If the server is only slow the panel stays
+    /// as it is. If the connection is gone, back to this computer. `lost` tells the user.
+    fn not_refreshed(&mut self, refused: &Refused) {
+        let Some(view) = &self.remote else { return };
+        let target = view.connection.target.to_string();
+        if refused.error.kind() == io::ErrorKind::TimedOut {
+            self.lost = Some(format!("{target} doesn't answer: the panel shows what it last read."));
+            return;
+        }
+        self.remote = None;
+        self.archive = None;
+        self.marked.clear();
+        self.dir_sizes.clear();
+        self.lost = Some(format!("The connection to {target} is gone."));
+        self.reload();
+    }
+
+    /// The folder under any zip on show.
+    fn under(&self) -> Spot {
+        self.remote.clone().map_or_else(|| Spot::Here(self.cwd.clone()), Spot::There)
     }
 
     /// Sorts by `by`. Choosing the order it already has flips it (A to Z, then Z to A), like
@@ -330,140 +612,94 @@ impl Panel {
         self.resort();
     }
 
-    /// Reloads and keeps the cursor on the same name when it still exists.
+    /// Reads the place again, keeping the cursor on the same name when it still exists. A
+    /// folder that is quick is in when this returns.
     pub fn reload(&mut self) {
-        let name = self.current().map(|e| e.name.clone());
-        self.reopen_archive();
-        if let Err(error) = self.load() {
-            if self.remote.is_some() {
-                return self.remote_failed(&error);
-            }
-            // The directory vanished (deleted, drive removed): climb to something that exists,
-            // starting above it. When the whole drive is gone (a share offline), each step up
-            // would wait for it again, so go home at once.
-            let cwd = self.cwd.clone();
-            let drive_root = if cfg!(windows) { cwd.ancestors().last().map(Path::to_path_buf) } else { platform::mount_point(&cwd) };
-            let start = match (cwd.parent(), drive_root) {
-                (Some(parent), Some(root)) if fs::metadata(&root).is_ok() => parent.to_path_buf(),
-                _ => util::home_dir().unwrap_or_else(system_root),
-            };
-            let show_hidden = self.show_hidden;
-            let (sort, reverse, filter) = (self.sort, self.reverse, self.filter.take());
-            let drive_dirs = std::mem::take(&mut self.drive_dirs);
-            let (mut back, forward) = (std::mem::take(&mut self.back), std::mem::take(&mut self.forward));
-            back.push(cwd);
-            *self = Panel::new(start, show_hidden);
-            (self.sort, self.reverse, self.back, self.forward, self.filter) = (sort, reverse, back, forward, filter);
-            for (drive, dir) in drive_dirs {
-                self.drive_dirs.entry(drive).or_insert(dir);
-            }
-            let _ = self.load();
-            return;
-        }
-        if let Some(name) = name {
-            self.select_name(&name);
+        if self.look_again() {
+            self.wait_a_moment();
         }
     }
 
-    /// A folder on another computer can't be read. If the server is only slow the panel stays
-    /// as it is. If the folder is gone, the nearest one above it. If the connection is gone,
-    /// back to this computer. `lost` tells the user.
-    fn remote_failed(&mut self, error: &io::Error) {
-        let Some(view) = &self.remote else { return };
-        let target = view.connection.target.to_string();
-        if error.kind() == io::ErrorKind::TimedOut {
-            self.lost = Some(format!("{target} doesn't answer: the panel shows what it last read."));
-            return;
+    /// Starts reading the place again, for when it comes; if something is being read, that
+    /// may be from before the change, so afterwards. Returns whether it started.
+    pub fn look_again(&mut self) -> bool {
+        if self.reading.is_some() {
+            self.read_again = true;
+            return false;
         }
-        if view.connection.sftp.lost().is_none() {
-            while let Some(view) = self.remote.as_mut() {
-                let Some(parent) = ssh::parent(&view.dir) else { break };
-                view.dir = parent;
-                // Marks are by name, and these names mean something else here.
-                self.marked.clear();
-                self.dir_sizes.clear();
-                if self.load().is_ok() {
-                    return;
-                }
+        let mut spots = Vec::new();
+        // A zip that changed is read again, staying in the same folder inside if that is still
+        // there; gone, the panel leaves it.
+        if let Some(view) = &self.archive {
+            spots.push(Spot::ZipAgain { file: view.archive.file.clone(), stamp: view.archive.stamp });
+        }
+        spots.push(self.under());
+        // A folder gone on another computer: the nearest one above it.
+        if let Some(view) = &self.remote {
+            let mut dir = view.dir.clone();
+            while let Some(parent) = ssh::parent(&dir) {
+                spots.push(Spot::There(RemoteView { connection: view.connection.clone(), dir: parent.clone() }));
+                dir = parent;
             }
         }
-        self.remote = None;
-        self.archive = None;
-        self.marked.clear();
-        self.dir_sizes.clear();
-        self.lost = Some(format!("The connection to {target} is gone."));
-        self.reload();
+        self.begin(spots, self.remote.is_none(), Purpose::Refresh);
+        true
     }
 
-    /// Goes to `dir`, a folder or the address of one on another computer; where the panel was
-    /// is where Alt+Left goes back to.
-    pub fn change_dir(&mut self, dir: PathBuf) -> Result<(), String> {
-        let previous = self.place();
-        self.open_dir(dir)?;
-        if !util::same_path(&previous, &self.place()) {
-            self.back.push(previous);
-            if self.back.len() > BACK_LIMIT {
-                self.back.remove(0);
+    #[cfg(test)]
+    pub fn change_dir(&mut self, dir: PathBuf) {
+        self.go_to_first(&[dir], false);
+    }
+
+    /// Goes to the first of `dirs`, folders or addresses of ones on another computer, that can
+    /// be read; where the panel was is where Alt+Left goes back to. `came` says how it ended,
+    /// once it has. `quiet`: nothing is said if none can.
+    pub fn go_to_first(&mut self, dirs: &[PathBuf], quiet: bool) {
+        let spots: Result<Vec<Spot>, String> = dirs.iter().map(|dir| spot_of(dir)).collect();
+        let spots = match spots {
+            Ok(spots) => spots,
+            Err(why) => {
+                self.came = Some(Came::Failed(why));
+                return;
             }
-            self.forward.clear();
+        };
+        // Asked again while on the way there: nothing new.
+        let going_there = |reading: &Reading| !matches!(reading.purpose, Purpose::Refresh) && spots.first().is_some_and(|spot| spot.place() == reading.place);
+        if self.reading.as_ref().is_some_and(going_there) {
+            return;
         }
-        Ok(())
+        self.begin(spots, false, Purpose::Go { quiet });
+        self.wait_a_moment();
     }
 
     /// Alt+Left: back to the folder before this one (passing over any that are gone).
-    /// Returns whether it went anywhere.
-    pub fn go_back(&mut self) -> Result<bool, String> {
-        self.step(true)
+    pub fn go_back(&mut self) {
+        self.step(true);
     }
 
     /// Alt+Right: forward again, after going back.
-    pub fn go_forward(&mut self) -> Result<bool, String> {
-        self.step(false)
+    pub fn go_forward(&mut self) {
+        self.step(false);
     }
 
-    fn step(&mut self, back: bool) -> Result<bool, String> {
-        loop {
-            let next = if back { self.back.pop() } else { self.forward.pop() };
-            let Some(dir) = next else { return Ok(false) };
-            let reachable = match ssh::parse_exact(&dir.to_string_lossy()) {
-                Some((target, _)) => ssh::find(&target).is_some(),
-                None => crate::lfs::is_dir(&dir),
-            };
-            if !reachable {
-                continue;
-            }
-            let here = self.place();
-            self.open_dir(dir)?;
-            if back { self.forward.push(here) } else { self.back.push(here) }
-            return Ok(true);
-        }
-    }
-
-    /// The zip on disk changed since it was read (or is gone): read it again, staying in the
-    /// same folder inside if that is still there; gone, the panel leaves it.
-    fn reopen_archive(&mut self) {
-        let Some(view) = self.archive.as_mut() else { return };
-        if !view.archive.changed() {
+    fn step(&mut self, back: bool) {
+        let stack = self.steps(back);
+        let reachable = stack.iter().enumerate().rev().filter_map(|(depth, dir)| Some((depth, spot_of(dir).ok()?)));
+        let (depths, spots): (Vec<usize>, Vec<Spot>) = reachable.unzip();
+        if spots.is_empty() {
+            stack.clear();
+            self.came = Some(Came::NoFurther { back });
             return;
         }
-        match Archive::open(&view.archive.file) {
-            Ok(archive) => {
-                if !view.inner.is_empty() && archive.find(&view.inner).is_none() {
-                    view.inner.clear();
-                }
-                view.archive = archive;
-            }
-            Err(_) => self.archive = None,
-        }
+        self.begin(spots, false, Purpose::Step { back, depths });
+        self.wait_a_moment();
     }
 
     /// Enter on a zip: the panel shows what is in it. `shown` is what the title calls it.
-    pub fn open_archive(&mut self, file: &Path, shown: PathBuf) -> Result<(), String> {
-        let archive = Archive::open(file).map_err(|e| format!("Cannot open \"{}\":\n{e}", shown.display()))?;
-        let outer = self.archive.take().map(Box::new);
-        self.archive = Some(ArchiveView { archive, inner: String::new(), shown, outer });
-        self.enter_inner();
-        Ok(())
+    /// `came` says how it ended, once it has.
+    pub fn open_archive(&mut self, file: &Path, shown: PathBuf) {
+        self.begin(vec![Spot::Zip { file: file.to_path_buf(), shown }], false, Purpose::OpenZip);
+        self.wait_a_moment();
     }
 
     /// Into folder `name` inside the archive.
@@ -479,9 +715,18 @@ impl Panel {
     pub fn archive_up(&mut self) {
         let Some(view) = self.archive.as_mut() else { return };
         let left = if view.inner.is_empty() {
-            let view = self.archive.take().expect("in an archive");
-            self.archive = view.outer.map(|outer| *outer);
-            view.shown.file_name().map(|n| n.to_string_lossy().into_owned())
+            let name = view.shown.file_name().map(|n| n.to_string_lossy().into_owned());
+            // Out of the last zip: what is around it is a folder to read.
+            if view.outer.is_none() {
+                self.begin(vec![self.under()], false, Purpose::Go { quiet: false });
+                self.wait_a_moment();
+                if let Some(name) = name {
+                    self.select_name(&name);
+                }
+                return;
+            }
+            self.archive = self.archive.take().and_then(|view| view.outer).map(|outer| *outer);
+            name
         } else {
             let name = view.inner.rsplit('/').next().map(str::to_string);
             view.inner = archive::parent_of(&view.inner).to_string();
@@ -489,15 +734,19 @@ impl Panel {
         };
         self.enter_inner();
         if let Some(name) = left {
-            self.select_name(&name);
+            self.put_cursor_on(&name);
         }
     }
 
+    /// A folder inside the zip, which is all in memory. What was being read was for another.
     fn enter_inner(&mut self) {
+        self.reading = None;
+        self.read_again = false;
+        self.cursor_to = None;
         self.marked.clear();
         self.dir_sizes.clear();
         (self.cursor, self.offset) = (0, 0);
-        let _ = self.load();
+        self.list_zip();
     }
 
     /// Where the panel is: its folder, on another computer its address (`nas:/home/me`).
@@ -539,75 +788,21 @@ impl Panel {
         Some((view.archive.file.clone(), names.iter().map(|name| archive::join(&view.inner, name)).collect()))
     }
 
-    fn open_dir(&mut self, dir: PathBuf) -> Result<(), String> {
-        if let Some((target, path)) = ssh::parse_exact(&dir.to_string_lossy()) {
-            let connection = ssh::find(&target).ok_or_else(|| format!("Not connected to {target}."))?;
-            let dir = ssh::absolute(&connection.home, &path);
-            return self.open_remote(RemoteView { connection, dir });
-        }
-        let dir = util::normalize(&dir);
-        // Going anywhere else leaves the archive, and the other computer.
-        let archive = self.archive.take();
-        let remote = self.remote.take();
-        let previous = std::mem::replace(&mut self.cwd, dir.clone());
-        let marked = std::mem::take(&mut self.marked);
-        let sizes = std::mem::take(&mut self.dir_sizes);
-        match self.load() {
-            Ok(()) => {
-                self.cursor = 0;
-                self.offset = 0;
-                self.remember_drive();
-                // Coming back up: put the cursor on the directory we just left.
-                if let Some(name) = util::child_name(&self.cwd, &previous) {
-                    self.select_name(&name);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.cwd = previous;
-                self.marked = marked;
-                self.dir_sizes = sizes;
-                self.archive = archive;
-                self.remote = remote;
-                let _ = self.load();
-                Err(format!("Cannot open \"{}\":\n{e}", dir.display()))
-            }
-        }
-    }
-
-    /// Goes to a folder on another computer.
-    fn open_remote(&mut self, view: RemoteView) -> Result<(), String> {
-        let archive = self.archive.take();
-        let (place, dir) = (view.place(&view.dir), view.dir.clone());
-        let previous = self.remote.replace(view);
-        let marked = std::mem::take(&mut self.marked);
-        let sizes = std::mem::take(&mut self.dir_sizes);
-        match self.load() {
-            Ok(()) => {
-                (self.cursor, self.offset) = (0, 0);
-                // Coming back up: the cursor on the folder just left.
-                let left = previous.as_ref().map_or("", |view| view.dir.as_str());
-                if let Some(name) = left.strip_prefix(&ssh::join(&dir, "")).and_then(|below| below.split('/').next()) {
-                    self.select_name(name);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.remote = previous;
-                self.marked = marked;
-                self.dir_sizes = sizes;
-                self.archive = archive;
-                let _ = self.load();
-                Err(format!("Cannot open \"{}\":\n{e}", place.display()))
-            }
-        }
-    }
-
     pub fn current(&self) -> Option<&Entry> {
         self.entries.get(self.cursor)
     }
 
+    /// Puts the cursor on `name`; with something being read, as soon as that is in. Returns
+    /// whether it is there now.
     pub fn select_name(&mut self, name: &str) -> bool {
+        if self.reading.is_some() {
+            self.cursor_to = Some(name.to_string());
+            return false;
+        }
+        self.put_cursor_on(name)
+    }
+
+    fn put_cursor_on(&mut self, name: &str) -> bool {
         let found = self.entries.iter().position(|e| e.name == name).or_else(|| {
             let lower = name.to_lowercase();
             self.entries.iter().position(|e| e.name.to_lowercase() == lower)
@@ -787,9 +982,19 @@ impl Panel {
         let start = usize::from(self.entries.first().is_some_and(|e| e.is_parent));
         sort_entries(&mut self.entries[start..], self.sort, self.reverse, &self.dir_sizes);
         if let Some(name) = name {
-            self.select_name(&name);
+            self.put_cursor_on(&name);
         }
     }
+}
+
+/// What `dir`, a folder or the address of one on another computer, is to a reading.
+fn spot_of(dir: &Path) -> Result<Spot, String> {
+    if let Some((target, path)) = ssh::parse_exact(&dir.to_string_lossy()) {
+        let connection = ssh::find(&target).ok_or_else(|| format!("Not connected to {target}."))?;
+        let dir = ssh::absolute(&connection.home, &path);
+        return Ok(Spot::There(RemoteView { connection, dir }));
+    }
+    Ok(Spot::Here(util::normalize(dir)))
 }
 
 /// A file's size, or a directory's measured size (0 until measured).
@@ -816,13 +1021,14 @@ fn archive_entries(view: &ArchiveView, filter: Option<&NameFilter>) -> Vec<Entry
             is_hidden: item.name().starts_with('.'),
             size: item.size,
             modified: item.modified,
+            leads_to: None,
             sort_name: item.name().to_lowercase(),
         })
         .collect()
 }
 
 /// The entries of a folder on another computer. A link shows what it points to, as here.
-fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {
+pub fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {
     let sftp = &view.connection.sftp;
     let mut items = sftp.read_dir(&view.dir)?;
     items.retain(|item| show_hidden || !item.name.starts_with('.'));
@@ -851,16 +1057,21 @@ fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&NameFilt
             is_link,
             is_parent: false,
             is_hidden,
+            leads_to: None,
         });
     }
     Ok(out)
 }
 
-fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> io::Result<Vec<Entry>> {
+/// The entries of a folder here; given up on once `stop` says nobody is waiting for them.
+pub fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>, stop: &AtomicBool) -> io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     // On a Windows drive in WSL every file looks executable.
     let exec_bits = platform::exec_bits_mean_something(dir);
     for item in crate::lfs::read_dir(dir)? {
+        if stop.load(Atomic::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
         let own = item.metadata().ok();
@@ -877,11 +1088,17 @@ fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> i
         if !is_dir && filter.is_some_and(|f| !f.matches(&name)) {
             continue;
         }
+        // Read here and not when it is on screen, where a share may not answer.
+        let leads_to = is_link.then(|| crate::lfs::read_link(&path).ok()).flatten().map(|target| {
+            let target = target.display().to_string();
+            target.strip_prefix(r"\\?\").map(String::from).unwrap_or(target)
+        });
         out.push(Entry {
             sort_name: name.to_lowercase(),
             is_exec: !is_dir && exec_bits && platform::is_executable(&name, meta),
             size: if is_dir { 0 } else { meta.map_or(0, |m| m.len()) },
             modified: meta.and_then(|m| m.modified().ok()),
+            leads_to,
             name,
             path,
             is_dir,
@@ -895,7 +1112,7 @@ fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>) -> i
 
 /// Directories first, then by `sort` (names break ties); `reverse` turns the order round but
 /// keeps directories on top, as mc and Total Commander do.
-fn sort_entries(entries: &mut [Entry], sort: SortBy, reverse: bool, sizes: &HashMap<String, DirSize>) {
+pub fn sort_entries(entries: &mut [Entry], sort: SortBy, reverse: bool, sizes: &HashMap<String, DirSize>) {
     entries.sort_by(|a, b| {
         let order = match sort {
             SortBy::Name => Ordering::Equal,
@@ -908,7 +1125,7 @@ fn sort_entries(entries: &mut [Entry], sort: SortBy, reverse: bool, sizes: &Hash
     });
 }
 
-fn system_root() -> PathBuf {
+pub fn system_root() -> PathBuf {
     if cfg!(windows) {
         let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
         PathBuf::from(format!("{drive}\\"))
@@ -990,7 +1207,7 @@ mod tests {
         tmp.dir("two");
         let mut panel = Panel::new(tmp.path().join("two"), true);
         let parent = panel.cwd.parent().unwrap().to_path_buf();
-        panel.change_dir(parent).unwrap();
+        panel.change_dir(parent);
         assert_eq!(panel.current().unwrap().name, "two");
     }
 
@@ -1002,20 +1219,24 @@ mod tests {
         let mut panel = Panel::new(deep.clone(), true);
         let root = PathBuf::from(format!("{}\\", util::volume_key(&deep).unwrap().to_uppercase()));
         // Somewhere on another (non-existent here) drive and back: the folder is remembered.
-        assert!(util::same_path(&panel.dir_on_drive(&root), &deep));
-        assert_eq!(panel.dir_on_drive(Path::new(r"Q:\")), PathBuf::from(r"Q:\"), "unknown drive: root");
-        panel.change_dir(tmp.path().to_path_buf()).unwrap();
-        assert!(util::same_path(&panel.dir_on_drive(&root), tmp.path()), "the latest visit wins");
+        assert!(util::same_path(&panel.places_on_drive(&root)[0], &deep));
+        assert_eq!(panel.places_on_drive(Path::new(r"Q:\")), [PathBuf::from(r"Q:\")], "unknown drive: root");
+        panel.change_dir(tmp.path().to_path_buf());
+        assert!(util::same_path(&panel.places_on_drive(&root)[0], tmp.path()), "the latest visit wins");
         // A remembered folder that was deleted falls back to the root.
+        let places = panel.places_on_drive(&root);
+        panel.change_dir(deep.clone());
         drop(tmp);
-        assert_eq!(panel.dir_on_drive(&root), root);
+        panel.go_to_first(&places, false);
+        assert_eq!(panel.cwd, root);
     }
 
     #[test]
     fn failed_change_dir_keeps_the_old_directory() {
         let tmp = TempDir::new("panel-fail");
         let mut panel = Panel::new(tmp.path().to_path_buf(), true);
-        assert!(panel.change_dir(tmp.path().join("missing")).is_err());
+        panel.change_dir(tmp.path().join("missing"));
+        assert!(matches!(panel.came, Some(Came::Failed(_))));
         assert!(util::same_path(&panel.cwd, tmp.path()));
     }
 

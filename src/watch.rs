@@ -7,7 +7,11 @@
 //! watched on Windows: an open watch would keep Windows from ejecting them.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::reading::a_moment;
 
 /// How long after the first change the panel reloads: a burst of changes (a copy of many
 /// files) gives one reload, not one per file.
@@ -18,6 +22,8 @@ const GAP: Duration = Duration::from_millis(1000);
 pub struct Watch {
     pub dir: PathBuf,
     handle: Option<sys::Handle>,
+    /// A thread is opening it: on a share that has gone away that takes as long as anything.
+    opening: Option<Receiver<Option<sys::Handle>>>,
     /// A change was seen; the panel reloads at this time.
     due: Option<Instant>,
     last: Option<Instant>,
@@ -25,13 +31,21 @@ pub struct Watch {
 
 impl Watch {
     pub fn new(dir: &Path) -> Watch {
-        Watch { dir: dir.to_path_buf(), handle: sys::Handle::open(dir, false), due: None, last: None }
+        let (tx, opened) = mpsc::channel();
+        let path = dir.to_path_buf();
+        thread::spawn(move || {
+            let _ = tx.send(sys::Handle::open(&path, false));
+        });
+        let handle = opened.recv_timeout(a_moment()).ok().flatten();
+        // Nothing yet, or nothing at all: only a look at the channel tells them apart.
+        let opening = handle.is_none().then_some(opened);
+        Watch { dir: dir.to_path_buf(), handle, opening, due: None, last: None }
     }
 
     /// The folder and everything below it (a git working tree). Only on Windows, where one
     /// handle covers a whole tree, and only on local drives; elsewhere the watch is inactive.
     pub fn tree(dir: &Path) -> Watch {
-        Watch { dir: dir.to_path_buf(), handle: sys::Handle::open(dir, true), due: None, last: None }
+        Watch { dir: dir.to_path_buf(), handle: sys::Handle::open(dir, true), opening: None, due: None, last: None }
     }
 
     /// Whether the folder is really being watched (not on a removable drive, say).
@@ -41,6 +55,7 @@ impl Watch {
 
     /// Drops the changes seen so far (ones rmc's own `git status` made, say).
     pub fn forget(&mut self) {
+        self.take_handle();
         if let Some(handle) = self.handle.as_mut() {
             handle.changed();
         }
@@ -50,6 +65,7 @@ impl Watch {
     /// Whether the panel should reload now: something changed, things have settled, and the
     /// last reload isn't too recent.
     pub fn due(&mut self, now: Instant) -> bool {
+        self.take_handle();
         if self.handle.as_mut().is_some_and(sys::Handle::changed) && self.due.is_none() {
             self.due = Some(now + SETTLE);
         }
@@ -66,6 +82,25 @@ impl Watch {
     /// A change is waiting to be shown (the main loop then wakes up sooner).
     pub fn pending(&self) -> bool {
         self.due.is_some()
+    }
+
+    fn take_handle(&mut self) {
+        if let Some(opened) = &self.opening
+            && let Ok(handle) = opened.try_recv()
+        {
+            self.handle = handle;
+            self.opening = None;
+        }
+    }
+}
+
+impl Drop for Watch {
+    /// A job closes the watches so that none holds a folder it moves: one still being opened
+    /// counts too, unless it is stuck, and then it holds nothing yet.
+    fn drop(&mut self) {
+        if let Some(opened) = self.opening.take() {
+            let _ = opened.recv_timeout(a_moment());
+        }
     }
 }
 
