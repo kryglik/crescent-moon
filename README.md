@@ -132,6 +132,10 @@ Typing anywhere goes to the command line; Enter runs it in the shell (see below)
 active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder; it
 reads quotes and environment variables as the shell would, and `cd -` goes back.
 
+On Windows the bar at the bottom follows Shift, Ctrl and Alt: hold one for a moment and it shows
+what that key does, and a click there works as with the key held. A terminal on Linux or over ssh
+doesn't tell a program about those keys held on their own, so there the bar stays as it is.
+
 Panels show what other programs change in their folders (a download finishing, a build) by
 themselves, as Explorer does, keeping the cursor and the marks; removable drives aren't
 watched, so they can still be ejected. The window's title names the active folder.
@@ -446,6 +450,7 @@ rmc shows the mono scheme.
 | --- | --- |
 | `src/main.rs` | arguments, terminal setup, event loop, running nvim/shell/commands |
 | `src/app.rs` | application state and all key handling |
+| `src/keybar.rs` | the bar at the bottom, and what it shows while Shift, Ctrl or Alt is held |
 | `src/panel.rs` | a panel: listing, sorting, cursor, marks, back/forward, filter, a zip shown as a folder |
 | `src/reading.rs` | reading a folder for a panel on a thread of its own, so a slow share can't hold the screen |
 | `src/ops.rs` | copy/move/delete/extract/pack jobs on a worker thread (progress, questions, cancel) |

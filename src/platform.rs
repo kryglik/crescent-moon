@@ -118,8 +118,14 @@ fn parent_of(_pid: u32) -> Option<u32> {
 #[cfg(windows)]
 pub use win::{
     admin_can_reach, close_elevated, delete_denied, delete_privileged, disk_space, drives, enable_admin_privileges, init,
-    long_wide, open_default, run_elevated, wait_elevated,
+    long_wide, open_default, run_elevated, wait_elevated, wait_for_input,
 };
+
+/// Outside Windows nothing tells of Shift, Ctrl and Alt held on their own.
+#[cfg(not(windows))]
+pub fn wait_for_input(_timeout: std::time::Duration, _looking: bool) -> Option<crate::keybar::Held> {
+    None
+}
 
 /// No "As admin" outside Windows.
 #[cfg(not(windows))]
@@ -276,9 +282,61 @@ mod win {
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     use super::DriveInfo;
+    use crate::keybar::Held;
 
     fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
         s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// The console's input, opened as crossterm opens it: stdin may be something else.
+    fn console_input() -> Option<isize> {
+        use std::sync::OnceLock;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+        static INPUT: OnceLock<Option<isize>> = OnceLock::new();
+        *INPUT.get_or_init(|| {
+            let name = wide("CONIN$");
+            let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+            let access = GENERIC_READ | GENERIC_WRITE;
+            let handle = unsafe { CreateFileW(name.as_ptr(), access, share, null(), OPEN_EXISTING, 0, null_mut()) };
+            (handle != INVALID_HANDLE_VALUE).then_some(handle as isize)
+        })
+    }
+
+    /// What is down on the keyboard, whichever window has the focus.
+    fn held_on_the_keyboard() -> Held {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+        let down = |key: u16| (unsafe { GetAsyncKeyState(key as i32) } as u16) & 0x8000 != 0;
+        Held::of(down(VK_SHIFT), down(VK_CONTROL), down(VK_MENU))
+    }
+
+    /// Waits up to `timeout` for something to read on the console, and says what is held down
+    /// (see `Held`). Every key comes with the state of Shift, Ctrl and Alt, and one of those
+    /// pressed alone is a key too, which crossterm reads and drops: so this only looks. A key
+    /// let go of in another window (Alt+Tab) is never heard of here, so with `looking`, what
+    /// was down is asked of the keyboard. With no console, None.
+    pub fn wait_for_input(timeout: std::time::Duration, looking: bool) -> Option<Held> {
+        use windows_sys::Win32::System::Console::{
+            INPUT_RECORD, KEY_EVENT, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, PeekConsoleInputW, RIGHT_ALT_PRESSED,
+            RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
+        };
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let input = console_input()? as *mut std::ffi::c_void;
+        unsafe { WaitForSingleObject(input, timeout.as_millis().min(u32::MAX as u128) as u32) };
+        let mut records: [INPUT_RECORD; 16] = unsafe { std::mem::zeroed() };
+        let mut count = 0;
+        unsafe { PeekConsoleInputW(input, records.as_mut_ptr(), records.len() as u32, &mut count) };
+        let keys = records[..count as usize].iter().filter(|record| u32::from(record.EventType) == KEY_EVENT);
+        // The union holds a key: the filter says so.
+        let state = keys.last().map(|record| unsafe { record.Event.KeyEvent.dwControlKeyState });
+        Some(match state {
+            Some(state) => {
+                let (ctrl, alt) = (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED, LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED);
+                Held::of(state & SHIFT_PRESSED != 0, state & ctrl != 0, state & alt != 0)
+            }
+            None if looking => held_on_the_keyboard(),
+            None => Held::Nothing,
+        })
     }
 
     /// A path as a wide string for raw Windows calls, in the literal `\\?\` form when it is

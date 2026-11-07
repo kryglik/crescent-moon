@@ -11,6 +11,7 @@ mod finder;
 mod git;
 mod history;
 mod hotlist;
+mod keybar;
 mod lfs;
 mod lnk;
 mod mouse;
@@ -338,6 +339,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
     let mut woke = None;
     let mut dirty = true;
     let mut title = String::new();
+    let mut held = keybar::Watch::default();
     while !app.quit {
         // The window (or tab) title names the active panel's folder.
         let wanted = window_title(app);
@@ -362,7 +364,18 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             _ if app.wake_soon() => 100,
             _ => 500,
         });
-        if event::poll(timeout)? {
+        let timeout = if held.is_watching() { timeout.min(keybar::LOOK_EVERY) } else { timeout };
+        // Where the system tells of Shift, Ctrl and Alt held on their own, the bar follows.
+        let waited = match platform::wait_for_input(timeout, held.is_watching()) {
+            Some(down) => {
+                let shown = held.see(down, Instant::now());
+                dirty |= shown != app.held;
+                app.held = shown;
+                Duration::ZERO
+            }
+            None => timeout,
+        };
+        if event::poll(waited)? {
             woke = Some(Instant::now());
             // Handle everything already queued (fast typing, pastes, mouse moves) before drawing again.
             loop {

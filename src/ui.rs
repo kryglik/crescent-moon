@@ -29,8 +29,6 @@ use crate::platform::DriveInfo;
 use crate::subshell::Subshell;
 use crate::util;
 
-pub const KEYS: [&str; 10] =["Help", "Rename", "View", "Edit", "Copy", "Move", "Mkdir", "Delete", "Sort", "Quit"];
-
 /// A dialog's own colours: an error's, or a dialog's.
 fn dialog_base(t: &Scheme, error: bool) -> Style {
     if error { t.error } else { t.dialog }
@@ -98,7 +96,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         search_cursor = search_cursor.or(cursor);
     }
     let cmd_cursor = draw_cmdline(frame, cmd_area, app);
-    draw_keybar(frame.buffer_mut(), keys_area, t);
+    crate::keybar::draw(frame.buffer_mut(), keys_area, app.held, t);
 
     let mut find_cursor = None;
     if app.find_shown
@@ -788,21 +786,6 @@ fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
     Position::new(area.x + (prompt_w + cursor) as u16, area.y)
 }
 
-fn draw_keybar(buf: &mut Buffer, area: Rect, t: &Scheme) {
-    buf.set_style(area, t.command_line);
-    let slot = area.width / KEYS.len() as u16;
-    for (i, label) in KEYS.iter().enumerate() {
-        let x = area.x + slot * i as u16;
-        let w = if i == KEYS.len() - 1 { area.width - slot * i as u16 } else { slot } as usize;
-        let number = (i + 1).to_string();
-        if w <= number.len() {
-            continue;
-        }
-        buf.set_string(x, area.y, &number, t.on_bar(t.key_number));
-        buf.set_string(x + number.len() as u16, area.y, util::fit(label, w - number.len()), t.on_bar(t.key_label));
-    }
-}
-
 /// The help box's height, border included.
 fn help_height(area: Rect) -> u16 {
     (dialog::HELP.len() as u16 + 2).min(area.height.saturating_sub(2))
@@ -1387,7 +1370,7 @@ mod tests {
         assert!(screen.contains(" Příliš žluťoučký kůň.txt"));
         assert!(screen.contains("*run.bat"));
         assert!(screen.contains("UP--DIR"));
-        assert!(screen.contains("10Quit"));
+        assert!(screen.contains("▐F10▌Quit"));
     }
 
     /// In a repository: the branch and the counts on the bottom line (fewer words when

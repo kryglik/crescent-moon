@@ -9,7 +9,6 @@ use ratatui::layout::{Position, Rect};
 use crate::app::App;
 use crate::dialog::Dialog;
 use crate::panel::SortBy;
-use crate::ui;
 
 /// Windows' default double-click time.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
@@ -113,9 +112,9 @@ impl App {
         self.quicksearch = None;
         if self.hit.keybar.contains(pos) {
             if event.kind == MouseEventKind::Down(MouseButton::Left)
-                && let Some(n) = keybar_slot(self.hit.keybar, pos.x)
+                && let Some(key) = crate::keybar::key_at(self.hit.keybar, pos.x, self.held)
             {
-                self.on_key(KeyEvent::from(KeyCode::F(n)));
+                self.on_key(key);
             }
             return;
         }
@@ -329,18 +328,10 @@ impl App {
     }
 }
 
-/// Which function key (1-10) a click on the key bar hits.
-fn keybar_slot(bar: Rect, x: u16) -> Option<u8> {
-    let slot = bar.width / ui::KEYS.len() as u16;
-    if slot == 0 {
-        return None;
-    }
-    Some(((x - bar.x) / slot).min(ui::KEYS.len() as u16 - 1) as u8 + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui;
     use crate::testutil::TempDir;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

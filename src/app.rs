@@ -25,6 +25,7 @@ use crate::mouse::{HitAreas, LastClick};
 use crate::ops::remote;
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
+use crate::keybar::Held;
 use crate::panel::{Came, DirSize, Entry, Panel, RemoteView, SortBy};
 use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
@@ -349,6 +350,8 @@ pub struct App {
     pub scheme: Scheme,
     /// Keys typed for a folder that is on its way (see `on_key_on_the_way`).
     pub(crate) typed_ahead: VecDeque<KeyEvent>,
+    /// What is held down, which the key bar shows what it does.
+    pub held: Held,
 }
 
 impl App {
@@ -422,6 +425,7 @@ impl App {
             tab_index: [0, 0],
             scheme,
             typed_ahead: VecDeque::new(),
+            held: Held::Nothing,
         }
     }
 

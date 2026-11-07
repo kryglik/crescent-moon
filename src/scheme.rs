@@ -111,9 +111,9 @@ parts! {
     command_line,
     /// messages on the command line
     notice,
-    /// the F-key numbers
+    /// the keys on the bar at the bottom
     key_number,
-    /// the F-key labels
+    /// what they do
     key_label,
     /// the row of tabs
     tab_bar,
@@ -416,8 +416,8 @@ pub fn classic() -> Scheme {
         found_text: s().black().on_yellow(),
         command_line: s(),
         notice: s().yellow(),
-        key_number: s().white(),
-        key_label: s().black().on_cyan(),
+        key_number: s().black().on_cyan(),
+        key_label: s(),
         tab_bar: s().on_black(),
         tab: s().gray().on_dark_gray(),
         tab_shown: s().white().on_blue(),
@@ -484,8 +484,8 @@ fn classic_v2() -> Scheme {
         found_text: s().fg(BLACK).bg(LIGHT_CYAN),
         command_line: s(),
         notice: s().fg(GOLD),
-        key_number: s().fg(WHITE),
-        key_label: s().fg(BLACK).bg(CYAN),
+        key_number: s().fg(BLACK).bg(CYAN),
+        key_label: s().fg(WHITE),
         tab_bar: s().bg(BLACK),
         tab: s().fg(GRAY).bg(DARK_GRAY),
         tab_shown: s().fg(WHITE).bg(BLUE),
@@ -551,8 +551,8 @@ fn terminal() -> Scheme {
         found_text: s().black().on_yellow(),
         command_line: s(),
         notice: s().yellow(),
-        key_number: s(),
-        key_label: s().reversed(),
+        key_number: s().reversed(),
+        key_label: s(),
         tab_bar: s(),
         tab: s().dark_gray(),
         tab_shown: s().bold(),
@@ -589,7 +589,7 @@ pub fn mono() -> Scheme {
         found_file: s().bold(),
         found_text: s().reversed(),
         notice: s().bold(),
-        key_label: s().reversed(),
+        key_number: s().reversed(),
         tab_shown: s().underlined(),
         dialog_title: s().bold(),
         dialog_focus: s().reversed(),
@@ -604,15 +604,16 @@ pub fn mono() -> Scheme {
 struct Palette {
     /// Panels and the command line.
     bg: Color,
-    /// Dialogs, F-key labels, tabs.
+    /// Dialogs, tabs.
     raised: Color,
-    /// Text fields, the tab shown on the other side, the progress bar's track.
+    /// Text fields, the keys on the bottom bar, the tab shown on the other side, the progress
+    /// bar's track.
     field: Color,
     frame: Color,
     text: Color,
     /// Hints; hidden, ignored and leftover files; the other panel's path.
     faint: Color,
-    /// The branch, the F-key numbers, typed text.
+    /// The branch, the keys on the bottom bar, typed text.
     bright: Color,
     /// The cursor bar's text and background (the focus in dialogs too).
     cursor: (Color, Color),
@@ -671,8 +672,8 @@ fn from_palette(p: &Palette) -> Scheme {
         found_text: s().fg(p.bg).bg(p.marked),
         command_line: s().fg(p.text).bg(p.bg),
         notice: s().fg(p.yellow),
-        key_number: s().fg(p.bright),
-        key_label: s().fg(p.text).bg(p.field),
+        key_number: s().fg(p.bright).bg(p.field),
+        key_label: s().fg(p.text),
         tab_bar: s().bg(p.bg),
         tab: s().fg(p.faint).bg(p.raised),
         tab_shown: s().fg(p.bright).bg(p.field),

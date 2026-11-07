@@ -487,6 +487,7 @@ pub fn worktree_rows<'a>(worktrees: &'a [Worktree], filter: &str) -> Vec<&'a Wor
 
 pub const HELP: &[&str] = &[
     "  F12          every command, found by typing part of its name",
+    "  Hold Shift, Ctrl or Alt: the bottom bar shows its keys (Windows)",
     "",
     "Panels",
     "  Arrows, PgUp/PgDn, Home/End  move the cursor",
