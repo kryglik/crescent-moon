@@ -3,7 +3,8 @@
 ## crossterm
 
 `crossterm/` is crossterm 0.29.0 from crates.io (its `src`, licence and readme; the examples
-and their entries in `Cargo.toml` left out), with one change on top. The root `Cargo.toml`
+and their entries in `Cargo.toml` left out, and its compiler warnings turned off there, as cargo
+does for crates from crates.io), with one change on top. The root `Cargo.toml`
 puts it in place of the published crate with `[patch.crates-io]`.
 
 **The change:** Konsole's default keytab sends F1–F4 with Shift, Alt or Ctrl held as SS3 with

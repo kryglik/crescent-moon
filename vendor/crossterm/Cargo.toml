@@ -81,6 +81,10 @@ windows = [
 name = "crossterm"
 path = "src/lib.rs"
 
+# As for a crate from crates.io (cargo caps their lints): its warnings are not rmc's.
+[lints.rust]
+warnings = "allow"
+
 [dependencies.base64]
 version = "0.22"
 optional = true
