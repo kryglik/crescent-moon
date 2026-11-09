@@ -483,6 +483,7 @@ rmc shows the mono scheme.
 | `src/ui.rs` | drawing with ratatui |
 | `src/platform.rs` | OS bits: drives and mounts, free space, hidden files, opening files, shells and their start-up scripts |
 | `src/util.rs` | formatting, path resolution, wildcard matching, column fitting |
+| `vendor/crossterm` | crossterm 0.29.0 with a fix for Konsole's Alt+F1, Shift+F4 and the like (see `vendor/README.md`) |
 
 ## Testing in a real terminal
 
