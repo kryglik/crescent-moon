@@ -308,7 +308,9 @@ screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
   which changes folder and redraws the prompt in place, so nothing shows up as a command or in
   your history.
 - A command typed in rmc while the shell is busy is refused rather than typed into the running
-  program.
+  program. Text typed in the shell while a command ran keeps it busy too, as it waits at the
+  next prompt; keys the program read itself don't: htop's q, a password, what goes over ssh
+  (a program on the whole screen, or on Linux one that reads key by key or without echo).
 - `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.
 - `rmc` typed there (or in rmc's command line) doesn't start a second rmc inside the first: it
   says rmc is already running in this terminal, and Ctrl+O goes back to it. A tab or window

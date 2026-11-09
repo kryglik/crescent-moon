@@ -299,14 +299,56 @@ impl Subshell {
         self.typed_anything = true;
         // Text typed before the first prompt is read at that prompt, so it counts as prompt 1's.
         let prompt = self.report().map_or(1, |report| report.prompt.max(1));
+        let running = self.submitted_at == Some(prompt);
+        // Keys for the program that runs (htop's q, a password, a line typed over ssh) are
+        // its own: nothing of them is left for the next prompt.
+        if running && self.program_reads_keys() {
+            return;
+        }
         // Typed while a command runs (Enter was pressed at this prompt and no new one came):
         // it waits for the next prompt, whose line it then is. That prompt is not idle, or
         // the follow key (which presses Enter in bash) would run it.
-        let line_prompt = if self.submitted_at == Some(prompt) { prompt + 1 } else { prompt };
+        let line_prompt = if running { prompt + 1 } else { prompt };
         self.prompt_at_last_input = line_prompt;
         if bytes.contains(&b'\r') {
             self.submitted_at = Some(line_prompt);
         }
+    }
+
+    /// Whether the program the shell runs reads the keys itself, so that what is typed now is
+    /// its and doesn't wait for the next prompt: one on the whole screen (htop, less, vim), or
+    /// on Linux one in the foreground that turned off line editing or echo (less -X, ssh,
+    /// sudo's password, a REPL). Just after Enter the shell is still in the foreground, so a
+    /// command typed ahead of the next prompt still counts as typed ahead.
+    fn program_reads_keys(&self) -> bool {
+        self.with_screen(vt100::Screen::alternate_screen).unwrap_or(false) || self.foreground_reads_keys()
+    }
+
+    /// A program other than the shell in the pty's foreground, with the terminal in raw or
+    /// no-echo mode. What stays in cooked mode (make, sleep, cat) can leave typed text behind
+    /// for the shell, so it doesn't count. PowerShell leaves the programs it runs in its own
+    /// process group, so with it only the whole screen tells.
+    #[cfg(unix)]
+    fn foreground_reads_keys(&self) -> bool {
+        let (Some(foreground), Some(shell)) = (self.master.process_group_leader(), self.child.process_id()) else {
+            return false;
+        };
+        if i64::from(foreground) == i64::from(shell) {
+            return false;
+        }
+        let Some(fd) = self.master.as_raw_fd() else { return false };
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills the struct when it returns 0; it is read only then.
+        if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let flags = unsafe { termios.assume_init() }.c_lflag;
+        flags & libc::ICANON == 0 || flags & libc::ECHO == 0
+    }
+
+    #[cfg(not(unix))]
+    fn foreground_reads_keys(&self) -> bool {
+        false
     }
 
     /// Scrolls the view back (positive) or forward through the output.
@@ -701,6 +743,47 @@ mod tests {
         wait_for("idle again", || shell.is_idle());
         shell.send_text("exit\r");
         wait_for("exit", || shell.has_exited());
+    }
+
+    /// Keys a running program reads (htop's q, a password, what is typed over ssh) are its:
+    /// the prompt after it is idle. They used to count as typed ahead for that prompt, so
+    /// after quitting htop rmc refused the next command as "still busy".
+    #[cfg(unix)]
+    #[test]
+    fn keys_a_program_reads_are_not_typed_ahead() {
+        let Some(bash) = util::find_in_path("bash") else {
+            return eprintln!("no bash here; skipped");
+        };
+        // Each program says READY once it reads keys, and ends after one: as htop does, key
+        // by key without echo; and on the whole screen, as less and vim do, here a line.
+        let programs = [
+            ("raw", "sh -c 'stty -icanon -echo; echo READY-raw; head -c1 >/dev/null; stty sane'\r", "q"),
+            (
+                "full",
+                "sh -c 'printf \"\\033[?1049h\"; echo READY-full; head -n1 >/dev/null; printf \"\\033[?1049l\"'\r",
+                "q\r",
+            ),
+        ];
+        for (name, program, keys) in programs {
+            let tmp = TempDir::new("subshell-reads");
+            // Wide enough for the command line not to wrap: the word shows twice once it runs,
+            // or once on a whole screen of its own.
+            let mut shell = Subshell::start(&Shell::Posix(bash.clone()), tmp.path(), 30, 250).unwrap();
+            wait_for("the first prompt", || shell.report().is_some());
+            let first = shell.report().unwrap().prompt;
+            shell.send_text(program);
+            let ready = format!("READY-{name}");
+            let started = |screen: &vt100::Screen| {
+                let seen = screen.contents().matches(&ready).count();
+                seen >= 2 || (seen == 1 && screen.alternate_screen())
+            };
+            wait_for(&format!("{name}: the program"), || shell.with_screen(started).unwrap_or(false));
+            shell.send_text(keys);
+            wait_for(&format!("{name}: the prompt after it"), || shell.report().is_some_and(|r| r.prompt > first));
+            assert!(shell.is_idle(), "{name}: the program read the keys, nothing waits at the prompt");
+            shell.send_text("exit\r");
+            wait_for("exit", || shell.has_exited());
+        }
     }
 
     /// cmd (and sh, fish) don't report their prompts: rmc can't see when a command ends,
