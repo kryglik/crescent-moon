@@ -417,7 +417,7 @@ const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 const ALT: KeyModifiers = KeyModifiers::ALT;
 
-/// F12: everything rmc does, for finding a command (and learning its key) by typing.
+/// F12: everything cm does, for finding a command (and learning its key) by typing.
 pub const COMMANDS: &[Command] = &[
     command("Keys: all of them (help)", "F1", KeyCode::F(1), NONE),
     command("Rename", "F2", KeyCode::F(2), NONE),
@@ -601,7 +601,7 @@ pub const HELP: &[&str] = &[
     "  right-click  mark         wheel         scroll",
     "  click Name / Size / Modify time to sort (again: flip the order)",
     "  click the F-key labels to run them",
-    "  Shift+drag selects text; rmc --no-mouse leaves the mouse alone",
+    "  Shift+drag selects text; cm --no-mouse leaves the mouse alone",
     "",
     "Command line",
     "  Type a command, Enter runs it in the shell, in the panel's folder",
@@ -630,8 +630,8 @@ pub const HELP: &[&str] = &[
     "  F10          quit",
     "",
     "Editor, viewer, pager, shell: Ctrl+P, or when empty there",
-    "  RMC_EDITOR, RMC_VIEWER, RMC_PAGER, RMC_SHELL (nvim, less, pwsh)",
-    "Shell: RMC_SHELL (pwsh, then powershell, then cmd; on Linux $SHELL)",
+    "  CM_EDITOR, CM_VIEWER, CM_PAGER, CM_SHELL (nvim, less, pwsh)",
+    "Shell: CM_SHELL (pwsh, then powershell, then cmd; on Linux $SHELL)",
 ];
 
 #[cfg(test)]

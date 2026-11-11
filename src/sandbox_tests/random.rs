@@ -5,8 +5,8 @@
 //! and an unpack, then a delete, and holds the whole disk to what must be true whatever the job
 //! did: nothing lost, nothing outside touched, nothing left behind, nothing silently skipped.
 //!
-//! A failure names its seed, which replays it: `RMC_SEED=<seed> RMC_ROUNDS=1 cargo test random_`.
-//! For a long run, `RMC_ROUNDS=2000`.
+//! A failure names its seed, which replays it: `CM_SEED=<seed> CM_ROUNDS=1 cargo test random_`.
+//! For a long run, `CM_ROUNDS=2000`.
 
 use std::path::MAIN_SEPARATOR;
 use std::sync::atomic::Ordering;
@@ -719,7 +719,7 @@ fn number(name: &str, default: u64) -> u64 {
 
 #[test]
 fn random_trees_lose_nothing() {
-    let (first, rounds) = (number("RMC_SEED", 1), number("RMC_ROUNDS", 4));
+    let (first, rounds) = (number("CM_SEED", 1), number("CM_ROUNDS", 4));
     let mut counts = Counts::default();
     for seed in first..first + rounds {
         round(seed, &mut counts);
@@ -734,7 +734,7 @@ fn random_trees_lose_nothing() {
 
 #[test]
 fn random_trees_lose_nothing_over_ssh() {
-    let (first, rounds) = (number("RMC_SEED", 1), number("RMC_ROUNDS", 4));
+    let (first, rounds) = (number("CM_SEED", 1), number("CM_ROUNDS", 4));
     let mut counts = Counts::default();
     for seed in first..first + rounds {
         round_over_ssh(seed, &mut counts);

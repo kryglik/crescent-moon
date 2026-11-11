@@ -1,8 +1,12 @@
 [package]
-name = "rmc"
+name = "crescent-moon"
 version = "0.1.0"
 edition = "2024"
-description = "A small Midnight Commander-style two-panel file manager for the terminal"
+description = "Crescent Moon: a small Midnight Commander-style two-panel file manager for the terminal"
+
+[[bin]]
+name = "cm"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30"

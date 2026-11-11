@@ -1,9 +1,9 @@
-# Link the C runtime statically so rmc.exe runs on PCs without the VC++ redistributable.
+# Link the C runtime statically so cm.exe runs on PCs without the VC++ redistributable.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 # Built on Ubuntu 24.04, the binary asks for glibc 2.39 only for these two functions, which Rust's
-# std looks up optionally and rmc never reaches. Older systems run it anyway, but print "weak
+# std looks up optionally and cm never reaches. Older systems run it anyway, but print "weak
 # version `GLIBC_2.39' not found" at every start. Settling them as absent here ends that, so one
 # build runs cleanly from glibc 2.34 up.
 [target.x86_64-unknown-linux-gnu]

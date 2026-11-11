@@ -1,6 +1,6 @@
-//! The persistent shell behind Ctrl+O. It runs in a pseudo-console (ConPTY) that rmc owns, so
+//! The persistent shell behind Ctrl+O. It runs in a pseudo-console (ConPTY) that cm owns, so
 //! it lives on while the panels are shown: variables stay, and a long command keeps running.
-//! rmc keeps a copy of its screen (vt100) and draws it; keys typed while it is shown go to it.
+//! cm keeps a copy of its screen (vt100) and draws it; keys typed while it is shown go to it.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -23,7 +23,7 @@ use crate::util;
 const SCROLLBACK: usize = 5000;
 
 /// Questions the pseudo-console asks its terminal. ConPTY waits for the answer to "where is the
-/// cursor?" (`ESC[6n`) before it runs anything, so rmc has to reply like a real terminal.
+/// cursor?" (`ESC[6n`) before it runs anything, so cm has to reply like a real terminal.
 #[derive(Default)]
 struct Queries {
     cursor_position: bool,
@@ -43,14 +43,14 @@ impl vt100::Callbacks for Queries {
 
 type Screen = vt100::Parser<Queries>;
 
-/// The shell's debug log, written when `RMC_LOG` names a file: what goes in and out of the
+/// The shell's debug log, written when `CM_LOG` names a file: what goes in and out of the
 /// pseudo-console, so a shell that gets stuck can be diagnosed.
 #[derive(Clone, Default)]
 pub struct Log(Option<Arc<Mutex<fs::File>>>);
 
 impl Log {
     fn from_env() -> Self {
-        let file = std::env::var_os("RMC_LOG")
+        let file = std::env::var_os("CM_LOG")
             .and_then(|path| fs::OpenOptions::new().create(true).append(true).open(path).ok());
         Log(file.map(|f| Arc::new(Mutex::new(f))))
     }
@@ -122,7 +122,7 @@ fn pump_output(
 }
 
 /// Writes keys and replies to the shell on a thread of its own, so a shell that stops
-/// reading its input can never freeze rmc.
+/// reading its input can never freeze cm.
 fn pump_input(mut writer: Box<dyn Write + Send>, chunks: mpsc::Receiver<Vec<u8>>, log: Log) {
     for chunk in chunks {
         if let Err(e) = writer.write_all(&chunk).and_then(|()| writer.flush()) {
@@ -143,19 +143,19 @@ pub struct Subshell {
     size: (u16, u16),
     /// Where the shell's prompt reports `<number>|<f or ->|<folder>` (see `PWSH_SHELL_INIT`).
     report_file: PathBuf,
-    /// Where rmc puts the folder for the shell's follow key.
+    /// Where cm puts the folder for the shell's follow key.
     request_file: PathBuf,
     /// A folder of this shell's own (private, with a name nobody can guess): the two files
-    /// above and rmc's start-up files for bash and zsh.
+    /// above and cm's start-up files for bash and zsh.
     init_dir: PathBuf,
-    /// The prompt number at which the line rmc last typed will be read. A later prompt means
+    /// The prompt number at which the line cm last typed will be read. A later prompt means
     /// the shell is idle: that line has run and the new prompt's line is empty.
     prompt_at_last_input: u64,
-    /// The prompt at which rmc last pressed Enter: until the next prompt, a command runs, and
+    /// The prompt at which cm last pressed Enter: until the next prompt, a command runs, and
     /// anything typed meanwhile waits for the prompt after it.
     submitted_at: Option<u64>,
     typed_anything: bool,
-    /// The shell it runs, for quoting and the lines rmc types into it (the options may name
+    /// The shell it runs, for quoting and the lines cm types into it (the options may name
     /// another one meanwhile).
     shell: Shell,
     /// Whether the shell's prompt writes `report_file` (PowerShell, bash, zsh).
@@ -163,7 +163,7 @@ pub struct Subshell {
     /// The shell's folder when it was last shown; if it has moved by the time the panels come
     /// back, the panel follows.
     pub cwd_when_shown: Option<PathBuf>,
-    /// The report (prompt number, folder) from before rmc last pressed the follow key. Until a
+    /// The report (prompt number, folder) from before cm last pressed the follow key. Until a
     /// newer one comes, or if the shell couldn't go there, it hasn't moved by itself.
     followed_from: Option<(u64, PathBuf)>,
 }
@@ -186,8 +186,8 @@ impl Subshell {
             command.env(key, value);
         }
         // Ctrl+O exits only the one-off shell of the fallback, never this one.
-        command.env_remove("RMC_ONE_OFF");
-        // What rmc's screen copy (vt100) understands; without it readline and zle fall back
+        command.env_remove("CM_ONE_OFF");
+        // What cm's screen copy (vt100) understands; without it readline and zle fall back
         // to a dumb terminal. ConPTY on Windows ignores it.
         if cfg!(unix) {
             command.env("TERM", "xterm-256color");
@@ -198,13 +198,13 @@ impl Subshell {
         match (shell, util::home_dir()) {
             (Shell::PowerShell(_), Some(home)) if cfg!(windows) => {
                 command.cwd(home);
-                command.env("RMC_START_DIR", cwd);
+                command.env("CM_START_DIR", cwd);
             }
             _ => command.cwd(cwd),
         }
-        command.env("RMC_CWD_FILE", &report_file);
-        command.env("RMC_REQUEST_FILE", &request_file);
-        command.env(crate::platform::RMC_PID, std::process::id().to_string());
+        command.env("CM_CWD_FILE", &report_file);
+        command.env("CM_REQUEST_FILE", &request_file);
+        command.env(crate::platform::CM_PID, std::process::id().to_string());
         let child = pair.slave.spawn_command(command).map_err(|e| error(&e))?;
         log.write(&format!("spawned pid {:?}, report file {}", child.process_id(), report_file.display()));
         drop(pair.slave);
@@ -382,9 +382,9 @@ impl Subshell {
         platform::parse_cwd_report_bytes(&fs::read(&self.report_file).ok()?)
     }
 
-    /// Waiting at an empty prompt: a prompt has appeared since rmc last typed anything.
+    /// Waiting at an empty prompt: a prompt has appeared since cm last typed anything.
     /// A shell that hasn't shown its first prompt yet counts as idle until something is typed.
-    /// A shell that never reports (cmd, bash) always counts as idle: rmc can't tell, and
+    /// A shell that never reports (cmd, bash) always counts as idle: cm can't tell, and
     /// refusing every command after the first would be worse than typing into a busy one.
     pub fn is_idle(&self) -> bool {
         match self.report() {
@@ -394,7 +394,7 @@ impl Subshell {
     }
 
     /// Before the shell is shown: if it sits idle in another folder than the panel's, move it
-    /// there, as mc does with its subshell. That is silent: rmc writes the folder to the request
+    /// there, as mc does with its subshell. That is silent: cm writes the folder to the request
     /// file and presses the follow key, and the shell changes folder and redraws its prompt in
     /// place. (Without the key, e.g. PowerShell without PSReadLine or bash before 4.4, a visible
     /// `cd` is typed instead.) Shells that don't report their folder are left alone.
@@ -603,7 +603,7 @@ mod tests {
     }
 
     /// The shell starts in the panel's folder without holding it: on Windows the folder a
-    /// process started in can't be renamed or deleted while it runs, even from rmc.
+    /// process started in can't be renamed or deleted while it runs, even from cm.
     #[test]
     fn the_shell_doesnt_hold_the_folder_it_started_in() {
         let shell_kind = Shell::detect();
@@ -634,21 +634,21 @@ mod tests {
         assert!(shell.is_idle(), "a new shell is ready for typing");
 
         // A command typed into it runs and its output shows on the screen.
-        shell.send_text("$rmcTest = 6 * 7; \"answer=$rmcTest\"\r");
+        shell.send_text("$cmTest = 6 * 7; \"answer=$cmTest\"\r");
         wait_for("the command's output", || screen_text(&shell).contains("answer=42"));
         wait_for("the next prompt", || shell.is_idle());
 
-        // rmc moves it to the panel's folder silently (no command line); the variable survives.
+        // cm moves it to the panel's folder silently (no command line); the variable survives.
         assert!(shell.report().is_some_and(|r| r.can_follow), "PSReadLine's follow key is there");
         shell.follow_panel(&other);
         wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
         wait_for("the redrawn prompt", || screen_text(&shell).contains("Účty>"));
         let screen = screen_text(&shell);
-        assert!(!screen.contains("Set-Location") && !screen.contains("__rmc"), "no visible cd:\n{screen}");
+        assert!(!screen.contains("Set-Location") && !screen.contains("__cm"), "no visible cd:\n{screen}");
         assert_eq!(screen.matches("PS ").count(), 2, "the prompt is redrawn in place:\n{screen}");
         assert!(shell.is_idle(), "still idle after the silent cd");
-        assert_eq!(shell.moved_to(), None, "rmc's own cd doesn't count as the user moving");
-        shell.send_text("\"still=$rmcTest\"; cd ..\r");
+        assert_eq!(shell.moved_to(), None, "cm's own cd doesn't count as the user moving");
+        shell.send_text("\"still=$cmTest\"; cd ..\r");
         wait_for("the variable", || screen_text(&shell).contains("still=42"));
         wait_for("the user's cd", || shell.moved_to().is_some_and(|dir| util::same_path(&dir, tmp.path())));
 
@@ -656,7 +656,7 @@ mod tests {
         wait_for("exit", || shell.has_exited());
     }
 
-    /// bash and zsh, with rmc's start-up files: the same as the PowerShell test above.
+    /// bash and zsh, with cm's start-up files: the same as the PowerShell test above.
     #[cfg(unix)]
     fn posix_shell_keeps_its_state_and_follows_the_panel(program: &str, set_prompt: &str) {
         let shell_kind = Shell::Posix(program.into());
@@ -675,10 +675,10 @@ mod tests {
         wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
         wait_for("the redrawn prompt", || screen_text(&shell).contains("[Účty]> "));
         let screen = screen_text(&shell);
-        assert!(!screen.contains("cd --") && !screen.contains("__rmc"), "no visible cd:\n{screen}");
+        assert!(!screen.contains("cd --") && !screen.contains("__cm"), "no visible cd:\n{screen}");
         assert_eq!(screen.matches("]> ").count(), 1, "the prompt is redrawn in place:\n{screen}");
         assert!(shell.is_idle(), "still idle after the silent cd");
-        assert_eq!(shell.moved_to(), None, "rmc's own cd doesn't count as the user moving");
+        assert_eq!(shell.moved_to(), None, "cm's own cd doesn't count as the user moving");
 
         shell.send_text("echo still=$x; cd ..\r");
         wait_for("the variable", || screen_text(&shell).contains("still=42"));
@@ -698,16 +698,16 @@ mod tests {
         posix_shell_keeps_its_state_and_follows_the_panel(&bash.to_string_lossy(), r"PS1='[\W]''> '");
     }
 
-    /// RMC_TEST_ZSH can point at a zsh that isn't on the PATH.
+    /// CM_TEST_ZSH can point at a zsh that isn't on the PATH.
     #[cfg(unix)]
     #[test]
     fn zsh_keeps_its_state_and_follows_the_panel() {
-        let zsh = std::env::var_os("RMC_TEST_ZSH").map(PathBuf::from).or_else(|| util::find_in_path("zsh"));
+        let zsh = std::env::var_os("CM_TEST_ZSH").map(PathBuf::from).or_else(|| util::find_in_path("zsh"));
         let Some(zsh) = zsh else {
             eprintln!("no zsh here; skipped");
             return;
         };
-        // The binary may be called zsh-static; rmc goes by the name, so give it a zsh one.
+        // The binary may be called zsh-static; cm goes by the name, so give it a zsh one.
         let tmp = TempDir::new("zsh-link");
         let link = tmp.path().join("zsh");
         std::os::unix::fs::symlink(&zsh, &link).unwrap();
@@ -715,7 +715,7 @@ mod tests {
     }
 
     /// Text typed while a command runs waits at the next prompt: that prompt isn't idle, so
-    /// rmc neither types a command after it nor presses the follow key (bash's ends in Enter,
+    /// cm neither types a command after it nor presses the follow key (bash's ends in Enter,
     /// which would run the text).
     #[test]
     fn text_typed_ahead_keeps_the_shell_busy() {
@@ -747,7 +747,7 @@ mod tests {
 
     /// Keys a running program reads (htop's q, a password, what is typed over ssh) are its:
     /// the prompt after it is idle. They used to count as typed ahead for that prompt, so
-    /// after quitting htop rmc refused the next command as "still busy".
+    /// after quitting htop cm refused the next command as "still busy".
     #[cfg(unix)]
     #[test]
     fn keys_a_program_reads_are_not_typed_ahead() {
@@ -786,7 +786,7 @@ mod tests {
         }
     }
 
-    /// cmd (and sh, fish) don't report their prompts: rmc can't see when a command ends,
+    /// cmd (and sh, fish) don't report their prompts: cm can't see when a command ends,
     /// so it must not refuse the second command as "still busy".
     #[test]
     fn a_shell_without_prompt_reports_takes_one_command_after_another() {

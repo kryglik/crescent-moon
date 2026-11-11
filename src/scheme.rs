@@ -1,7 +1,7 @@
 //! Colour schemes: the look (colours, bold, dim…) of every part of the screen.
 //!
 //! The built-in schemes are below. The user's own are `*.ini` files in the `schemes` folder
-//! beside the settings (`%APPDATA%\rmc\schemes`, `~/.config/rmc/schemes`), one
+//! beside the settings (`%APPDATA%\crescent-moon\schemes`, `~/.config/crescent-moon/schemes`), one
 //! `part = colour [on colour] [bold]…` per line, on top of a built-in scheme (`base`) or
 //! classic; a file named like a built-in scheme takes its place. Alt+C lists them all and
 //! shows each on the whole screen; F4 there writes a built-in one out as a file to change.
@@ -382,7 +382,7 @@ const fn rgb(value: u32) -> Color {
     Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
 }
 
-/// mc's blue panels, rmc's own look from the start.
+/// mc's blue panels, cm's own look from the start.
 pub fn classic() -> Scheme {
     let s = Style::new;
     Scheme {
@@ -1164,8 +1164,8 @@ const GROUPS: &[(&str, &str)] = &[
 /// A scheme file for `choice`, every part spelled out, on top of the built-in one of that name.
 pub fn file_text(choice: &Choice) -> String {
     let mut text = format!(
-        "# rmc colour scheme \"{name}\". Alt+C in rmc picks a scheme and shows it on the whole\n\
-         # screen; F4 there opens this file, which rmc reads again when the editor closes.\n\
+        "# cm colour scheme \"{name}\". Alt+C in cm picks a scheme and shows it on the whole\n\
+         # screen; F4 there opens this file, which cm reads again when the editor closes.\n\
          #\n\
          # Each line gives a part of the screen its look:\n\
          #     part = colour [on colour] [bold] [dim] [italic] [underline] [reverse]\n\

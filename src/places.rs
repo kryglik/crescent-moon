@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use crate::git::Repo;
 use crate::util;
 
-/// What the file says first, when rmc makes it.
+/// What the file says first, when cm makes it.
 const HEADER: &str = "\
-; rmc's places in git repositories: Ctrl+E lists them for the repository the panel is in.
+; cm's places in git repositories: Ctrl+E lists them for the repository the panel is in.
 ; A section per repository: the address of its remote (origin), or where it is when it has
 ; none. A place is `key = label | path`, the path from the top of the repository with /, the
 ; same in all its worktrees. A path to a file puts the cursor on it, so F4 edits it.
@@ -106,7 +106,7 @@ fn remote_address(config: &str) -> Option<String> {
     first
 }
 
-/// `places.ini`, as lines of text: rmc changes it a line at a time, so what the user wrote in it
+/// `places.ini`, as lines of text: cm changes it a line at a time, so what the user wrote in it
 /// stays as it was.
 pub struct File {
     path: Option<PathBuf>,
@@ -114,7 +114,8 @@ pub struct File {
 }
 
 impl File {
-    /// `%APPDATA%\rmc\places.ini` on Windows, `~/.config/rmc/places.ini` elsewhere.
+    /// `%APPDATA%\crescent-moon\places.ini` on Windows, `~/.config/crescent-moon/places.ini`
+    /// elsewhere.
     pub fn default_path() -> Option<PathBuf> {
         util::config_dir().map(|dir| dir.join("places.ini"))
     }
@@ -203,7 +204,7 @@ impl File {
 
     /// For F4: the file, with a section for `repo` in it, and the line (from 1) where that is.
     pub fn for_editing(&mut self, repo: &str) -> io::Result<(PathBuf, u64)> {
-        let Some(path) = self.path.clone() else { return Err(io::Error::other("rmc has no folder for its settings here")) };
+        let Some(path) = self.path.clone() else { return Err(io::Error::other("cm has no folder for its settings here")) };
         if self.section(repo).is_none() {
             self.start_section(repo);
             self.save()?;
@@ -443,7 +444,7 @@ pub(crate) mod tests {
         assert_eq!(fresh.add("other", "docs", "docs", &[]), Some('1'));
         fresh.save().unwrap();
         let text = fs::read_to_string(tmp.path().join("new.ini")).unwrap();
-        assert!(text.starts_with("; rmc's places") && text.ends_with("\n[other]\n1 = docs | docs\n"), "{text}");
+        assert!(text.starts_with("; cm's places") && text.ends_with("\n[other]\n1 = docs | docs\n"), "{text}");
     }
 
     #[test]

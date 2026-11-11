@@ -252,9 +252,9 @@ pub mod tests {
     #[test]
     fn environment_variables_are_filled_in() {
         // SAFETY: tests that read this variable don't run concurrently with one changing it.
-        unsafe { std::env::set_var("RMC_LNK_TEST", r"C:\Users\x") };
-        assert_eq!(expand_environment(r"%RMC_LNK_TEST%\Documents"), r"C:\Users\x\Documents");
-        assert_eq!(expand_environment(r"%RMC_NO_SUCH_VARIABLE%\a"), r"%RMC_NO_SUCH_VARIABLE%\a");
+        unsafe { std::env::set_var("CM_LNK_TEST", r"C:\Users\x") };
+        assert_eq!(expand_environment(r"%CM_LNK_TEST%\Documents"), r"C:\Users\x\Documents");
+        assert_eq!(expand_environment(r"%CM_NO_SUCH_VARIABLE%\a"), r"%CM_NO_SUCH_VARIABLE%\a");
         assert_eq!(expand_environment("100% sure"), "100% sure");
     }
 }

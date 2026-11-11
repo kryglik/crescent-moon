@@ -202,7 +202,7 @@ impl Place {
             #[cfg(unix)]
             Place::Here(path) => Ok(fs::read_link(path)?.to_string_lossy().into_owned()),
             #[cfg(not(unix))]
-            Place::Here(_) => Err(io::Error::other("rmc reads links on Linux only")),
+            Place::Here(_) => Err(io::Error::other("cm reads links on Linux only")),
             Place::There(connection, path) => connection.sftp.read_link(path),
         }
     }
@@ -212,7 +212,7 @@ impl Place {
             #[cfg(unix)]
             Place::Here(path) => std::os::unix::fs::symlink(target, path),
             #[cfg(not(unix))]
-            Place::Here(_) => Err(io::Error::other("rmc makes links on Linux only")),
+            Place::Here(_) => Err(io::Error::other("cm makes links on Linux only")),
             Place::There(connection, path) => connection.sftp.symlink(target, path),
         }
     }
@@ -1360,7 +1360,7 @@ mod tests {
         assert_eq!(tree(&two.on_server("to")), ["one.txt", "sub", "sub/three.txt", "sub/two.txt"]);
     }
 
-    /// F5 on one computer goes through rmc, and arrives.
+    /// F5 on one computer goes through cm, and arrives.
     #[test]
     fn a_copy_over_there() {
         let Some(two) = Two::new("remote-copy-there") else { return };

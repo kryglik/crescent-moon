@@ -1,4 +1,4 @@
-//! What rmc remembers between sessions, in `history.txt` next to the hotlist: the folders
+//! What cm remembers between sessions, in `history.txt` next to the hotlist: the folders
 //! the panels visited (Alt+H lists them) and the commands typed (Alt+P / Alt+N); and in
 //! `inputs.txt` what was typed into the fields of dialogs.
 
@@ -19,7 +19,7 @@ pub struct History {
     pub dirs: Vec<PathBuf>,
     /// Oldest first, as typed.
     pub commands: Vec<String>,
-    /// Commands run here since the last save: another rmc window may have saved its own
+    /// Commands run here since the last save: another cm window may have saved its own
     /// meanwhile, and these go after them.
     unsaved: Vec<String>,
     /// Folders forgotten here (Delete in Alt+H), which what is on disk mustn't bring back.
@@ -29,7 +29,8 @@ pub struct History {
 }
 
 impl History {
-    /// `%APPDATA%\rmc\history.txt` on Windows, `~/.config/rmc/history.txt` elsewhere.
+    /// `%APPDATA%\crescent-moon\history.txt` on Windows, `~/.config/crescent-moon/history.txt`
+    /// elsewhere.
     pub fn default_file() -> Option<PathBuf> {
         util::config_dir().map(|dir| dir.join("history.txt"))
     }
@@ -56,7 +57,7 @@ impl History {
         history
     }
 
-    /// Saves the history together with what other rmc windows saved meanwhile: their
+    /// Saves the history together with what other cm windows saved meanwhile: their
     /// folders after this window's, their commands before the ones run here since the last
     /// save. (This window's own lists stay as they are until it starts again.)
     pub fn save(&mut self) -> io::Result<()> {
@@ -137,7 +138,7 @@ impl History {
 }
 
 /// What was typed into the fields of dialogs, a list for each kind of field
-/// (`InputAction::kind`). In a file of its own: an older rmc still open in another window
+/// (`InputAction::kind`). In a file of its own: an older cm still open in another window
 /// would take sections of `history.txt` it doesn't know for commands.
 #[derive(Default)]
 pub struct Inputs {
@@ -303,7 +304,7 @@ mod tests {
         assert_eq!(History::load(Some(file)).dirs, [PathBuf::from("/keep")]);
     }
 
-    /// Two rmc windows open at once: each one's save keeps what the other saved.
+    /// Two cm windows open at once: each one's save keeps what the other saved.
     #[test]
     fn two_windows_keep_each_others_history() {
         let tmp = TempDir::new("history-two");

@@ -44,7 +44,7 @@ impl TempDir {
     fn under(base: &Path, tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("rmc-{tag}-{}-{n}", std::process::id()));
+        let dir = base.join(format!("cm-{tag}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         TempDir(dir)

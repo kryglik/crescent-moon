@@ -1,4 +1,4 @@
-# Sends key presses into the console of a running process (for testing rmc's real main loop).
+# Sends key presses into the console of a running process (for testing cm's real main loop).
 # Usage: sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:hello', 'enter', 'esc', 'alt+f1', 'shift+f4' ...
 # From another script (pwsh -File), pass the keys as separate words after the process id:
 #   pwsh -File sendkey.ps1 -ProcessId <pid> home down f2

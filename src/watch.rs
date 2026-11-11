@@ -53,7 +53,7 @@ impl Watch {
         self.handle.is_some()
     }
 
-    /// Drops the changes seen so far (ones rmc's own `git status` made, say).
+    /// Drops the changes seen so far (ones cm's own `git status` made, say).
     pub fn forget(&mut self) {
         self.take_handle();
         if let Some(handle) = self.handle.as_mut() {

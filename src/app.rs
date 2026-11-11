@@ -48,7 +48,7 @@ const FIND_FILES: &str = "find-files";
 const VIEWER_STAYS: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 0 } else { 3 });
 
 /// What happens to a file taken out of an archive, or fetched from another computer, into
-/// rmc's temp folder once it is there.
+/// cm's temp folder once it is there.
 enum AfterJob {
     /// Enter: opened in its app; a zip in the zip opens in the panel, called `shown`.
     Open { shown: PathBuf },
@@ -70,7 +70,7 @@ pub struct EditedCopy {
     /// The file over there as it was fetched, to see if it changed meanwhile.
     there: Attrs,
     since: Instant,
-    /// A copy kept where it outlives rmc, while it isn't sure yours goes back.
+    /// A copy kept where it outlives cm, while it isn't sure yours goes back.
     rescued: Option<PathBuf>,
 }
 
@@ -153,14 +153,14 @@ impl Config {
     }
 
     /// Commands come from the settings, or when those are empty from the environment
-    /// (RMC_EDITOR…), or from what is installed.
+    /// (CM_EDITOR…), or from what is installed.
     pub fn new(settings: Settings, hotlist_file: Option<PathBuf>, settings_file: Option<PathBuf>) -> Self {
         let auto = Automatic::detect();
         let chosen = |value: &str| (!value.trim().is_empty()).then(|| parse_command(value));
         let editor = chosen(&settings.editor).unwrap_or(auto.editor);
-        // RMC_VIEWER counts when the option is empty; otherwise the editor, read-only.
+        // CM_VIEWER counts when the option is empty; otherwise the editor, read-only.
         let viewer = chosen(&settings.viewer)
-            .or_else(|| env_command(&["RMC_VIEWER"]))
+            .or_else(|| env_command(&["CM_VIEWER"]))
             .unwrap_or_else(|| viewer_for(&editor));
         let pager = chosen(&settings.pager).or(auto.pager);
         let shell = if settings.shell.trim().is_empty() { auto.shell } else { Shell::from_program(settings.shell.trim()) };
@@ -181,7 +181,7 @@ impl Config {
     }
 }
 
-/// What rmc uses when a setting is empty: the environment, or what is installed.
+/// What cm uses when a setting is empty: the environment, or what is installed.
 pub struct Automatic {
     pub editor: Vec<String>,
     pub viewer: Vec<String>,
@@ -191,9 +191,9 @@ pub struct Automatic {
 
 impl Automatic {
     pub fn detect() -> Self {
-        let editor = env_command(&["RMC_EDITOR", "VISUAL", "EDITOR"]).unwrap_or_else(|| vec![default_editor()]);
-        let viewer = env_command(&["RMC_VIEWER"]).unwrap_or_else(|| viewer_for(&editor));
-        let pager = env_command(&["RMC_PAGER", "PAGER"]).or_else(default_pager);
+        let editor = env_command(&["CM_EDITOR", "VISUAL", "EDITOR"]).unwrap_or_else(|| vec![default_editor()]);
+        let viewer = env_command(&["CM_VIEWER"]).unwrap_or_else(|| viewer_for(&editor));
+        let pager = env_command(&["CM_PAGER", "PAGER"]).or_else(default_pager);
         Automatic { editor, viewer, pager, shell: Shell::detect() }
     }
 }
@@ -274,7 +274,7 @@ pub struct App {
     pub external: Option<External>,
     /// A built-in scheme F4 has just written out as a file, and the text written. If the file
     /// is still only that when the editor closes, it goes again: a look mustn't leave a copy
-    /// that pins the scheme, as the built-in one keeps getting rmc's updates.
+    /// that pins the scheme, as the built-in one keeps getting cm's updates.
     scheme_file_written: Option<(PathBuf, String)>,
     /// The folder of a file taken out of an archive for the viewer, removed when it closes.
     viewed_copy: Option<(PathBuf, Instant)>,
@@ -310,7 +310,7 @@ pub struct App {
     pub(crate) closing_click: Option<(Instant, ratatui::layout::Position)>,
     /// The "how to get back" line has been shown for the one-off Ctrl+O shell.
     pub shell_hint_shown: bool,
-    /// The persistent shell, started by the first Ctrl+O (or command typed in rmc).
+    /// The persistent shell, started by the first Ctrl+O (or command typed in cm).
     pub subshell: Option<Subshell>,
     /// The shell is on screen instead of the panels; keys go to it.
     pub shell_shown: bool,
@@ -1165,7 +1165,7 @@ impl App {
     }
 
     /// Ctrl+O: shows the shell, moved to the panel's folder if it is idle somewhere else.
-    /// If the shell can't run inside rmc, a one-off shell takes over the console instead.
+    /// If the shell can't run inside cm, a one-off shell takes over the console instead.
     fn show_shell(&mut self) {
         if self.ensure_subshell().is_err() {
             self.external = Some(External::Shell);
@@ -1345,7 +1345,7 @@ impl App {
         if shell_busy {
             lines.push("The shell is still busy; quitting ends what runs in it.".to_string());
         }
-        lines.push("Quit rmc?".into());
+        lines.push("Quit cm?".into());
         self.dialog = Some(Dialog::Confirm { title: "Quit".into(), lines, focus: 0, danger: shell_busy, action: ConfirmAction::Quit });
     }
 
@@ -1759,7 +1759,7 @@ impl App {
             return;
         }
         // A password in an address is refused, and isn't kept either, as nothing that isn't
-        // an address rmc can read is: what looks like a path may hold one too.
+        // an address cm can read is: what looks like a path may hold one too.
         if ssh::parse_typed(&text).is_ok() {
             self.history.inputs.add(action.kind(), text.trim());
             self.history_changed = true;
@@ -2052,7 +2052,7 @@ impl App {
                 changed |= previewer.tick();
             }
         }
-        // Now and then rather than only on exit: closing the window ends rmc without one.
+        // Now and then rather than only on exit: closing the window ends cm without one.
         if self.history_changed && self.history_saved.elapsed() > std::time::Duration::from_secs(5) {
             self.save_history();
         }
@@ -2249,7 +2249,7 @@ impl App {
         // F4 in the scheme list: the file edited counts at once (one left as it was goes).
         self.reload_schemes();
         // A file taken out of an archive to look at: looked at. A viewer back at once went on
-        // by itself (gvim, code) and still needs the copy, which then goes when rmc ends.
+        // by itself (gvim, code) and still needs the copy, which then goes when cm ends.
         if let Some((copy, since)) = self.viewed_copy.take()
             && since.elapsed() >= VIEWER_STAYS
         {
@@ -2272,7 +2272,7 @@ impl App {
         if !changed {
             // An editor back at once went on by itself (gvim, code), and what it saves stays here.
             if copy.since.elapsed() < VIEWER_STAYS {
-                self.notice = Some(format!("The editor went on by itself: rmc can't bring back what it saves in {}, which goes when rmc ends", copy.local.display()));
+                self.notice = Some(format!("The editor went on by itself: cm can't bring back what it saves in {}, which goes when cm ends", copy.local.display()));
             } else {
                 let _ = copy.local.parent().map(fs::remove_dir_all);
             }
@@ -3043,7 +3043,7 @@ impl App {
         }
     }
 
-    /// A file in an archive goes out into rmc's temp folder (as a job: it may be big), and
+    /// A file in an archive goes out into cm's temp folder (as a job: it may be big), and
     /// `then` happens to it there.
     fn take_out(&mut self, entry: &Entry, then: AfterJob) {
         let Some(view) = self.active_panel().archive.as_ref() else { return };
@@ -3054,7 +3054,7 @@ impl App {
         self.start_job(Job::Extract { archive: file, items: vec![inner], dest: dir });
     }
 
-    /// A new folder in rmc's temp folder, for a file that comes here for a while.
+    /// A new folder in cm's temp folder, for a file that comes here for a while.
     fn temp_folder(&mut self) -> Option<PathBuf> {
         static TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         match archive::temp_dir() {
@@ -3083,7 +3083,7 @@ impl App {
         }
     }
 
-    /// A file at `path` on another computer comes into rmc's temp folder (as a job: it may be
+    /// A file at `path` on another computer comes into cm's temp folder (as a job: it may be
     /// big), under the name it has in the panel, and `then` happens to it there.
     fn fetch(&mut self, entry: &Entry, path: String, then: AfterJob) {
         let Some(view) = self.active_panel().remote.clone() else { return };
@@ -3104,7 +3104,7 @@ impl App {
         match then {
             AfterJob::Open { shown } if archive::is_archive(&path) => self.open_zip_here(&path, shown),
             AfterJob::Open { .. } => {
-                // Only a copy, gone when rmc ends: read-only, so that its app says so when
+                // Only a copy, gone when cm ends: read-only, so that its app says so when
                 // something is saved, instead of the work being lost with the copy.
                 if let Ok(meta) = fs::metadata(&path) {
                     let mut permissions = meta.permissions();
@@ -3146,7 +3146,7 @@ impl App {
         if self.panels[side].archive.is_none() {
             return false;
         }
-        self.error("rmc opens archives read-only.\nF5 copies files out of one; Alt+F5 packs files into a new one.");
+        self.error("cm opens archives read-only.\nF5 copies files out of one; Alt+F5 packs files into a new one.");
         true
     }
 
@@ -3568,7 +3568,7 @@ fn is_whole_path(text: &str) -> bool {
 }
 
 /// An edited file that can't go back to its computer: it moves out of the temp folder, which
-/// goes when rmc ends. Returns where it went.
+/// goes when cm ends. Returns where it went.
 fn rescue(copy: &Path) -> Option<PathBuf> {
     let dir = util::config_dir()?.join("rescued");
     fs::create_dir_all(&dir).ok()?;
@@ -4017,7 +4017,7 @@ mod tests {
     }
 
     /// Ctrl+C and Alt+V copy files across (and into the same folder as "name - Copy"); Ctrl+X
-    /// and Alt+V move them, and then the clipboard is empty. (Tests use rmc's own clipboard,
+    /// and Alt+V move them, and then the clipboard is empty. (Tests use cm's own clipboard,
     /// not the system's.)
     #[test]
     fn files_go_through_the_clipboard() {
@@ -4464,7 +4464,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(util::same_path(&app.active_panel().cwd, tmp.path()));
         assert!(app.cmdline.is_empty());
-        assert!(app.subshell.is_none(), "cd is handled by rmc itself");
+        assert!(app.subshell.is_none(), "cd is handled by cm itself");
 
         // Alt+P brings commands back.
         app.on_key(with_mods(KeyCode::Char('p'), KeyModifiers::ALT));
@@ -4510,8 +4510,8 @@ mod tests {
         let sub = tmp.dir("Účty");
         let mut app = test_app(tmp.path(), tmp.path());
 
-        // A command typed in rmc runs in the shell, which comes up to show it.
-        typing(&mut app, "$rmcX = 'kept'; \"out=$(6*7)\"");
+        // A command typed in cm runs in the shell, which comes up to show it.
+        typing(&mut app, "$cmX = 'kept'; \"out=$(6*7)\"");
         app.on_key(key(KeyCode::Enter));
         assert!(app.shell_shown);
         wait_until("the output", &mut app, |app| shell_screen(app).contains("out=42"));
@@ -4528,8 +4528,8 @@ mod tests {
         // Move the panel up; Ctrl+O takes the same shell (variable intact) there.
         app.on_key(key(KeyCode::Backspace));
         app.on_key(ctrl('o'));
-        wait_until("rmc's cd", &mut app, |app| shell_dir(app).is_some_and(|d| util::same_path(&d, tmp.path())));
-        typing(&mut app, "\"var=$rmcX\"");
+        wait_until("cm's cd", &mut app, |app| shell_dir(app).is_some_and(|d| util::same_path(&d, tmp.path())));
+        typing(&mut app, "\"var=$cmX\"");
         app.on_key(key(KeyCode::Enter));
         wait_until("the variable", &mut app, |app| shell_screen(app).contains("var=kept"));
 
@@ -4610,7 +4610,7 @@ mod tests {
     #[test]
     fn options_editor_changes_applies_and_saves_settings() {
         let tmp = TempDir::new("app-options");
-        let file = tmp.path().join("rmc").join("settings.ini");
+        let file = tmp.path().join("cm").join("settings.ini");
         let config = Config { settings_file: Some(file.clone()), ..crate::testutil::config() };
         let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
 
@@ -4666,12 +4666,12 @@ mod tests {
         assert_eq!((saved.big_file_mb, saved.editor.as_str(), saved.mouse), (25, "micro", false));
     }
 
-    /// A config whose settings (loaded from there, as rmc starts) and schemes live in `dir`.
+    /// A config whose settings (loaded from there, as cm starts) and schemes live in `dir`.
     fn scheme_config(dir: &Path) -> Config {
-        let rmc = dir.join("rmc");
-        let file = rmc.join("settings.ini");
+        let cm = dir.join("cm");
+        let file = cm.join("settings.ini");
         let settings = Settings { git_status: false, ..Settings::load(Some(&file)).unwrap() };
-        Config { settings, settings_file: Some(file), schemes_dir: Some(rmc.join("schemes")), ..crate::testutil::config() }
+        Config { settings, settings_file: Some(file), schemes_dir: Some(cm.join("schemes")), ..crate::testutil::config() }
     }
 
     /// Alt+C: moving through the list shows each scheme; Esc brings back the one before, Enter
@@ -4698,7 +4698,7 @@ mod tests {
         assert!(app.dialog.is_none());
         assert_eq!(app.scheme, scheme::built_in("nord").unwrap());
         assert_eq!(Settings::load(app.config.settings_file.as_deref()).unwrap().scheme, "nord");
-        // Next time rmc starts in it, with the list's cursor on it.
+        // Next time cm starts in it, with the list's cursor on it.
         let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
         assert_eq!(app.scheme, scheme::built_in("nord").unwrap());
         app.on_key(alt(KeyCode::Char('c')));
@@ -4731,7 +4731,7 @@ mod tests {
         app.on_key(alt(KeyCode::Char('c')));
         typing(&mut app, "n");
         app.on_key(key(KeyCode::F(4)));
-        let file = tmp.path().join("rmc").join("schemes").join("nord.ini");
+        let file = tmp.path().join("cm").join("schemes").join("nord.ini");
         assert_eq!(app.external.take(), Some(External::Edit(file.clone(), None)));
         // What the user does in the editor.
         let text = fs::read_to_string(&file).unwrap().replace("\nheading ", "\nheading = red ;").replace("\nmarked ", "\nmarked = blu ;");
@@ -4753,7 +4753,7 @@ mod tests {
     fn a_scheme_file_left_as_f4_wrote_it_goes_again() {
         let tmp = TempDir::new("app-scheme-untouched");
         let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), scheme_config(tmp.path()));
-        let file = tmp.path().join("rmc").join("schemes").join("nord.ini");
+        let file = tmp.path().join("cm").join("schemes").join("nord.ini");
         app.on_key(alt(KeyCode::Char('c')));
         typing(&mut app, "n");
         app.on_key(key(KeyCode::F(4)));
@@ -4933,7 +4933,7 @@ mod tests {
     }
 
     /// A job caught in a system call that doesn't return: Esc can't reach it, so after a while
-    /// F10 leaves rmc. Before that F10 does nothing, as during any job.
+    /// F10 leaves cm. Before that F10 does nothing, as during any job.
     #[test]
     fn a_job_that_doesnt_stop_can_be_left() {
         let tmp = TempDir::new("app-stuck");
@@ -5411,7 +5411,7 @@ mod tests {
         let Some(Dialog::Confirm { lines, focus, .. }) = &app.dialog else { panic!("no question") };
         assert_eq!(*focus, 1, "No is what Enter gives");
         assert!(lines[0].contains("changed on"), "{lines:?}");
-        let rescued: Vec<_> = fs::read_dir(config.path().join("rmc/rescued")).unwrap().flatten().map(|e| e.path()).collect();
+        let rescued: Vec<_> = fs::read_dir(config.path().join(util::FOLDER).join("rescued")).unwrap().flatten().map(|e| e.path()).collect();
         assert_eq!(fs::read_to_string(&rescued[0]).unwrap(), "mine");
         app.on_key(key(KeyCode::Enter));
         wait_for_job(app);

@@ -238,7 +238,7 @@ pub fn read_start(file: &Path, index: usize, limit: u64) -> io::Result<Vec<u8>> 
 }
 
 /// Copies one file out of the zip to `dest`, with its time. (The Extract job does this for
-/// rmc, with progress and questions.)
+/// cm, with progress and questions.)
 #[cfg(test)]
 pub fn extract_file(file: &Path, index: usize, dest: &Path) -> io::Result<()> {
     use std::io::Write;
@@ -257,7 +257,7 @@ pub fn extract_file(file: &Path, index: usize, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// A folder of rmc's own, for files taken out of archives to be viewed: in the session's
+/// A folder of cm's own, for files taken out of archives to be viewed: in the session's
 /// private folder, so nobody else on the machine reads them.
 pub fn temp_dir() -> std::io::Result<PathBuf> {
     crate::util::session_dir().map(|dir| dir.join("archives"))

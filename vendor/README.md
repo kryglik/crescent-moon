@@ -16,7 +16,7 @@ opening the drive picker, and Shift+F2 and Shift+F4 typed Q and S.
 `test_parse_ss3_with_modifier` there and `konsole_alt_f1_is_one_key_and_no_stray_letter` in
 `src/event/source/unix/mio.rs`.
 
-**Testing it:** crossterm isn't part of rmc's own tests (its tests need dev-dependencies rmc
+**Testing it:** crossterm isn't part of cm's own tests (its tests need dev-dependencies cm
 doesn't otherwise pull in). From this folder:
 
 ```bash

@@ -66,7 +66,7 @@ const LINK: u32 = 0o120000;
 /// The size of a piece of a file, and how many may be under way: as OpenSSH's own client.
 const PIECE: usize = 32 * 1024;
 const WINDOW: usize = 64;
-/// The most names of a folder rmc takes: a server may go on listing for ever.
+/// The most names of a folder cm takes: a server may go on listing for ever.
 const MOST_NAMES: usize = 2_000_000;
 /// What the first answer tells a server from a program printing text: OpenSSH's own limit is a
 /// quarter of this, and text reads as a length far beyond it.
@@ -572,7 +572,7 @@ impl Sftp {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "the server doesn't finish listing this folder"));
             }
             if names.len() > MOST_NAMES {
-                return Err(io::Error::other("the server lists more names than rmc takes in one folder"));
+                return Err(io::Error::other("the server lists more names than cm takes in one folder"));
             }
             let reply = self.call(READDIR, Body::default().bytes(&handle.0))?;
             if reply.is_eof() {

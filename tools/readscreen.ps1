@@ -1,4 +1,4 @@
-# Prints the visible text of another process's console window (for testing rmc in Windows Terminal).
+# Prints the visible text of another process's console window (for testing cm in Windows Terminal).
 param([int] $ProcessId)
 
 Add-Type -TypeDefinition @'

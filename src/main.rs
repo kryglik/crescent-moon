@@ -1,4 +1,4 @@
-//! rmc: a small Midnight Commander-style two-panel file manager for the terminal.
+//! cm: a small Midnight Commander-style two-panel file manager for the terminal.
 
 mod admin;
 mod app;
@@ -51,12 +51,12 @@ use ratatui::crossterm::{cursor, execute, terminal};
 
 use app::{App, Config, External};
 
-/// rmc's terminal: frames go out through `Output`.
+/// cm's terminal: frames go out through `Output`.
 type Tui = Terminal<CrosstermBackend<Output>>;
 
-/// What rmc writes to the terminal. ratatui flushes at the end of each frame, and only then
+/// What cm writes to the terminal. ratatui flushes at the end of each frame, and only then
 /// does the frame go out, in one write. Rust's stdout alone sends it in 1 KB pieces, and the
-/// terminal may show a half-drawn screen in between. Counts the bytes for RMC_TRACE.
+/// terminal may show a half-drawn screen in between. Counts the bytes for CM_TRACE.
 #[derive(Default)]
 struct Output {
     frame: Vec<u8>,
@@ -83,8 +83,8 @@ impl Write for Output {
     }
 }
 
-/// RMC_TRACE=FILE: a line per frame, to tell a slow rmc from a slow terminal. It says what
-/// woke rmc (k key, m mouse move, c click, w wheel, r resize; nothing for a timer), how long
+/// CM_TRACE=FILE: a line per frame, to tell a slow cm from a slow terminal. It says what
+/// woke cm (k key, m mouse move, c click, w wheel, r resize; nothing for a timer), how long
 /// from the first of those events until the frame was sent, how long drawing took, and how
 /// many bytes went to the terminal.
 struct Trace {
@@ -94,7 +94,7 @@ struct Trace {
 
 impl Trace {
     fn from_env() -> Self {
-        let file = std::env::var_os("RMC_TRACE").and_then(|path| fs::File::create(path).ok());
+        let file = std::env::var_os("CM_TRACE").and_then(|path| fs::File::create(path).ok());
         Trace { file, start: Instant::now() }
     }
 
@@ -123,9 +123,9 @@ impl Trace {
 }
 
 const USAGE: &str = "\
-rmc - two-panel file manager
+cm - two-panel file manager
 
-Usage: rmc [LEFT_DIR [RIGHT_DIR]] [--cwd-file FILE] [--no-mouse]
+Usage: cm [LEFT_DIR [RIGHT_DIR]] [--cwd-file FILE] [--no-mouse]
 
   --cwd-file FILE   on exit, write the active panel's directory to FILE
                     (lets a shell function cd there)
@@ -133,8 +133,8 @@ Usage: rmc [LEFT_DIR [RIGHT_DIR]] [--cwd-file FILE] [--no-mouse]
   -h, --help        show this help
   -V, --version     show the version
 
-Environment: RMC_EDITOR (default nvim), RMC_VIEWER (default nvim -R),
-             RMC_SHELL (default pwsh). Press F1 inside rmc for the keys.";
+Environment: CM_EDITOR (default nvim), CM_VIEWER (default nvim -R),
+             CM_SHELL (default pwsh). Press F1 inside cm for the keys.";
 
 struct Args {
     dirs: Vec<PathBuf>,
@@ -153,7 +153,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             Some("-V" | "--version") => {
-                println!("rmc {}", env!("CARGO_PKG_VERSION"));
+                println!("cm {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             Some("--cwd-file") => {
@@ -178,14 +178,14 @@ fn main() -> ExitCode {
         Ok(Some(args)) => args,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rmc: {e}");
+            eprintln!("cm: {e}");
             return ExitCode::from(2);
         }
     };
-    // Typed in rmc's shell or command line, a second rmc would run inside the first one's
+    // Typed in cm's shell or command line, a second cm would run inside the first one's
     // screen, both wanting the keys.
     if platform::running_inside().is_some() {
-        eprintln!("rmc: already running in this terminal; Ctrl+O goes back to it.");
+        eprintln!("cm: already running in this terminal; Ctrl+O goes back to it.");
         return ExitCode::FAILURE;
     }
     platform::init();
@@ -194,14 +194,15 @@ fn main() -> ExitCode {
     let cwd_file = args.cwd_file.as_ref().map(|file| cwd.join(file));
     let left = dirs.first().cloned().unwrap_or_else(|| cwd.clone());
     let right = dirs.get(1).cloned().unwrap_or_else(|| left.clone());
-    // A Windows process holds its working folder: as long as rmc runs, the folder it was
-    // started in couldn't be moved or deleted, even from rmc. Nothing here depends on it:
+    // A Windows process holds its working folder: as long as cm runs, the folder it was
+    // started in couldn't be moved or deleted, even from cm. Nothing here depends on it:
     // every path is absolute, and programs are started in the panel's folder.
     #[cfg(windows)]
     if let Some(home) = util::home_dir() {
         let _ = std::env::set_current_dir(home);
     }
     util::sweep_temp();
+    util::carry_over_settings();
     let mut app = App::new(left, right, Config::load());
     app.mouse &= args.mouse;
     app.mouse_allowed = args.mouse;
@@ -239,13 +240,13 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rmc: {e}");
+            eprintln!("cm: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// The window title from before rmc, put back on exit (rmc names the active folder in it).
+/// The window title from before cm, put back on exit (cm names the active folder in it).
 /// Windows has it as the console's title; other terminals keep a stack of titles.
 struct SavedTitle(#[cfg_attr(not(windows), allow(dead_code))] Option<String>);
 
@@ -284,9 +285,9 @@ impl SavedTitle {
 #[derive(Clone, Copy)]
 struct Mouse(bool);
 
-/// On Unix rmc asks the terminal for clicks and the wheel only: normal tracking (1000) with
+/// On Unix cm asks the terminal for clicks and the wheel only: normal tracking (1000) with
 /// SGR coordinates (1006). crossterm's EnableMouseCapture also turns on any-motion tracking
-/// (1003), so the terminal sends a report for every cell the pointer crosses, which rmc
+/// (1003), so the terminal sends a report for every cell the pointer crosses, which cm
 /// doesn't use. On Windows mouse input is a console mode instead.
 #[cfg(unix)]
 const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
@@ -427,7 +428,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
     Ok(())
 }
 
-/// "photos - rmc": the active panel's folder (the whole path for a drive root).
+/// "photos - cm": the active panel's folder (the whole path for a drive root).
 fn window_title(app: &App) -> String {
     let location = app.active_panel().location();
     let name = location.file_name().map_or_else(|| location.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -438,7 +439,7 @@ fn window_title(app: &App) -> String {
 /// hold what ends the title and starts a command to the terminal.
 fn title_text(name: &str) -> String {
     let name: String = name.chars().filter(|c| !c.is_control()).collect();
-    format!("{name} - rmc")
+    format!("{name} - cm")
 }
 
 /// Hands the terminal to an editor, viewer, shell or command, then takes it back.
@@ -460,7 +461,7 @@ fn run_external(
         return Ok((Err(lfs::UNOPENABLE.to_string()), None));
     }
     let cwd = app.active_panel().cwd.clone();
-    // In rmc's private folder: in a shared /tmp another user could put a folder of their own
+    // In cm's private folder: in a shared /tmp another user could put a folder of their own
     // choosing there, or a link.
     let cwd_file = util::session_dir().unwrap_or_else(|_| std::env::temp_dir()).join("cwd.txt");
     let _ = std::fs::remove_file(&cwd_file);
@@ -477,7 +478,7 @@ fn run_external(
         External::SshLogin(_) => unreachable!("handled above"),
     };
     let wait = matches!(external, External::Command(_));
-    command.current_dir(&cwd).env(platform::RMC_PID, std::process::id().to_string());
+    command.current_dir(&cwd).env(platform::CM_PID, std::process::id().to_string());
 
     mouse.release();
     terminal::disable_raw_mode()?;
@@ -488,14 +489,14 @@ fn run_external(
         External::Shell if !app.shell_hint_shown => {
             app.shell_hint_shown = true;
             let way_back = if config.shell.ctrl_o_returns() { "Ctrl+O (or exit)" } else { "exit" };
-            println!("rmc: {way_back} returns to the panels.");
+            println!("cm: {way_back} returns to the panels.");
         }
         _ => {}
     }
     let result = match run_shielded(&mut command) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Err(format!("\"{name}\" was not found.\nInstall it, or set RMC_EDITOR, RMC_VIEWER, RMC_PAGER or RMC_SHELL."))
+            Err(format!("\"{name}\" was not found.\nInstall it, or set CM_EDITOR, CM_VIEWER, CM_PAGER or CM_SHELL."))
         }
         Err(e) => Err(format!("Cannot run \"{name}\":\n{e}")),
     };
@@ -517,12 +518,12 @@ fn run_external(
 
 /// Hands the terminal to `ssh` for what it has to ask (a password, a passphrase, whether to
 /// trust a new host), and takes it back when the connection is there or has failed. Ctrl+C
-/// ends `ssh` alone, as the shield keeps it from rmc.
+/// ends `ssh` alone, as the shield keeps it from cm.
 fn log_in(terminal: &mut Tui, target: &ssh::Target, mouse: Mouse) -> io::Result<Result<(), String>> {
     mouse.release();
     terminal::disable_raw_mode()?;
     execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
-    println!("rmc: connecting to {target}; ssh asks here for what it needs (Ctrl+C gives up).");
+    println!("cm: connecting to {target}; ssh asks here for what it needs (Ctrl+C gives up).");
     let mut shield = None;
     let connection = ssh::Connection::open(target, ssh::Login::AtTheTerminal, || shield = Some(IgnoreInterrupts::new()));
     drop(shield);
@@ -541,8 +542,8 @@ fn log_in(terminal: &mut Tui, target: &ssh::Target, mouse: Mouse) -> io::Result<
 }
 
 /// Runs a program in the foreground. Ctrl+C there is meant for it (stopping a search in
-/// less, say), but the terminal sends it to rmc too, which would end, taking its shell along:
-/// rmc ignores it until the program ends.
+/// less, say), but the terminal sends it to cm too, which would end, taking its shell along:
+/// cm ignores it until the program ends.
 fn run_shielded(command: &mut Command) -> io::Result<std::process::ExitStatus> {
     let mut child = command.spawn()?;
     let _shield = IgnoreInterrupts::new();
@@ -616,7 +617,7 @@ fn takes_plus_line(program: &str) -> bool {
 
 /// Lets the user read a command's output before the panels come back.
 fn wait_for_key() -> io::Result<()> {
-    print!("\nrmc: press any key to return to the panels…");
+    print!("\ncm: press any key to return to the panels…");
     io::stdout().flush()?;
     terminal::enable_raw_mode()?;
     loop {
@@ -637,7 +638,7 @@ mod tests {
     /// A name can't end the title and go on as a command to the terminal.
     #[test]
     fn a_title_holds_no_control_characters() {
-        assert_eq!(title_text("photos"), "photos - rmc");
-        assert_eq!(title_text("x\u{7}\u{1b}]52;c;AAAA\u{7}\u{9b}2J"), "x]52;c;AAAA2J - rmc");
+        assert_eq!(title_text("photos"), "photos - cm");
+        assert_eq!(title_text("x\u{7}\u{1b}]52;c;AAAA\u{7}\u{9b}2J"), "x]52;c;AAAA2J - cm");
     }
 }

@@ -754,7 +754,7 @@ impl Worker {
                 self.errors.push(message);
                 return Err(Stop::Cancelled);
             }
-            // "As admin" only where the administrator's rmc can reach the path: a mapped
+            // "As admin" only where the administrator's cm can reach the path: a mapped
             // network drive or a subst drive belongs to the user's own logon session.
             let as_admin = self
                 .admin_offer
@@ -1275,7 +1275,7 @@ fn child_names(dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
 
 /// The trash crate's error in words. On Windows a refusal arrives as "Some operations were
 /// aborted" with no reason (the Recycle Bin is asked not to show any UI, such as the
-/// administrator prompt): usually a lack of permission, so rmc checks that itself.
+/// administrator prompt): usually a lack of permission, so cm checks that itself.
 fn trash_error(path: &Path, error: &trash::Error) -> io::Error {
     if let Some(denied) = platform::delete_denied(path) {
         return denied;
@@ -1422,8 +1422,8 @@ fn temp_name(target: &Path) -> PathBuf {
 fn temp_leaf() -> String {
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    // Random too: a crashed rmc's leftover with a reused process id mustn't be in the way.
-    format!(".rmc-{}-{n}-{:08x}.part", std::process::id(), util::random() as u32)
+    // Random too: a crashed cm's leftover with a reused process id mustn't be in the way.
+    format!(".cm-{}-{n}-{:08x}.part", std::process::id(), util::random() as u32)
 }
 
 /// Puts the finished copy `temp` in place of `target` (replacing an existing file).

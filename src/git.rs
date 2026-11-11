@@ -5,7 +5,7 @@
 //! repository's own files, so they show the moment a panel enters a repository, with or
 //! without git installed. How the files stand comes from `git status`, run on a thread of its
 //! own (it can take a while in a big repository or on a network drive) whenever something may
-//! have changed: rmc reloaded the panels, files in the repository changed (watched), or some
+//! have changed: cm reloaded the panels, files in the repository changed (watched), or some
 //! time passed.
 
 use std::collections::{HashMap, HashSet};
@@ -214,7 +214,7 @@ fn track_text(track: &str) -> String {
         .join(" ")
 }
 
-/// A git command in the working tree at `root`: in the repository asked about, whatever rmc
+/// A git command in the working tree at `root`: in the repository asked about, whatever cm
 /// was started with, and never asking anything.
 fn git_at(root: &Path) -> Command {
     let mut command = Command::new("git");
@@ -761,7 +761,7 @@ impl Tracker {
         self.repos.values().any(|t| t.running)
     }
 
-    /// rmc reloaded the panels (a command ran, Ctrl+R, a job ended): everything is looked at
+    /// cm reloaded the panels (a command ran, Ctrl+R, a job ended): everything is looked at
     /// again.
     pub fn refresh(&mut self) {
         for tracked in self.repos.values_mut() {
@@ -915,7 +915,7 @@ pub mod tests {
     pub fn run_git(dir: &Path, args: &[&str], date: Option<&str>) {
         let mut command = Command::new("git");
         command
-            .args(["-c", "user.name=rmc", "-c", "user.email=rmc@example.com", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+            .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1095,7 +1095,7 @@ pub mod tests {
         assert_eq!(status.mark("notes.txt"), Some((Mark::Untracked, false)));
         assert_eq!(status.mark("drafts"), Some((Mark::Untracked, false)));
         assert_eq!(status.mark("drafts/2024/plan.md"), Some((Mark::Untracked, false)), "inside a new folder");
-        assert_eq!(status.mark("target/debug/rmc.exe"), Some((Mark::Ignored, false)));
+        assert_eq!(status.mark("target/debug/cm.exe"), Some((Mark::Ignored, false)));
         assert_eq!(status.mark(".env"), Some((Mark::Ignored, false)));
         assert_eq!(status.mark(".git"), Some((Mark::Ignored, false)), "git's own folder");
         assert_eq!(status.mark("Cargo.toml"), None);
@@ -1134,7 +1134,7 @@ pub mod tests {
         let dir = tmp.dir("repo");
         let git = |args: &[&str]| {
             let ok = Command::new("git")
-                .args(["-c", "user.name=rmc", "-c", "user.email=rmc@example.com", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+                .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
                 .args(args)
                 .current_dir(&dir)
                 .stdout(Stdio::null())

@@ -57,7 +57,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Too small for the panels (a narrow split pane): say so rather than draw out of bounds.
     if area.height < 6 || area.width < 20 {
         app.hit = HitAreas::default();
-        let text = util::take_width("rmc: the window is too small", area.width as usize);
+        let text = util::take_width("cm: the window is too small", area.width as usize);
         if area.height > 0 {
             frame.buffer_mut().set_string(area.x, area.y, text, t.notice);
         }
@@ -579,7 +579,7 @@ fn draw_shell(buf: &mut Buffer, area: Rect, shell: &Subshell, t: &Scheme) -> Opt
             vec![
                 format!("The shell hasn't answered for {seconds} s."),
                 "Ctrl+O goes back to the panels.".to_string(),
-                "To find out why, start rmc with RMC_LOG set to a file name (e.g. %TEMP%\\rmc.log).".to_string(),
+                "To find out why, start cm with CM_LOG set to a file name (e.g. %TEMP%\\cm.log).".to_string(),
             ]
         };
         let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
@@ -953,7 +953,7 @@ fn draw_dialog(
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
-            let (outer, inner) = dialog_frame(frame, area, 72, height, "rmc keys (Esc closes)", false, t);
+            let (outer, inner) = dialog_frame(frame, area, 72, height, "Crescent Moon keys (Esc closes)", false, t);
             let visible = inner.height as usize;
             let start = (*scroll).min(dialog::HELP.len().saturating_sub(visible));
             let heading = t.on_dialog(t.dialog_title).add_modifier(Modifier::BOLD);
@@ -1394,7 +1394,7 @@ fn draw_progress(frame: &mut Frame, area: Rect, job: &Running, t: &Scheme) {
         frame.render_widget(Paragraph::new(text).style(style), row(4));
     }
     let hint = match (job.stuck(), job.stopping.is_some()) {
-        (true, _) => "It doesn't stop: the system isn't answering. F10 leaves rmc",
+        (true, _) => "It doesn't stop: the system isn't answering. F10 leaves cm",
         (_, true) => "Stopping…",
         _ => "Esc = cancel",
     };
@@ -1440,7 +1440,7 @@ mod tests {
         tmp.dir("Účty");
         let mut app = app_for(&tmp);
         let screen = render(&mut app, 100, 16);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Modify time"));
@@ -1515,7 +1515,7 @@ mod tests {
         let lines: Vec<String> =
             (0..16).map(|y| (0..140).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect();
         let screen = lines.join("\n");
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         // Git's row below the path: the branch and how the working tree stands; a linked
@@ -1557,7 +1557,7 @@ mod tests {
         let worktrees = Repo::find(&root).unwrap().worktrees();
         app.dialog = Some(Dialog::Worktrees { filter: LineEdit::default(), cursor: 1, worktrees, here: root.clone() });
         let screen = render(&mut app, 140, 16);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Git worktrees"), "{screen}");
@@ -1609,7 +1609,7 @@ mod tests {
         app.hotlist.dirs = vec![PathBuf::from(r"C:\Users\me\Documents"), PathBuf::from(r"E:\devel")];
         app.dialog = Some(Dialog::Hotlist { cursor: 1 });
         let screen = render(&mut app, 100, 16);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Directory hotlist"));
@@ -1639,7 +1639,7 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::F(8)));
         wait(&mut app);
         let screen = render(&mut app, 100, 24);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Move \"old\" to"), "{screen}");
@@ -1656,7 +1656,7 @@ mod tests {
             app.on_key(KeyEvent::from(KeyCode::F(8)));
             wait(&mut app);
             let screen = render(&mut app, 120, 30);
-            if std::env::var_os("RMC_PRINT").is_some() {
+            if std::env::var_os("CM_PRINT").is_some() {
                 println!("{screen}");
             }
             app.on_key(KeyEvent::from(KeyCode::Esc));
@@ -1689,7 +1689,7 @@ mod tests {
         }
         app.on_key(KeyEvent::from(KeyCode::Down));
         let screen = render(&mut app, 100, 20);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Find in"));
@@ -1707,7 +1707,7 @@ mod tests {
         app.config.settings_file = Some(PathBuf::from("settings.ini"));
         app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         let screen = render(&mut app, 100, 30);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Options"));
@@ -1731,7 +1731,7 @@ mod tests {
         app.panels[0].choose_sort(SortBy::Time);
         app.on_key(KeyEvent::from(KeyCode::F(9)));
         let screen = render(&mut app, 100, 16);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Modify time↑"), "oldest first goes up:\n{screen}");
@@ -1763,7 +1763,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.lines().any(|l| l.trim() == "Příliš žluťoučký"), "{screen}");
@@ -1784,7 +1784,7 @@ mod tests {
             app.tick();
         }
         let screen = render(&mut app, 100, 20);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Left drive"));
@@ -1799,10 +1799,10 @@ mod tests {
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(1)));
         // Tall enough for all of it.
         let help = render(&mut app, 80, 110);
-        assert!(help.contains("rmc keys"));
+        assert!(help.contains("Crescent Moon keys"));
         // The longest help lines fit whole.
         assert!(help.contains("Enter runs it in the shell, in the panel's folder"), "{help}");
-        assert!(help.contains("rmc --no-mouse leaves the mouse alone"), "{help}");
+        assert!(help.contains("cm --no-mouse leaves the mouse alone"), "{help}");
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Esc));
         app.on_key(ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::F(7)));
         let mkdir = render(&mut app, 80, 24);
@@ -1816,7 +1816,7 @@ mod tests {
         for (w, h) in [(30, 24), (37, 12), (20, 6), (1, 40)] {
             render(&mut app, w, h);
         }
-        assert!(render(&mut app, 18, 4).contains("rmc: the window"));
+        assert!(render(&mut app, 18, 4).contains("cm: the window"));
     }
 
     /// Ctrl+Q shows the file under the cursor where the other panel was, and follows the cursor.
@@ -1843,7 +1843,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         settle(&mut app);
         let screen = render(&mut app, 100, 16);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Quick view: a.txt") && screen.contains("druhý řádek"), "{screen}");
@@ -1867,7 +1867,7 @@ mod tests {
         let mut app = app_for(&tmp);
         app.dialog = Some(Dialog::Commands { filter: LineEdit::new("clip"), cursor: 1 });
         let screen = render(&mut app, 100, 20);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Commands") && screen.contains("Files to the clipboard (cut)") && screen.contains("Ctrl+X"));
@@ -1880,7 +1880,7 @@ mod tests {
         app.history.dirs = vec![PathBuf::from(r"E:\Fotky\2024 Léto"), PathBuf::from(r"C:\Users\me\Downloads")];
         app.dialog = Some(Dialog::History { filter: LineEdit::new("fot"), cursor: 0 });
         let screen = render(&mut app, 100, 20);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Folder history") && screen.contains("Filter: fot"));
@@ -1898,7 +1898,7 @@ mod tests {
             ratatui::crossterm::event::KeyModifiers::ALT,
         ));
         let screen = render(&mut app, 100, 30);
-        if std::env::var_os("RMC_PRINT").is_some() {
+        if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
         assert!(screen.contains("Colour scheme"), "{screen}");

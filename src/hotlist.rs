@@ -11,7 +11,7 @@ pub struct Hotlist {
 }
 
 impl Hotlist {
-    /// `%APPDATA%\rmc\hotlist.txt` on Windows.
+    /// `%APPDATA%\crescent-moon\hotlist.txt` on Windows.
     pub fn default_file() -> Option<PathBuf> {
         util::config_dir().map(|dir| dir.join("hotlist.txt"))
     }

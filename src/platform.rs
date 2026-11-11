@@ -37,28 +37,29 @@ pub fn query_space_later(roots: Vec<PathBuf>) -> Receiver<(PathBuf, Option<(u64,
     rx
 }
 
-/// What rmc passes to everything it runs (its shell, a command typed in it, the editor): its
-/// process id, so an rmc started there can tell it would run inside this one.
-pub const RMC_PID: &str = "RMC_PID";
+/// What cm passes to everything it runs (its shell, a command typed in it, the editor): its
+/// process id, so a cm started there can tell it would run inside this one.
+pub const CM_PID: &str = "CM_PID";
 
-/// The rmc this process would run inside of, drawing over it and fighting it for the keys:
-/// one whose shell it was started from (Ctrl+O, a command typed in rmc), in the terminal rmc
-/// made for that shell, or one that lent it its own terminal (a command or an editor rmc
+/// The cm this process would run inside of, drawing over it and fighting it for the keys:
+/// one whose shell it was started from (Ctrl+O, a command typed in cm), in the terminal cm
+/// made for that shell, or one that lent it its own terminal (a command or an editor cm
 /// runs). A tab or window opened from there is a terminal of its own and doesn't count.
 pub fn running_inside() -> Option<u32> {
-    let rmc: u32 = std::env::var(RMC_PID).ok()?.parse().ok()?;
-    (rmc != std::process::id() && in_terminal_of(rmc)).then_some(rmc)
+    // RMC_PID: an rmc from before the new name, whose shell this may be.
+    let cm: u32 = std::env::var(CM_PID).or_else(|_| std::env::var("RMC_PID")).ok()?.parse().ok()?;
+    (cm != std::process::id() && in_terminal_of(cm)).then_some(cm)
 }
 
-/// Whether, among the processes `sharing` a terminal, `rmc` is one or started one.
+/// Whether, among the processes `sharing` a terminal, `cm` is one or started one.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn shares_terminal(rmc: u32, sharing: &[u32], parent: impl Fn(u32) -> Option<u32>) -> bool {
-    sharing.iter().any(|&pid| pid == rmc || parent(pid) == Some(rmc))
+fn shares_terminal(cm: u32, sharing: &[u32], parent: impl Fn(u32) -> Option<u32>) -> bool {
+    sharing.iter().any(|&pid| pid == cm || parent(pid) == Some(cm))
 }
 
 /// Windows: the terminal is the console, and the processes attached to it say whose it is.
 #[cfg(windows)]
-fn in_terminal_of(rmc: u32) -> bool {
+fn in_terminal_of(cm: u32) -> bool {
     use std::collections::HashMap;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Console::GetConsoleProcessList;
@@ -91,16 +92,16 @@ fn in_terminal_of(rmc: u32) -> bool {
     }
     unsafe { CloseHandle(snapshot) };
     // Still running: once it has ended, its number may be another program's.
-    parents.contains_key(&rmc) && shares_terminal(rmc, &attached, |pid| parents.get(&pid).copied())
+    parents.contains_key(&cm) && shares_terminal(cm, &attached, |pid| parents.get(&pid).copied())
 }
 
-/// Unix: the terminal is the session: rmc's own, or the one its shell leads in the terminal
-/// rmc made for it.
+/// Unix: the terminal is the session: cm's own, or the one its shell leads in the terminal
+/// cm made for it.
 #[cfg(unix)]
-fn in_terminal_of(rmc: u32) -> bool {
+fn in_terminal_of(cm: u32) -> bool {
     let session = unsafe { libc::getsid(0) };
-    let rmc_session = unsafe { libc::getsid(rmc as libc::pid_t) };
-    rmc_session >= 0 && (rmc_session == session || parent_of(session as u32) == Some(rmc))
+    let cm_session = unsafe { libc::getsid(cm as libc::pid_t) };
+    cm_session >= 0 && (cm_session == session || parent_of(session as u32) == Some(cm))
 }
 
 #[cfg(target_os = "linux")]
@@ -346,7 +347,7 @@ mod win {
         wide(crate::lfs::literal(path).as_os_str())
     }
 
-    /// Whether rmc running as administrator can get at `path`. Not on a network share or a
+    /// Whether cm running as administrator can get at `path`. Not on a network share or a
     /// mapped drive (they belong to the user's own logon session, and an administrator's
     /// privileges don't count on another machine), nor on a subst drive (also per session).
     pub fn admin_can_reach(path: &Path) -> bool {
@@ -611,7 +612,7 @@ mod win {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(process.0 as _) };
     }
 
-    /// Whether `DOMAIN\name` is the account rmc runs as.
+    /// Whether `DOMAIN\name` is the account cm runs as.
     fn is_me(account: &str) -> bool {
         let me = format!(
             "{}\\{}",
@@ -735,7 +736,7 @@ pub fn exec_bits_mean_something(_dir: &Path) -> bool {
     true
 }
 
-/// Windows' "How do you want to open this file?" for `path`, in a process of its own so rmc
+/// Windows' "How do you want to open this file?" for `path`, in a process of its own so cm
 /// goes on meanwhile.
 #[cfg(windows)]
 pub fn open_with(path: &Path) -> Result<(), String> {
@@ -976,10 +977,10 @@ mod unix {
     /// - macOS: `open`;
     /// - WSL: the Windows app for it, via `wslview` or `explorer.exe` (WSLg's DISPLAY would
     ///   make xdg-open look usable, but without a Linux desktop app it falls back to a
-    ///   terminal program, which then fights rmc for the screen);
+    ///   terminal program, which then fights cm for the screen);
     /// - other Linux: `xdg-open`, only in a graphical session, for the same reason.
     ///
-    /// Otherwise `NoOpener`, and rmc shows the file in the viewer instead.
+    /// Otherwise `NoOpener`, and cm shows the file in the viewer instead.
     pub fn open_default(path: &Path) -> Result<(), OpenError> {
         let found = |program: &str| util::find_in_path(program).is_some();
         let graphical = ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
@@ -998,7 +999,7 @@ mod unix {
         } else {
             return Err(OpenError::NoOpener);
         };
-        // Its chatter would land on rmc's screen; and wait for it so it doesn't linger as a zombie.
+        // Its chatter would land on cm's screen; and wait for it so it doesn't linger as a zombie.
         let mut child = Command::new(opener)
             .arg(arg)
             .stdin(Stdio::null())
@@ -1082,44 +1083,44 @@ pub fn is_executable(_name: &str, meta: Option<&Metadata>) -> bool {
     meta.is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// The key rmc presses to make the shell go to the folder in `$RMC_REQUEST_FILE`:
+/// The key cm presses to make the shell go to the folder in `$CM_REQUEST_FILE`:
 /// Ctrl+Alt+Shift+F12, as a terminal sends it. The start-up scripts below bind it.
 pub const FOLLOW_KEY: &str = "\x1b[24;8~";
 
 /// Start-up script of the PowerShell behind Ctrl+O.
 ///
-/// - Every prompt writes `<prompt number>|<f or ->|<current folder>` to `$env:RMC_CWD_FILE`.
-///   The folder lets rmc's panel follow `cd`; the number tells rmc whether the shell is idle
+/// - Every prompt writes `<prompt number>|<f or ->|<current folder>` to `$env:CM_CWD_FILE`.
+///   The folder lets cm's panel follow `cd`; the number tells cm whether the shell is idle
 ///   (a prompt has appeared since it last typed anything) or busy with a command; `f` says the
 ///   follow key below works. The folder comes last, so any name fits.
 /// - The user's prompt runs first, so prompt themes still see `$?` of the last command.
 /// - Ctrl+Alt+Shift+F12 (`FOLLOW_KEY`) moves the shell to the folder in
-///   `$env:RMC_REQUEST_FILE` and redraws the prompt in place: no command line, no history entry.
+///   `$env:CM_REQUEST_FILE` and redraws the prompt in place: no command line, no history entry.
 /// - Ctrl+O at the prompt exits, only in the one-off shell used when the persistent one can't
-///   start (`RMC_ONE_OFF`). In the persistent shell rmc keeps Ctrl+O to itself, and a Ctrl+O
+///   start (`CM_ONE_OFF`). In the persistent shell cm keeps Ctrl+O to itself, and a Ctrl+O
 ///   that slips through (Caps Lock) mustn't end the session.
-/// - It goes to `$env:RMC_START_DIR` last: the process itself started elsewhere, so as not to
+/// - It goes to `$env:CM_START_DIR` last: the process itself started elsewhere, so as not to
 ///   hold that folder (see `Subshell::start`).
 const PWSH_SHELL_INIT: &str = r#"
-$global:__rmc_seq = 0
-$global:__rmc_follow = '-'
-function global:__rmc_save_cwd {
-    $global:__rmc_seq++
+$global:__cm_seq = 0
+$global:__cm_follow = '-'
+function global:__cm_save_cwd {
+    $global:__cm_seq++
     $here = (Get-Location -PSProvider FileSystem).ProviderPath
-    [IO.File]::WriteAllText($env:RMC_CWD_FILE, "$($global:__rmc_seq)|$($global:__rmc_follow)|$here")
+    [IO.File]::WriteAllText($env:CM_CWD_FILE, "$($global:__cm_seq)|$($global:__cm_follow)|$here")
 }
-$global:__rmc_prompt = $function:prompt
-function global:prompt { $p = & $global:__rmc_prompt; __rmc_save_cwd; $p }
+$global:__cm_prompt = $function:prompt
+function global:prompt { $p = & $global:__cm_prompt; __cm_save_cwd; $p }
 if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
-    if ($env:RMC_ONE_OFF) {
-        Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to rmc' -ScriptBlock {
-            __rmc_save_cwd
+    if ($env:CM_ONE_OFF) {
+        Set-PSReadLineKeyHandler -Chord Ctrl+o -BriefDescription 'Back to cm' -ScriptBlock {
+            __cm_save_cwd
             [Environment]::Exit(0)
         }
     }
-    Set-PSReadLineKeyHandler -Chord Ctrl+Alt+Shift+F12 -BriefDescription 'Go to the rmc panel folder' -ScriptBlock {
+    Set-PSReadLineKeyHandler -Chord Ctrl+Alt+Shift+F12 -BriefDescription 'Go to the cm panel folder' -ScriptBlock {
         try {
-            $target = [IO.File]::ReadAllText($env:RMC_REQUEST_FILE)
+            $target = [IO.File]::ReadAllText($env:CM_REQUEST_FILE)
             if (Test-Path -LiteralPath $target -PathType Container) { Set-Location -LiteralPath $target }
         } catch {}
         # InvokePrompt writes through [Console]::OutputEncoding, an old code page by default,
@@ -1132,103 +1133,103 @@ if (Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue) {
             [Console]::OutputEncoding = $encoding
         }
     }
-    $global:__rmc_follow = 'f'
+    $global:__cm_follow = 'f'
 }
-if ($env:RMC_START_DIR) {
-    Set-Location -LiteralPath $env:RMC_START_DIR
-    $env:RMC_START_DIR = $null
+if ($env:CM_START_DIR) {
+    Set-Location -LiteralPath $env:CM_START_DIR
+    $env:CM_START_DIR = $null
 }
 "#;
 
 /// Start-up file of the bash behind Ctrl+O (`bash --rcfile`): the user's ~/.bashrc, then the
 /// same reports as `PWSH_SHELL_INIT`.
 ///
-/// - `PROMPT_COMMAND` writes `<prompt number>|<f or ->|<folder>` to `$RMC_CWD_FILE` (with
+/// - `PROMPT_COMMAND` writes `<prompt number>|<f or ->|<folder>` to `$CM_CWD_FILE` (with
 ///   `>|`, so `set -o noclobber` doesn't stop it), keeping `$?` for whatever runs after it.
-/// - The follow key (bash 4.4+) runs `__rmc_cd` and then presses Enter on the empty line, as
+/// - The follow key (bash 4.4+) runs `__cm_cd` and then presses Enter on the empty line, as
 ///   bash can only redraw its prompt by drawing a new one. The next prompt first moves the
 ///   cursor back over the old prompt, so the new one takes its place. Empty lines don't go
 ///   into the history.
 const BASH_SHELL_INIT: &str = r#"
 [ -f ~/.bashrc ] && . ~/.bashrc
 
-__rmc_seq=0
-__rmc_redraw=
-__rmc_follow=-
-__rmc_prompt() {
+__cm_seq=0
+__cm_redraw=
+__cm_follow=-
+__cm_prompt() {
     local ret=$?
-    if [ -n "$__rmc_redraw" ]; then
-        __rmc_redraw=
+    if [ -n "$__cm_redraw" ]; then
+        __cm_redraw=
         local prompt="${PS1@P}" nl=$'\n'
         local newlines="${prompt//[!$nl]/}"
         printf '\e[%dA\r\e[J' "$(( ${#newlines} + 1 ))"
     fi
-    __rmc_seq=$(( __rmc_seq + 1 ))
-    printf '%s|%s|%s' "$__rmc_seq" "$__rmc_follow" "$PWD" >| "$RMC_CWD_FILE"
+    __cm_seq=$(( __cm_seq + 1 ))
+    printf '%s|%s|%s' "$__cm_seq" "$__cm_follow" "$PWD" >| "$CM_CWD_FILE"
     return $ret
 }
-PROMPT_COMMAND="__rmc_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PROMPT_COMMAND="__cm_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-    __rmc_cd() {
+    __cm_cd() {
         local target
-        { target=$(< "$RMC_REQUEST_FILE"); } 2>/dev/null
+        { target=$(< "$CM_REQUEST_FILE"); } 2>/dev/null
         [ -d "$target" ] && builtin cd -- "$target"
-        __rmc_redraw=1
+        __cm_redraw=1
     }
-    for __rmc_map in emacs vi-insert; do
-        bind -m "$__rmc_map" -x '"\e[24;7~": __rmc_cd'
-        bind -m "$__rmc_map" '"\e[24;8~": "\e[24;7~\C-m"'
+    for __cm_map in emacs vi-insert; do
+        bind -m "$__cm_map" -x '"\e[24;7~": __cm_cd'
+        bind -m "$__cm_map" '"\e[24;8~": "\e[24;7~\C-m"'
     done
-    unset __rmc_map
-    __rmc_follow=f
+    unset __cm_map
+    __cm_follow=f
 fi
 "#;
 
-/// The `.zshenv` in the ZDOTDIR rmc gives its zsh: the user's own .zshenv (from their ZDOTDIR,
-/// which that file may change), then back to rmc's folder so zsh reads rmc's .zshrc next.
+/// The `.zshenv` in the ZDOTDIR cm gives its zsh: the user's own .zshenv (from their ZDOTDIR,
+/// which that file may change), then back to cm's folder so zsh reads cm's .zshrc next.
 const ZSH_ENV: &str = r#"
-__rmc_zdotdir=$ZDOTDIR
-ZDOTDIR=${RMC_USER_ZDOTDIR:-$HOME}
+__cm_zdotdir=$ZDOTDIR
+ZDOTDIR=${CM_USER_ZDOTDIR:-$HOME}
 [[ -r $ZDOTDIR/.zshenv ]] && builtin source $ZDOTDIR/.zshenv
-__rmc_user_zdotdir=$ZDOTDIR
-ZDOTDIR=$__rmc_zdotdir
+__cm_user_zdotdir=$ZDOTDIR
+ZDOTDIR=$__cm_zdotdir
 "#;
 
-/// rmc's `.zshrc`: the user's, then the reports of `PWSH_SHELL_INIT` from a precmd hook, and the
+/// cm's `.zshrc`: the user's, then the reports of `PWSH_SHELL_INIT` from a precmd hook, and the
 /// follow key as a zle widget, which can redraw the prompt in place (`zle reset-prompt`).
 const ZSH_RC: &str = r#"
-ZDOTDIR=$__rmc_user_zdotdir
-unset __rmc_zdotdir __rmc_user_zdotdir
+ZDOTDIR=$__cm_user_zdotdir
+unset __cm_zdotdir __cm_user_zdotdir
 [[ -r $ZDOTDIR/.zshrc ]] && builtin source $ZDOTDIR/.zshrc
 
-typeset -gi __rmc_seq=0 __rmc_status=0
-__rmc_report() {
+typeset -gi __cm_seq=0 __cm_status=0
+__cm_report() {
     local ret=$?
-    __rmc_status=$ret
-    __rmc_seq+=1
-    print -rn -- "$__rmc_seq|f|$PWD" >| $RMC_CWD_FILE
+    __cm_status=$ret
+    __cm_seq+=1
+    print -rn -- "$__cm_seq|f|$PWD" >| $CM_CWD_FILE
     return $ret
 }
-precmd_functions+=(__rmc_report)
+precmd_functions+=(__cm_report)
 
-__rmc_follow() {
+__cm_follow() {
     local target f
-    { target=$(<$RMC_REQUEST_FILE) } 2>/dev/null
+    { target=$(<$CM_REQUEST_FILE) } 2>/dev/null
     [[ -d $target ]] && builtin cd -q -- $target
     # What a new prompt would run: themes update from precmd (seeing the last command's
     # status, not this widget's), and it reports the folder.
     for f in precmd $precmd_functions; do
         if (( $+functions[$f] )); then
-            () { return $__rmc_status }
+            () { return $__cm_status }
             $f
         fi
     done
     zle reset-prompt
 }
-zle -N __rmc_follow
+zle -N __cm_follow
 for f in emacs viins vicmd; do
-    bindkey -M $f '\e[24;8~' __rmc_follow
+    bindkey -M $f '\e[24;8~' __cm_follow
 done
 unset f
 "#;
@@ -1282,7 +1283,7 @@ pub struct Session {
     pub env: Vec<(OsString, OsString)>,
 }
 
-/// The shells rmc knows how to hook into.
+/// The shells cm knows how to hook into.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Flavour {
     PowerShell,
@@ -1301,9 +1302,9 @@ pub enum Shell {
 }
 
 impl Shell {
-    /// `RMC_SHELL` if set, else pwsh, Windows PowerShell or cmd (or `$SHELL` elsewhere).
+    /// `CM_SHELL` if set, else pwsh, Windows PowerShell or cmd (or `$SHELL` elsewhere).
     pub fn detect() -> Self {
-        if let Ok(custom) = std::env::var("RMC_SHELL")
+        if let Ok(custom) = std::env::var("CM_SHELL")
             && !custom.trim().is_empty()
         {
             return Self::from_program(custom.trim());
@@ -1390,16 +1391,16 @@ impl Shell {
         }
     }
 
-    /// A one-off interactive session in rmc's own console (the fallback for Ctrl+O). A
-    /// PowerShell one reports its folder in `cwd_file` and goes back to rmc on Ctrl+O.
+    /// A one-off interactive session in cm's own console (the fallback for Ctrl+O). A
+    /// PowerShell one reports its folder in `cwd_file` and goes back to cm on Ctrl+O.
     pub fn interactive(&self, cwd_file: &Path) -> Command {
         let argv = self.interactive_argv();
         let mut command = Command::new(&argv[0]);
-        command.args(&argv[1..]).env("RMC_CWD_FILE", cwd_file).env("RMC_ONE_OFF", "1");
+        command.args(&argv[1..]).env("CM_CWD_FILE", cwd_file).env("CM_ONE_OFF", "1");
         command
     }
 
-    /// Whether Ctrl+O in the interactive shell returns to rmc (otherwise it takes `exit`).
+    /// Whether Ctrl+O in the interactive shell returns to cm (otherwise it takes `exit`).
     pub fn ctrl_o_returns(&self) -> bool {
         matches!(self, Shell::PowerShell(_))
     }
@@ -1416,14 +1417,14 @@ impl Shell {
         }
     }
 
-    /// Whether its prompt reports to rmc (its number and folder), so rmc can tell when it is
+    /// Whether its prompt reports to cm (its number and folder), so cm can tell when it is
     /// idle and where it is. cmd, sh, fish and others don't.
     pub fn reports_prompts(&self) -> bool {
         matches!(self.flavour(), Flavour::PowerShell | Flavour::Bash | Flavour::Zsh)
     }
 
     /// Program, arguments and extra environment of the persistent shell. bash and zsh get
-    /// rmc's start-up files (which load the user's own first), written into `dir`.
+    /// cm's start-up files (which load the user's own first), written into `dir`.
     pub fn session(&self, dir: &Path) -> std::io::Result<Session> {
         match (self, self.flavour()) {
             (Shell::Posix(program), Flavour::Bash) => {
@@ -1439,7 +1440,7 @@ impl Shell {
                 std::fs::write(dir.join(".zshrc"), ZSH_RC)?;
                 let mut env = vec![("ZDOTDIR".into(), dir.into())];
                 if let Some(user) = std::env::var_os("ZDOTDIR") {
-                    env.push(("RMC_USER_ZDOTDIR".into(), user));
+                    env.push(("CM_USER_ZDOTDIR".into(), user));
                 }
                 Ok(Session { argv: vec![program.into(), "-i".into()], env })
             }
@@ -1531,15 +1532,15 @@ mod tests {
         }
     }
 
-    /// An rmc started where another one is drawn is told; one in a new window isn't.
+    /// A cm started where another one is drawn is told; one in a new window isn't.
     #[test]
-    fn an_rmc_in_the_terminal_of_another_is_told() {
+    fn a_cm_in_the_terminal_of_another_is_told() {
         let parents = |pairs: &'static [(u32, u32)]| move |pid: u32| pairs.iter().find(|(p, _)| *p == pid).map(|(_, q)| *q);
-        // A command or an editor rmc (7) runs: rmc lends it its own terminal.
+        // A command or an editor cm (7) runs: cm lends it its own terminal.
         assert!(shares_terminal(7, &[7, 30], parents(&[(30, 7)])));
-        // In its shell (20, which rmc started) and so in the terminal rmc made for it.
+        // In its shell (20, which cm started) and so in the terminal cm made for it.
         assert!(shares_terminal(7, &[20, 30], parents(&[(20, 7), (30, 20)])));
-        // A new window opened from that shell: its processes are the shell's, none rmc's.
+        // A new window opened from that shell: its processes are the shell's, none cm's.
         assert!(!shares_terminal(7, &[40, 50], parents(&[(40, 20), (50, 40)])));
     }
 
@@ -1580,7 +1581,7 @@ mod tests {
         );
         let status = Command::new(program)
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encode_ps(&script)])
-            .env("RMC_CWD_FILE", &file)
+            .env("CM_CWD_FILE", &file)
             .status()
             .unwrap();
         assert!(status.success());
@@ -1589,7 +1590,7 @@ mod tests {
         assert!(util::same_path(&report.dir, &target), "{}", report.dir.display());
     }
 
-    /// Only opens handles; nothing is deleted. RMC_PROBE=PATH also prints the reason for PATH.
+    /// Only opens handles; nothing is deleted. CM_PROBE=PATH also prints the reason for PATH.
     #[test]
     fn says_why_something_cannot_be_deleted() {
         let tmp = TempDir::new("denied");
@@ -1601,7 +1602,7 @@ mod tests {
             assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(denied.to_string().contains("TrustedInstaller"), "{denied}");
         }
-        if let Some(path) = std::env::var_os("RMC_PROBE") {
+        if let Some(path) = std::env::var_os("CM_PROBE") {
             println!("{}: {:?}", Path::new(&path).display(), delete_denied(Path::new(&path)));
         }
     }

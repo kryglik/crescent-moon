@@ -1,6 +1,7 @@
-//! The user's settings: `settings.ini` in the config folder (`%APPDATA%\rmc`, `~/.config/rmc`),
-//! changed with the options editor (Ctrl+P) or by hand. One `name = value` per line; unknown
-//! names and unreadable values are ignored, so an older or newer file still loads.
+//! The user's settings: `settings.ini` in the config folder (`%APPDATA%\crescent-moon`,
+//! `~/.config/crescent-moon`), changed with the options editor (Ctrl+P) or by hand. One
+//! `name = value` per line; unknown names and unreadable values are ignored, so an older or
+//! newer file still loads.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use crate::util;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
-    /// F10 asks "Quit rmc?" (it asks anyway while the shell is busy).
+    /// F10 asks "Quit cm?" (it asks anyway while the shell is busy).
     pub confirm_quit: bool,
     pub show_hidden: bool,
     pub mouse: bool,
@@ -113,8 +114,8 @@ impl Settings {
 
     fn to_text(&self) -> String {
         format!(
-            "# rmc settings: change them with Ctrl+P in rmc, or here.\n\
-             # Empty commands mean automatic (RMC_EDITOR etc., then what is installed).\n\
+            "# cm settings: change them with Ctrl+P in cm, or here.\n\
+             # Empty commands mean automatic (CM_EDITOR etc., then what is installed).\n\
              confirm_quit = {}\n\
              show_hidden = {}\n\
              mouse = {}\n\
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn saves_and_loads() {
         let tmp = TempDir::new("settings");
-        let file = tmp.path().join("rmc").join("settings.ini");
+        let file = tmp.path().join("cm").join("settings.ini");
         assert_eq!(Settings::load(Some(&file)).unwrap(), Settings::default(), "no file: defaults");
         let settings = Settings {
             confirm_quit: true,

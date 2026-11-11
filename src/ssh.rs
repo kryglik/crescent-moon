@@ -1,6 +1,6 @@
 //! Connections to other computers, through the `ssh` program. It does the login, with the
-//! user's keys, agent, `~/.ssh/config` and known hosts, so rmc never sees a password or a key;
-//! over its pipes rmc speaks SFTP (see `sftp`).
+//! user's keys, agent, `~/.ssh/config` and known hosts, so cm never sees a password or a key;
+//! over its pipes cm speaks SFTP (see `sftp`).
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -81,7 +81,7 @@ pub fn parse(text: &str) -> Option<(Target, String)> {
     parse_exact(util::strip_quotes(text.trim()))
 }
 
-/// `parse` for an address rmc wrote itself (`Target::place`), to the letter: a name there may
+/// `parse` for an address cm wrote itself (`Target::place`), to the letter: a name there may
 /// end in a space, and read as typed it would be another file.
 pub fn parse_exact(text: &str) -> Option<(Target, String)> {
     if let Some(rest) = strip_scheme(text) {
@@ -110,14 +110,14 @@ pub fn parse_exact(text: &str) -> Option<(Target, String)> {
     Some((Target::from_text(who)?, path.to_string()))
 }
 
-/// `parse` for what is typed into a field, where the mistakes are said: rmc takes no password
+/// `parse` for what is typed into a field, where the mistakes are said: cm takes no password
 /// in an address (and keeps no field that holds one).
 pub fn parse_typed(text: &str) -> Result<Option<(Target, String)>, String> {
     if has_password(text) {
-        return Err("rmc takes no password in an address: ssh asks for it itself.".into());
+        return Err("cm takes no password in an address: ssh asks for it itself.".into());
     }
     match parse(text) {
-        None if strip_scheme(util::strip_quotes(text.trim())).is_some() => Err(format!("\"{}\" is not an address rmc can read.", text.trim())),
+        None if strip_scheme(util::strip_quotes(text.trim())).is_some() => Err(format!("\"{}\" is not an address cm can read.", text.trim())),
         parsed => Ok(parsed),
     }
 }
@@ -135,7 +135,7 @@ pub fn parse_connect(text: &str) -> Result<(Target, String), String> {
     match parse_typed(text)? {
         Some(parsed) => Ok(parsed),
         None => Target::from_text(text.trim()).map(|target| (target, String::new())).ok_or_else(|| {
-            format!("\"{}\" is not an address rmc can read.\nThe forms are host, user@host, host:/path, ssh://user@host:port/path", text.trim())
+            format!("\"{}\" is not an address cm can read.\nThe forms are host, user@host, host:/path, ssh://user@host:port/path", text.trim())
         }),
     }
 }
@@ -302,7 +302,7 @@ fn fast_pipe() -> Option<(std::fs::File, std::os::windows::io::OwnedHandle)> {
     };
     use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT};
     const BUFFER: u32 = 1 << 20;
-    let name = format!(r"\\.\pipe\rmc-{}-{:016x}{:016x}", std::process::id(), util::random(), util::random());
+    let name = format!(r"\\.\pipe\cm-{}-{:016x}{:016x}", std::process::id(), util::random(), util::random());
     let name: Vec<u16> = std::ffi::OsStr::new(&name).encode_wide().chain([0]).collect();
     let ends = PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE;
     let kind = PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
@@ -341,7 +341,7 @@ fn start_ssh(target: &Target, login: Login, fast: bool) -> io::Result<(Child, Bo
 fn ssh_command(target: &Target, login: Login) -> Command {
     let mut command = Command::new(ssh_program());
     command.args(ssh_arguments(target, login));
-    // Ctrl+C in a viewer rmc runs is for the viewer; it mustn't end every connection too.
+    // Ctrl+C in a viewer cm runs is for the viewer; it mustn't end every connection too.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -357,7 +357,7 @@ fn ssh_command(target: &Target, login: Login) -> Command {
             }
         }
     }
-    // Behind the panels it stays off the console rmc draws on and reads keys from; at the
+    // Behind the panels it stays off the console cm draws on and reads keys from; at the
     // terminal it has to be on it, in a group of its own (Ctrl+C reaches it as a key there).
     #[cfg(windows)]
     {
@@ -392,7 +392,7 @@ impl TerminalLent {
 #[cfg(unix)]
 impl Drop for TerminalLent {
     fn drop(&mut self) {
-        // SAFETY: as above. From the background this would stop rmc, unless ignored.
+        // SAFETY: as above. From the background this would stop cm, unless ignored.
         unsafe {
             let before = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(libc::STDIN_FILENO, self.0);
@@ -429,7 +429,7 @@ impl Connection {
         let mut started = Some(started);
         let mut attempt = |fast: bool| {
             let (child, stdin) = start_ssh(target, login, fast).map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => Refused::Said("The ssh program was not found. rmc connects through it.".into()),
+                io::ErrorKind::NotFound => Refused::Said("The ssh program was not found. cm connects through it.".into()),
                 _ => Refused::Said(format!("Cannot run ssh:\n{e}")),
             })?;
             #[cfg(unix)]
@@ -497,7 +497,7 @@ impl Connection {
 
 static POOL: Mutex<Vec<Arc<Connection>>> = Mutex::new(Vec::new());
 
-/// The live connection to `target`, if there is one. They stay open until rmc ends: going back
+/// The live connection to `target`, if there is one. They stay open until cm ends: going back
 /// to a host mustn't mean logging in again.
 pub fn find(target: &Target) -> Option<Arc<Connection>> {
     let mut pool = lock(&POOL);
@@ -638,7 +638,7 @@ pub mod tests {
         assert_eq!(parent("/"), None);
         assert_eq!(name_of("/a/b.txt"), "b.txt");
         assert_eq!(name_of("/a/b/"), "b");
-        // Names keep their spaces, in an address rmc made.
+        // Names keep their spaces, in an address cm made.
         assert_eq!(parse_exact("nas:/tmp/name "), Some((target(None, "nas", None), "/tmp/name ".into())));
         assert_eq!(parse("nas:/tmp/name ").map(|(_, path)| path), Some("/tmp/name".into()));
         assert_eq!(absolute("/home/me", "/tmp/ name "), "/tmp/ name ");

@@ -1,6 +1,7 @@
-# rmc
+# Crescent Moon
 
-A small Midnight Commander-style two-panel file manager for the terminal, written in Rust.
+Crescent Moon (`cm`, mc turned around) is a small Midnight Commander-style two-panel file
+manager for the terminal, written in Rust.
 It runs natively on Windows (Windows Terminal, PowerShell) and on Linux, including WSL
 (bash or zsh). It should build on macOS too, but that hasn't been tried.
 
@@ -41,20 +42,20 @@ What it does differently from the Windows port of mc:
 
 ```powershell
 cargo test
-cargo install --path .     # puts rmc.exe into ~/.cargo/bin
-rmc                        # or: rmc LEFT_DIR RIGHT_DIR
+cargo install --path .     # puts cm.exe into ~/.cargo/bin
+cm                        # or: cm LEFT_DIR RIGHT_DIR
 ```
 
-The release build links the C runtime statically (`.cargo/config.toml`), so `rmc.exe` can be
+The release build links the C runtime statically (`.cargo/config.toml`), so `cm.exe` can be
 copied to another PC without installing anything.
 
-On Linux the same `cargo install --path .` puts `rmc` into `~/.cargo/bin`. Building inside WSL
+On Linux the same `cargo install --path .` puts `cm` into `~/.cargo/bin`. Building inside WSL
 from the Windows checkout works; keep the build output on the Linux side, where it is much
 faster:
 
 ```bash
 cd /mnt/e/devel/midnight-commander
-CARGO_TARGET_DIR=~/rmc-target cargo install --path .
+CARGO_TARGET_DIR=~/cm-target cargo install --path .
 ```
 
 ### On Linux
@@ -69,7 +70,7 @@ CARGO_TARGET_DIR=~/rmc-target cargo install --path .
 
 ## Keys
 
-Press **F1** inside rmc for the full list, or **F12** to find a command by typing part of its
+Press **F1** inside cm for the full list, or **F12** to find a command by typing part of its
 name ("zip", "clip", "hist"; Enter runs it). The essentials:
 
 #### Moving around
@@ -117,7 +118,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Alt+F5 / Alt+F9 | pack into a zip / unpack the zip under the cursor (see Zip archives) |
 | Ctrl+C / Ctrl+X | the marked files (or the one under the cursor) to the clipboard, copied or cut, the way Explorer puts them there: paste them in Explorer, a mail or a chat |
 | Ctrl+Shift+C | their full paths to the clipboard as text |
-| Alt+V | paste files copied or cut in Explorer or in rmc into the panel's folder (cut ones are moved, and the clipboard is emptied afterwards, as Explorer does). Windows Terminal keeps Ctrl+V for its own paste; where a terminal lets Ctrl+V through, it works too. On Linux rmc keeps its own clipboard for files, and the paths go to the terminal's clipboard (OSC 52, over ssh too) |
+| Alt+V | paste files copied or cut in Explorer or in cm into the panel's folder (cut ones are moved, and the clipboard is emptied afterwards, as Explorer does). Windows Terminal keeps Ctrl+V for its own paste; where a terminal lets Ctrl+V through, it works too. On Linux cm keeps its own clipboard for files, and the paths go to the terminal's clipboard (OSC 52, over ssh too) |
 
 #### Everything else
 
@@ -131,7 +132,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | F12 | every command with its key, found by typing |
 
 Typing anywhere goes to the command line; Enter runs it in the shell (see below), in the
-active panel's folder. `cd DIR` is handled by rmc itself and changes the panel's folder; it
+active panel's folder. `cd DIR` is handled by cm itself and changes the panel's folder; it
 reads quotes and environment variables as the shell would, and `cd -` goes back.
 
 On Windows the bar at the bottom follows Shift, Ctrl and Alt: hold one for a moment and it shows
@@ -162,7 +163,7 @@ checks whether you may delete everything. Where you may not, it says which item 
 (who owns it), and on Windows offers **As admin**, as does the error dialog if a delete runs
 into such a file halfway.
 
-As admin starts a second rmc with administrator rights, after Windows asks you (UAC). It
+As admin starts a second cm with administrator rights, after Windows asks you (UAC). It
 turns on the backup and restore privileges an administrator has, so even files belonging to
 TrustedInstaller go, with no `takeown` or `icacls` needed, and deletes permanently: the
 Recycle Bin refuses protected files even then. Its progress shows as for any delete, and Esc
@@ -177,10 +178,10 @@ say so.
 
 - **F5** copies the marked files and folders out of it, into the other panel's folder by
   default, with the usual progress, overwrite questions and Esc.
-- **F3** and **Enter** take a file out into rmc's temp folder and view it or open it in its
+- **F3** and **Enter** take a file out into cm's temp folder and view it or open it in its
   app (a zip in the zip opens as a folder too); quick view (Ctrl+Q) reads files straight from
   the zip. Ctrl+Space sizes its folders at once. What Enter opens is a read-only copy: save
-  changes somewhere else, as it goes when rmc ends. What F3 shows goes when the viewer closes.
+  changes somewhere else, as it goes when cm ends. What F3 shows goes when the viewer closes.
 - **Alt+F5** packs the marked files (folders with what they hold) into a new zip, in the
   other panel's folder by default; **Alt+F9** unpacks the zip under the cursor into the other
   panel's folder, and one with several things at its top into a folder of its own name, as
@@ -188,9 +189,9 @@ say so.
 - A zip that is there is only replaced by a complete one: if a file can't be read (and is
   skipped), the new zip goes beside it as `name (incomplete).zip`.
 - Names in a zip that would land outside the folder it is unpacked to (`../x`, `C:x`) are left
-  out, and rmc says so.
+  out, and cm says so.
 - Names are UTF-8 when the zip says so or when they read as UTF-8; older zips made by Windows
-  use its OEM code page (852 on a Czech Windows), which rmc reads too. Names that would climb
+  use its OEM code page (852 on a Czech Windows), which cm reads too. Names that would climb
   out of the folder they are unpacked into (`../x`) are left out. Packing writes UTF-8 names,
   deflated, ZIP64 for files over 4 GB.
 
@@ -201,11 +202,11 @@ say so.
 picker (Alt+F1 / Alt+F2) lists the computers connected to lately and the hosts of
 `~/.ssh/config`. Addresses go in the hotlist and the folder history like folders do.
 
-rmc runs your `ssh` program and speaks SFTP through it, so whatever `ssh host` does works here
+cm runs your `ssh` program and speaks SFTP through it, so whatever `ssh host` does works here
 too: keys, the agent, aliases from `~/.ssh/config`, ProxyJump. If `ssh` needs to ask something (a
 password, a passphrase, whether to trust a new host), the terminal is handed over for that,
-and Ctrl+C gives up. rmc itself never sees a password; it refuses one written in an address.
-Connections stay open until rmc ends. The server has to offer SFTP, as OpenSSH does.
+and Ctrl+C gives up. cm itself never sees a password; it refuses one written in an address.
+Connections stay open until cm ends. The server has to offer SFTP, as OpenSSH does.
 
 - **F5 / F6** work between a panel here and a panel there, between two computers, and within one.
   The field takes an address too, so a local panel can copy straight to `host:/path/`. In a
@@ -219,9 +220,9 @@ Connections stay open until rmc ends. The server has to offer SFTP, as OpenSSH d
 - **F3** brings a copy here for the viewer. **F4** brings one for the editor, and if you saved
   it, it goes back when the editor closes, keeping the permissions the file had. On a link
   both go to what it leads to, and the link stays. If the file changed over there meanwhile,
-  rmc asks, and keeps yours in `rescued` beside the settings whichever way you answer. An editor
-  that goes on by itself (gvim, code) can't be followed: what it saves stays here until rmc ends,
-  and rmc says so. Enter opens a copy in its app (read-only), and a zip as a folder.
+  cm asks, and keeps yours in `rescued` beside the settings whichever way you answer. An editor
+  that goes on by itself (gvim, code) can't be followed: what it saves stays here until cm ends,
+  and cm says so. Enter opens a copy in its app (read-only), and a zip as a folder.
 - **F8** deletes for good, as there is no trash over SSH; the question says so, and Enter answers
   No. Links are never followed. What is mounted in a folder is left alone as far as a server
   shows it: another disk is seen, a bind mount of the same disk isn't.
@@ -241,7 +242,7 @@ Connections stay open until rmc ends. The server has to offer SFTP, as OpenSSH d
   is a name.
 - A replaced file is a new file with the old one's permissions. As in a local copy, it belongs to
   you unless you are root, and hard links to the old one stay with the old contents.
-- A folder reached both over SSH and through a share mounted here is two folders to rmc. A file
+- A folder reached both over SSH and through a share mounted here is two folders to cm. A file
   moved onto itself that way is noticed and left in place; a whole folder moved into itself goes
   down to the depth limit and says so, with nothing lost.
 
@@ -282,10 +283,10 @@ dimmed.
   shows when its newest commit was made, how it stands against what it follows (`↑1 ↓2`,
   `gone`) and that commit's first line; typing narrows the list by name or by that line. As in
   `git branch`, `*` marks the branch this worktree is on and `+` one another worktree has.
-  Enter on a `+` branch goes to that worktree, like Alt+W. On any other branch rmc asks, then
+  Enter on a `+` branch goes to that worktree, like Alt+W. On any other branch cm asks, then
   runs `git switch` (`git switch --track origin/fix` for a remote one, which makes a branch
   `fix` that follows it). Changes not committed go along, and git refuses when they would be
-  lost; rmc then shows what git said. The switch is never stopped halfway, and keys wait
+  lost; cm then shows what git said. The switch is never stopped halfway, and keys wait
   until it is done. git lists the branches on a thread of its own, so a slow share doesn't
   hold the screen.
 
@@ -341,33 +342,33 @@ and binary files. Results appear while you type, grouped by file, with the match
 ### The shell
 
 Like mc's subshell, there is one shell for the whole session. It starts with the first Ctrl+O
-(or the first command typed in rmc) and runs in a pseudo-console (ConPTY) that rmc owns, so it
+(or the first command typed in cm) and runs in a pseudo-console (ConPTY) that cm owns, so it
 keeps going while the panels are shown: variables stay, and a long command keeps running in the
-background. Ctrl+O switches between the panels and the shell's screen, which rmc draws full
+background. Ctrl+O switches between the panels and the shell's screen, which cm draws full
 screen; Shift+PgUp/PgDn or the mouse wheel scroll back through its output.
 
 - If you `cd` in the shell, the active panel follows when you come back to the panels.
 - If you move the panel and the shell is idle at its prompt, the shell follows when you switch
-  to it. That's silent: rmc presses a key the shell's start-up script binds (Ctrl+Alt+Shift+F12),
+  to it. That's silent: cm presses a key the shell's start-up script binds (Ctrl+Alt+Shift+F12),
   which changes folder and redraws the prompt in place, so nothing shows up as a command or in
   your history.
-- A command typed in rmc while the shell is busy is refused rather than typed into the running
+- A command typed in cm while the shell is busy is refused rather than typed into the running
   program. Text typed in the shell while a command ran keeps it busy too, as it waits at the
   next prompt; keys the program read itself don't: htop's q, a password, what goes over ssh
   (a program on the whole screen, or on Linux one that reads key by key or without echo).
 - `exit` ends the shell and returns to the panels; the next Ctrl+O starts a new one.
-- `rmc` typed there (or in rmc's command line) doesn't start a second rmc inside the first: it
-  says rmc is already running in this terminal, and Ctrl+O goes back to it. A tab or window
-  opened from there is a terminal of its own, so rmc starts there as usual. (rmc tells by the
-  `RMC_PID` it passes to everything it runs, and checks which processes share the console, or
+- `cm` typed there (or in cm's command line) doesn't start a second cm inside the first: it
+  says cm is already running in this terminal, and Ctrl+O goes back to it. A tab or window
+  opened from there is a terminal of its own, so cm starts there as usual. (cm tells by the
+  `CM_PID` it passes to everything it runs, and checks which processes share the console, or
   on Linux the session.)
 
-This works with pwsh or Windows PowerShell, bash and zsh: rmc starts the shell with a small
+This works with pwsh or Windows PowerShell, bash and zsh: cm starts the shell with a small
 start-up script that loads your usual one (your profile, `~/.bashrc`, or `.zshenv` and `.zshrc`
 from your ZDOTDIR), then hooks the prompt so each prompt reports its number and folder, and
 binds the silent follow key. bash redraws its prompt by drawing a new one in the old one's
 place (bash 4.4 or later; older ones get a visible ` cd`). With cmd, sh, fish or other shells
-the shell still works, but the folders don't follow each other, and rmc can't tell whether a
+the shell still works, but the folders don't follow each other, and cm can't tell whether a
 command is still running, so it never refuses one.
 
 ### Mouse
@@ -379,15 +380,17 @@ to new). Click the F-key bar labels to run them; dialog buttons and the rows of 
 picker, hotlist, sort menu, folder history, worktree list, F12 list, colour schemes and attributes are
 clickable too, as are the tabs. The wheel scrolls the quick view.
 
-While rmc has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
-`rmc --no-mouse` to leave the mouse to the terminal.
+While cm has the mouse, Windows Terminal selects text with **Shift+drag**. Start it with
+`cm --no-mouse` to leave the mouse to the terminal.
 
 ## Settings
 
 Ctrl+P opens the options editor; arrows move, Space toggles a checkbox, and you type into a
 text row (it counts when you move off it). Everything takes effect at once and is saved in
-`settings.ini` next to the hotlist (`%APPDATA%\rmc`, or `~/.config/rmc` on Linux), a plain
-`name = value` file you can also edit by hand:
+`settings.ini` next to the hotlist (`%APPDATA%\crescent-moon`, or `~/.config/crescent-moon` on
+Linux), a plain `name = value` file you can also edit by hand. (Crescent Moon used to be called
+rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc` or
+`~/.config/rmc`, into its own.)
 
 | Option | Default |
 | --- | --- |
@@ -405,14 +408,15 @@ Environment variables, used when the matching option is empty:
 
 | Variable | Default |
 | --- | --- |
-| `RMC_EDITOR` (then `VISUAL`, `EDITOR`) | `nvim` (if missing: vim, vi, nano) |
-| `RMC_VIEWER` | the editor, plus `-R` for vim/nvim or `-v` for nano |
-| `RMC_PAGER` (then `PAGER`) | `less`, for files over 10 MB; on Windows Git for Windows' `less.exe` is found too. Without a pager, F3 asks like F4 |
-| `RMC_SHELL` | `pwsh`, then `powershell`, then `cmd`; on Linux `$SHELL` |
-| `RMC_LOG` | file to log the shell's pseudo-console traffic to, for debugging (typed input is logged as a byte count only) |
-| `RMC_TRACE` | file to log a line per frame to: what woke rmc, how long until the frame was sent, drawing time and bytes; tells a slow rmc from a slow terminal |
+| `CM_EDITOR` (then `VISUAL`, `EDITOR`) | `nvim` (if missing: vim, vi, nano) |
+| `CM_VIEWER` | the editor, plus `-R` for vim/nvim or `-v` for nano |
+| `CM_PAGER` (then `PAGER`) | `less`, for files over 10 MB; on Windows Git for Windows' `less.exe` is found too. Without a pager, F3 asks like F4 |
+| `CM_SHELL` | `pwsh`, then `powershell`, then `cmd`; on Linux `$SHELL` |
+| `CM_LOG` | file to log the shell's pseudo-console traffic to, for debugging (typed input is logged as a byte count only) |
+| `CM_TRACE` | file to log a line per frame to: what woke cm, how long until the frame was sent, drawing time and bytes; tells a slow cm from a slow terminal |
 
-Favourite folders are saved in `%APPDATA%\rmc\hotlist.txt` (one path per line; you can edit it).
+Favourite folders are saved in `%APPDATA%\crescent-moon\hotlist.txt` (one path per line; you
+can edit it).
 The folders visited (Alt+H) and the commands typed (Alt+P / Alt+N) are kept in `history.txt`
 beside it: the last 300 folders and 500 commands.
 
@@ -422,13 +426,13 @@ with sizes measured, F9's size sort orders directories by them.
 
 ### Staying in the last directory
 
-`rmc --cwd-file FILE` writes the active panel's directory to `FILE` on exit. With this function
-in your PowerShell profile, `rmc` leaves the shell in that directory:
+`cm --cwd-file FILE` writes the active panel's directory to `FILE` on exit. With this function
+in your PowerShell profile, `cm` leaves the shell in that directory:
 
 ```powershell
-function rmc {
+function cm {
     $f = New-TemporaryFile
-    rmc.exe --cwd-file $f @args
+    cm.exe --cwd-file $f @args
     $dir = Get-Content $f -ErrorAction SilentlyContinue
     Remove-Item $f
     if ($dir) { Set-Location -LiteralPath $dir }
@@ -444,7 +448,7 @@ letter jumps to the next name starting with it. A click on a row keeps that one.
 
 | Scheme | Look |
 | --- | --- |
-| classic | mc's blue panels, rmc's look from the start |
+| classic | mc's blue panels, cm's look from the start |
 | classic-v2 | classic in exact colours on a darker, calmer blue, with a yellow cursor bar: marked files full yellow, in the panels' blue on the bar |
 | dark | classic on black, with dimmer lines and hidden files |
 | terminal | the terminal's own background and palette, with `ls`'s colours for folders and files |
@@ -458,12 +462,12 @@ png, raw photos such as cr2, cr3, nef, arw, dng; svg…), sound and video, lefto
 their own parts too, plain in the built-in schemes.
 
 **F4** in the list opens the scheme in the editor as a file: a built-in one is first written
-out as `<name>.ini` in the `schemes` folder beside the settings (`%APPDATA%\rmc\schemes`,
-`~/.config/rmc/schemes`), every part spelled out with what it is, and from then on that file
-takes the built-in one's place (delete it to get the built-in one back). Back from the editor
+out as `<name>.ini` in the `schemes` folder beside the settings
+(`%APPDATA%\crescent-moon\schemes`, `~/.config/crescent-moon/schemes`), every part spelled out
+with what it is, and from then on that file takes the built-in one's place (delete it to get the built-in one back). Back from the editor
 the list reads it again and shows it at once; a line it can't read is named under the list.
 A file closed without a change is removed again, so a look doesn't pin the scheme: the
-built-in one keeps getting rmc's updates.
+built-in one keeps getting cm's updates.
 Any other `*.ini` file there is a scheme of its own, named after the file. A line gives a
 part of the screen its look:
 
@@ -483,12 +487,12 @@ lightcyan, white. A part drawn on a panel, in a dialog or on the command line ha
 background unless it names one; a file's look builds up from the panel's, its kind's,
 hidden, ignored, marked and the cursor's.
 
-Terminals that show only 256 colours (or 16) get the nearest of theirs. rmc takes any
+Terminals that show only 256 colours (or 16) get the nearest of theirs. cm takes any
 colour in Windows' consoles and Windows Terminal (WSL in it too), and on Linux where
 `COLORTERM=truecolor` (or `24bit`) says so. ssh doesn't pass `COLORTERM` on, so a server
 reached from Windows Terminal gets 256 colours unless its `~/.bashrc` sets
 `export COLORTERM=truecolor`. The list says what the terminal gets. With `NO_COLOR` set,
-rmc shows the mono scheme.
+cm shows the mono scheme.
 
 ## Layout
 
@@ -505,7 +509,7 @@ rmc shows the mono scheme.
 | `src/sftp.rs` | an SFTP client over any pair of pipes, with many requests under way |
 | `src/lfs.rs` | file calls that give Windows a path literally when it has to be (`foo.`, `nul`), and keeping a copy's flags and mode |
 | `src/sandbox_tests.rs` | the jobs at the edges, on real files: links, odd names, long paths, locked files, crafted zips |
-| `src/sandbox_tests/random.rs` | random colliding trees through every job and way of answering, the whole disk checked after each (`RMC_ROUNDS=2000 cargo test random_` for a long run) |
+| `src/sandbox_tests/random.rs` | random colliding trees through every job and way of answering, the whole disk checked after each (`CM_ROUNDS=2000 cargo test random_` for a long run) |
 | `src/archive.rs` | zip archives: the index, names (none that would land outside the folder), times |
 | `src/git.rs` | git: the branch, operation under way and worktrees from the repository's files; `git status` in the background |
 | `src/places.rs` | Ctrl+E: the places kept per git repository in `places.ini`, and the menu of them |
@@ -524,7 +528,7 @@ rmc shows the mono scheme.
 | `src/settings.rs` | `settings.ini`: loading, saving |
 | `src/scheme.rs` | colour schemes: the parts of the screen, the built-in schemes, scheme files, fewer colours for terminals with fewer, files' kinds |
 | `src/survey.rs` | counting what a delete would remove, and checking permissions, in the background |
-| `src/admin.rs` | "As admin": starting the elevated helper (`rmc --admin-job`) and the helper itself |
+| `src/admin.rs` | "As admin": starting the elevated helper (`cm --admin-job`) and the helper itself |
 | `src/options.rs` | the options editor's rows |
 | `src/dialog.rs` | dialogs, buttons, line editor, help text |
 | `src/ui.rs` | drawing with ratatui |
@@ -535,21 +539,21 @@ rmc shows the mono scheme.
 ## Testing in a real terminal
 
 `cargo test` covers most things, including a real shell in the embedded terminal: pwsh on
-Windows, bash and zsh on Linux (`RMC_TEST_ZSH` can point at a zsh that isn't on the PATH).
+Windows, bash and zsh on Linux (`CM_TEST_ZSH` can point at a zsh that isn't on the PATH).
 Run the Linux tests from Windows with WSL:
 
 ```bash
-wsl -- bash -lc 'cd /mnt/e/devel/midnight-commander && CARGO_TARGET_DIR=~/rmc-target cargo test'
+wsl -- bash -lc 'cd /mnt/e/devel/midnight-commander && CARGO_TARGET_DIR=~/cm-target cargo test'
 ```
 
-To check rmc itself in a Windows Terminal window, the scripts in `tools/` attach to its
-console. That works for rmc inside WSL too: give them the pid of its `wsl.exe`. A `NO_COLOR`
+To check cm itself in a Windows Terminal window, the scripts in `tools/` attach to its
+console. That works for cm inside WSL too: give them the pid of its `wsl.exe`. A `NO_COLOR`
 variable in the environment the window inherits (some tools set it) gives the mono scheme.
 Trying schemes there saves the one kept in `settings.ini`; point `APPDATA` (on Linux
 `XDG_CONFIG_HOME`) at another folder for the window to keep yours as they are.
 
 ```powershell
-wt -w new cmd /c rmc E:\some\dir          # then find its pid: Get-Process rmc
+wt -w new cmd /c cm E:\some\dir          # then find its pid: Get-Process cm
 tools\sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:dir', 'enter'   # also esc, f1-f12, alt+f1, shift+f4, ctrl+d…
 tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
 ```

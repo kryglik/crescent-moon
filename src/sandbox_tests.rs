@@ -244,13 +244,14 @@ fn saving_keeps_a_link_to_the_settings() {
     assert_eq!(names(&tmp.path().join("dotfiles")), ["settings.ini"], "nothing left aside");
 }
 
-/// What an rmc that was killed left in the temp folder is recognised by its name; other
+/// What a cm that was killed left in the temp folder is recognised by its name; other
 /// folders aren't touched.
 #[test]
-fn only_rmc_private_folders_are_swept() {
-    assert_eq!(crate::util::private_dir_owner("rmc-1234-session-0123456789abcdef"), Some(1234));
-    assert_eq!(crate::util::private_dir_owner("rmc-1234-shell-0123456789abcdef"), Some(1234));
-    for other in ["rmc-edge-dots-140564-5", "rmc-1234-admin-0123456789abcdef", "rmc-1234-session-xyz", "rmc-panic.txt", "other"] {
+fn only_cm_private_folders_are_swept() {
+    assert_eq!(crate::util::private_dir_owner("cm-1234-session-0123456789abcdef"), Some(1234));
+    assert_eq!(crate::util::private_dir_owner("cm-1234-shell-0123456789abcdef"), Some(1234));
+    assert_eq!(crate::util::private_dir_owner("rmc-1234-shell-0123456789abcdef"), Some(1234), "from before the new name");
+    for other in ["cm-edge-dots-140564-5", "cm-1234-admin-0123456789abcdef", "cm-1234-session-xyz", "cm-panic.txt", "other"] {
         assert_eq!(crate::util::private_dir_owner(other), None, "{other}");
     }
 }

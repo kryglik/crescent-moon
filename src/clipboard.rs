@@ -1,9 +1,9 @@
-//! The clipboard for files, as in Explorer and Total Commander. Ctrl+C (Ctrl+X to move) in rmc
+//! The clipboard for files, as in Explorer and Total Commander. Ctrl+C (Ctrl+X to move) in cm
 //! puts the marked files on it, so Explorer, a mail or a chat can paste them; Ctrl+Shift+C
 //! puts their full paths there as text. Alt+V (or Ctrl+V, where the terminal lets it through)
-//! pastes files copied or cut in Explorer or in rmc.
+//! pastes files copied or cut in Explorer or in cm.
 //!
-//! Elsewhere than Windows there is no system clipboard for files: rmc keeps its own, and the
+//! Elsewhere than Windows there is no system clipboard for files: cm keeps its own, and the
 //! paths go to the terminal's clipboard as text (OSC 52, which works over ssh too).
 
 use std::path::{Path, PathBuf};
@@ -21,14 +21,14 @@ pub struct Files {
     pub effect: Effect,
 }
 
-/// The system's clipboard on Windows; rmc's own elsewhere, and in tests (so `cargo test`
+/// The system's clipboard on Windows; cm's own elsewhere, and in tests (so `cargo test`
 /// never replaces what the user copied).
 #[cfg_attr(not(windows), allow(dead_code))]
 const SYSTEM: bool = cfg!(all(windows, not(test)));
 
 #[derive(Default)]
 pub struct Clipboard {
-    /// rmc's own clipboard, where the system has none for files.
+    /// cm's own clipboard, where the system has none for files.
     own: Option<Files>,
 }
 
@@ -65,7 +65,7 @@ impl Clipboard {
     }
 
     /// After moved files were pasted, the clipboard no longer says where they are; Explorer
-    /// empties it then, and so does rmc.
+    /// empties it then, and so does cm.
     pub fn moved(&mut self) {
         #[cfg(windows)]
         if SYSTEM {
@@ -154,7 +154,7 @@ mod win {
     impl Open {
         fn new() -> Result<Open, String> {
             // With no owner window, EmptyClipboard leaves the clipboard without an owner, and
-            // what is put on it afterwards doesn't outlive rmc reliably; the console window
+            // what is put on it afterwards doesn't outlive cm reliably; the console window
             // will do as the owner.
             let owner = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
             for _ in 0..25 {
@@ -316,12 +316,12 @@ mod tests {
         assert_eq!(paste_target(&dir, tmp.path()), Some(tmp.path().join("photos.2024 - Copy")));
     }
 
-    /// The real Windows clipboard: what rmc puts there reads back, cut included. (It replaces
-    /// whatever was on the clipboard, so it runs only when asked: RMC_CLIPBOARD_TEST=1.)
+    /// The real Windows clipboard: what cm puts there reads back, cut included. (It replaces
+    /// whatever was on the clipboard, so it runs only when asked: CM_CLIPBOARD_TEST=1.)
     #[cfg(windows)]
     #[test]
     fn files_go_through_the_windows_clipboard() {
-        if std::env::var_os("RMC_CLIPBOARD_TEST").is_none() {
+        if std::env::var_os("CM_CLIPBOARD_TEST").is_none() {
             return;
         }
         let tmp = TempDir::new("clipboard");
@@ -332,9 +332,9 @@ mod tests {
         assert_eq!(win::get_files().map(|f| (f.paths.len(), f.effect)), Some((1, Effect::Copy)));
         win::clear();
         assert_eq!(win::get_files(), None);
-        // RMC_CLIPBOARD_LEAVE: leave two cut files on it, for another program to read.
-        if std::env::var_os("RMC_CLIPBOARD_LEAVE").is_some() {
-            let kept = std::env::temp_dir().join("rmc-clipboard-check");
+        // CM_CLIPBOARD_LEAVE: leave two cut files on it, for another program to read.
+        if std::env::var_os("CM_CLIPBOARD_LEAVE").is_some() {
+            let kept = std::env::temp_dir().join("cm-clipboard-check");
             let _ = std::fs::create_dir_all(&kept);
             let files = [kept.join("a.txt"), kept.join("Účty a faktury.txt")];
             for file in &files {

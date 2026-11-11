@@ -197,10 +197,10 @@ pub fn random() -> u64 {
 
 /// A new folder in the temp folder, made fresh with a name nobody can guess and on Linux
 /// readable by its owner only: /tmp is shared with other users, who could otherwise read
-/// what rmc puts there or plant a link under a name rmc is about to use.
+/// what cm puts there or plant a link under a name cm is about to use.
 pub fn private_dir(tag: &str) -> std::io::Result<PathBuf> {
     for _ in 0..100 {
-        let dir = std::env::temp_dir().join(format!("rmc-{}-{tag}-{:016x}", std::process::id(), random()));
+        let dir = std::env::temp_dir().join(format!("cm-{}-{tag}-{:016x}", std::process::id(), random()));
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -217,7 +217,7 @@ pub fn private_dir(tag: &str) -> std::io::Result<PathBuf> {
 /// Writes `text` to `file` aside first and renames it over the old one: a crash or a full
 /// disk never leaves half a file. `flush` puts it on the disk first, which can take a second
 /// on a busy one: for what the user just changed, not what is saved in passing. The name
-/// aside is unique, so two rmc windows saving at once don't trip over each other.
+/// aside is unique, so two cm windows saving at once don't trip over each other.
 pub fn write_atomically(file: &Path, text: &str, flush: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = file.parent() {
@@ -244,7 +244,7 @@ pub fn write_atomically(file: &Path, text: &str, flush: bool) -> std::io::Result
 
 static SESSION_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// This rmc's own private folder (see `private_dir`), made when first needed: files taken
+/// This cm's own private folder (see `private_dir`), made when first needed: files taken
 /// out of archives, the last folder of a one-off shell. `remove_session_dir` clears it.
 pub fn session_dir() -> std::io::Result<PathBuf> {
     let mut dir = SESSION_DIR.lock().unwrap_or_else(|e| e.into_inner());
@@ -263,7 +263,7 @@ pub fn remove_session_dir() {
     }
 }
 
-/// Clears, in the background, what an rmc that ended without tidying up (a closed terminal
+/// Clears, in the background, what a cm that ended without tidying up (a closed terminal
 /// tab, a lost ssh connection) left in the temp folder: private folders of processes that are
 /// gone. Files taken out of archives could otherwise pile up for good.
 pub fn sweep_temp() {
@@ -280,9 +280,10 @@ pub fn sweep_temp() {
     });
 }
 
-/// The process a folder name of `private_dir` belongs to: `rmc-<pid>-<tag>-<16 hex digits>`.
+/// The process a folder name of `private_dir` belongs to: `cm-<pid>-<tag>-<16 hex digits>`,
+/// or `rmc-…` from the time cm was called rmc.
 pub fn private_dir_owner(name: &str) -> Option<u32> {
-    let mut parts = name.strip_prefix("rmc-")?.split('-');
+    let mut parts = name.strip_prefix("cm-").or_else(|| name.strip_prefix("rmc-"))?.split('-');
     let (pid, tag, random) = (parts.next()?, parts.next()?, parts.next()?);
     let valid = parts.next().is_none()
         && matches!(tag, "session" | "shell")
@@ -292,16 +293,16 @@ pub fn private_dir_owner(name: &str) -> Option<u32> {
 }
 
 /// Where an internal error on a background thread is written: the per-user temp folder on
-/// Windows, `~/.cache/rmc` elsewhere (not /tmp, which other users share).
+/// Windows, `~/.cache/crescent-moon` elsewhere (not /tmp, which other users share).
 pub fn panic_log() -> PathBuf {
     if cfg!(windows) {
-        return std::env::temp_dir().join("rmc-panic.txt");
+        return std::env::temp_dir().join("cm-panic.txt");
     }
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".cache")));
-    cache.map_or_else(|| std::env::temp_dir().join("rmc-panic.txt"), |dir| dir.join("rmc").join("panic.txt"))
+    cache.map_or_else(|| std::env::temp_dir().join("cm-panic.txt"), |dir| dir.join(FOLDER).join("panic.txt"))
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -309,14 +310,69 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-/// `%APPDATA%\rmc` on Windows, `$XDG_CONFIG_HOME/rmc` or `~/.config/rmc` elsewhere.
-pub fn config_dir() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
+/// The name of cm's folders: its settings, and on Linux its cache.
+pub const FOLDER: &str = "crescent-moon";
+
+/// What the settings folder was called when cm was rmc.
+const OLD_FOLDER: &str = "rmc";
+
+/// Where the settings folder is: `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config`
+/// elsewhere.
+fn config_base() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from)
     } else {
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home_dir().map(|h| h.join(".config")))
-    };
-    base.map(|dir| dir.join("rmc"))
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|h| h.join(".config")))
+    }
+}
+
+/// `%APPDATA%\crescent-moon` on Windows, `$XDG_CONFIG_HOME/crescent-moon` or
+/// `~/.config/crescent-moon` elsewhere.
+pub fn config_dir() -> Option<PathBuf> {
+    config_base().map(|dir| dir.join(FOLDER))
+}
+
+/// The first time cm starts, the settings folder rmc had (settings, history, hotlist, places,
+/// schemes, rescued files) is copied into cm's, so nothing is lost by the new name. The old
+/// folder stays as it was for an rmc still in use. The copy is made beside and renamed into
+/// place when whole, so one cut short is made again next time rather than half kept.
+pub fn carry_over_settings() {
+    if let Some(base) = config_base() {
+        let _ = carry_over(&base.join(OLD_FOLDER), &base.join(FOLDER));
+    }
+}
+
+fn carry_over(old: &Path, new: &Path) -> std::io::Result<()> {
+    if new.exists() || !old.is_dir() {
+        return Ok(());
+    }
+    let mut part = new.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    if part.exists() {
+        std::fs::remove_dir_all(&part)?;
+    }
+    copy_tree(old, &part)?;
+    std::fs::rename(&part, new)
+}
+
+/// Folders and files only: anything else in a settings folder (a link) is left behind.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn find_in_path(program: &str) -> Option<PathBuf> {
@@ -786,6 +842,35 @@ pub fn center(s: &str, w: usize) -> String {
 mod tests {
     use super::*;
 
+    /// rmc's settings folder comes over whole the first time, and then never again: the new one
+    /// is cm's from then on, and the old one is left as it was.
+    #[test]
+    fn the_settings_of_rmc_are_carried_over_once() {
+        let tmp = crate::testutil::TempDir::new("carry-over");
+        let (old, new) = (tmp.path().join("rmc"), tmp.path().join(FOLDER));
+        std::fs::create_dir_all(old.join("schemes")).unwrap();
+        std::fs::write(old.join("settings.ini"), "mouse = false\n").unwrap();
+        std::fs::write(old.join("schemes").join("nord.ini"), "[nord]\n").unwrap();
+        // What a copy cut short left behind is made again.
+        std::fs::create_dir_all(tmp.path().join(format!("{FOLDER}.part"))).unwrap();
+        std::fs::write(tmp.path().join(format!("{FOLDER}.part")).join("half"), "").unwrap();
+
+        carry_over(&old, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(new.join("settings.ini")).unwrap(), "mouse = false\n");
+        assert_eq!(std::fs::read_to_string(new.join("schemes").join("nord.ini")).unwrap(), "[nord]\n");
+        assert!(!new.join("half").exists() && !tmp.path().join(format!("{FOLDER}.part")).exists());
+        assert!(old.join("settings.ini").is_file(), "the old folder stays");
+
+        std::fs::write(new.join("settings.ini"), "mouse = true\n").unwrap();
+        std::fs::write(old.join("settings.ini"), "changed by an old rmc\n").unwrap();
+        carry_over(&old, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(new.join("settings.ini")).unwrap(), "mouse = true\n", "only once");
+
+        let (none, fresh) = (tmp.path().join("nothing"), tmp.path().join("fresh"));
+        carry_over(&none, &fresh).unwrap();
+        assert!(!fresh.exists(), "no rmc before: nothing is made");
+    }
+
     #[test]
     fn sizes() {
         assert_eq!(format_size(0), "0");
@@ -867,14 +952,14 @@ mod tests {
         assert_eq!(shell_word(r"My\ Folder", true).as_deref(), Some("My Folder"));
         // Variables from the environment, in each shell's way of writing them.
         // SAFETY: no other test reads or writes this variable.
-        unsafe { std::env::set_var("RMC_WORD_TEST", "/data") };
-        assert_eq!(shell_word("$RMC_WORD_TEST/x", true).as_deref(), Some("/data/x"));
-        assert_eq!(shell_word("\"${RMC_WORD_TEST}\"/x", true).as_deref(), Some("/data/x"));
-        assert_eq!(shell_word("$env:RMC_WORD_TEST\\x", false).as_deref(), Some(r"/data\x"));
-        assert_eq!(shell_word("%RMC_WORD_TEST%\\x", false).as_deref(), Some(r"/data\x"));
-        assert_eq!(shell_word("'$RMC_WORD_TEST'", true).as_deref(), Some("$RMC_WORD_TEST"), "single quotes keep it");
+        unsafe { std::env::set_var("CM_WORD_TEST", "/data") };
+        assert_eq!(shell_word("$CM_WORD_TEST/x", true).as_deref(), Some("/data/x"));
+        assert_eq!(shell_word("\"${CM_WORD_TEST}\"/x", true).as_deref(), Some("/data/x"));
+        assert_eq!(shell_word("$env:CM_WORD_TEST\\x", false).as_deref(), Some(r"/data\x"));
+        assert_eq!(shell_word("%CM_WORD_TEST%\\x", false).as_deref(), Some(r"/data\x"));
+        assert_eq!(shell_word("'$CM_WORD_TEST'", true).as_deref(), Some("$CM_WORD_TEST"), "single quotes keep it");
         // Only the shell knows these.
-        assert_eq!(shell_word("$rmc_shell_only_variable", false), None);
+        assert_eq!(shell_word("$cm_shell_only_variable", false), None);
         assert_eq!(shell_word("$(pwd)", true), None);
         assert_eq!(shell_word("'unclosed", true), None);
         assert_eq!(shell_word("100%", false).as_deref(), Some("100%"));

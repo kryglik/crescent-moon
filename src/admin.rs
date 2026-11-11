@@ -1,12 +1,12 @@
-//! "As admin": the rest of a delete done by a second rmc with administrator rights, the way
+//! "As admin": the rest of a delete done by a second cm with administrator rights, the way
 //! Total Commander does it.
 //!
-//! rmc writes the job into a folder of its own in the temp folder and starts
-//! `rmc --admin-job FOLDER` as administrator (Windows asks the user first). That helper turns
+//! cm writes the job into a folder of its own in the temp folder and starts
+//! `cm --admin-job FOLDER` as administrator (Windows asks the user first). That helper turns
 //! on the backup and restore privileges, so even TrustedInstaller's files can go, runs the
 //! delete, writes its progress to `status.txt` and the outcome to `result.txt`, and stops
-//! when a `stop` file appears. It starts on rmc's word, a `go` file, so that a job stopped
-//! while Windows was asking touches nothing. Meanwhile rmc shows the progress as for any job.
+//! when a `stop` file appears. It starts on cm's word, a `go` file, so that a job stopped
+//! while Windows was asking touches nothing. Meanwhile cm shows the progress as for any job.
 
 use std::fs;
 use std::io;
@@ -108,7 +108,7 @@ fn job_folder(paths: &[PathBuf]) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("there is no folder outside what is being deleted to keep the job in"))?;
     fs::create_dir_all(&base)?;
     for _ in 0..100 {
-        let dir = base.join(format!("rmc-admin-{}-{:016x}", std::process::id(), crate::util::random()));
+        let dir = base.join(format!("cm-admin-{}-{:016x}", std::process::id(), crate::util::random()));
         match fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -141,7 +141,7 @@ fn run_and_watch(dir: &Path, cancel: &AtomicBool, tx: &Sender<Msg>) -> io::Resul
     let report = fs::read_to_string(dir.join("result.txt")).unwrap_or_default();
     // It ran but didn't say how it went: some of it may be gone.
     Ok(parse_result(&report).unwrap_or_else(|| {
-        (vec!["The administrator's rmc ended without a report: what it deleted is unknown.".into()], true)
+        (vec!["The administrator's cm ended without a report: what it deleted is unknown.".into()], true)
     }))
 }
 
@@ -150,8 +150,8 @@ fn run_and_watch(_dir: &Path, _cancel: &AtomicBool, _tx: &Sender<Msg>) -> io::Re
     Err(io::Error::other("deleting as administrator is only there on Windows"))
 }
 
-/// Waits for rmc's word, which it gives as soon as Windows has let the helper start. No word
-/// (rmc is gone) is no.
+/// Waits for cm's word, which it gives as soon as Windows has let the helper start. No word
+/// (cm is gone) is no.
 fn told_to_go(dir: &Path) -> bool {
     let since = Instant::now();
     while since.elapsed() < Duration::from_secs(10) {
@@ -166,10 +166,10 @@ fn told_to_go(dir: &Path) -> bool {
     false
 }
 
-/// `rmc --admin-job FOLDER`: the elevated side. Deletes what the job file lists, answering
+/// `cm --admin-job FOLDER`: the elevated side. Deletes what the job file lists, answering
 /// questions itself (failures are skipped and reported), until done or told to stop.
 pub fn run_helper(dir: &Path) -> i32 {
-    // A plain folder of rmc's, not a junction or link leading somewhere else.
+    // A plain folder of cm's, not a junction or link leading somewhere else.
     if fs::symlink_metadata(dir).map_or(true, |meta| !meta.is_dir()) {
         return 2;
     }
@@ -190,7 +190,7 @@ pub fn run_helper(dir: &Path) -> i32 {
     let (mut errors, stopped) = loop {
         match running.rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Msg::Progress(progress)) => {
-                // Written aside and renamed, so rmc never reads half a line.
+                // Written aside and renamed, so cm never reads half a line.
                 let temp = dir.join("status.tmp");
                 if fs::write(&temp, status_text(&progress)).is_ok() {
                     let _ = fs::rename(&temp, dir.join("status.txt"));
@@ -223,7 +223,7 @@ mod tests {
     use crate::testutil::TempDir;
 
     #[test]
-    fn files_between_rmc_and_the_helper_read_back() {
+    fn files_between_cm_and_the_helper_read_back() {
         let paths = vec![PathBuf::from(r"T:\Windows\WinSxS"), PathBuf::from("/tmp/Účty a faktury")];
         assert_eq!(parse_job(&job_text(&paths)), Some(paths));
         let progress = Progress { current: "a\tb".into(), files_done: 3, files_total: 9, bytes_done: 5, bytes_total: 7, scanning: true };
