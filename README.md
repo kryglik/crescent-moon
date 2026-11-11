@@ -86,6 +86,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
 | Alt+W | the git repository's worktrees: Enter goes to one, into the same subfolder (see Git) |
 | Alt+B | the git repository's branches, newest first: type to find one, Enter switches to it after asking (see Git) |
+| Ctrl+E | in a git repository: the places you keep there; a key goes to one, Ins adds where the panel is (see Places) |
 | Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
@@ -288,6 +289,37 @@ dimmed.
   until it is done. git lists the branches on a thread of its own, so a slow share doesn't
   hold the screen.
 
+### Places
+
+In a git repository **Ctrl+E** opens a menu of the places you keep going back to there: `r`
+the repository's top, then the ones you add. A key goes there at once, as do Enter and a
+click; a place that is a file puts the cursor on it, so F4 edits it. The menu opens on the place
+the panel is at, and Alt+Left comes back.
+
+- **Ins** adds where the panel is: its folder, or the file under the cursor, under the first
+  key no place has.
+- **Del** forgets the place under the cursor.
+- **F4** opens all of them in the editor, as `places.ini` beside the settings.
+
+The places are kept per repository, as paths from its top, so they are the same in every
+worktree of it. A repository goes by the address of its remote (origin), so they are the same in
+every clone of it too; one with no remote goes by where it is. A place that isn't there (a
+worktree on an older branch) is left out. A `*` in a path stands for any one folder, and makes a
+place of each folder that has the rest:
+
+```ini
+[git@gitlab.example.com:team/workspace.git]
+1 = * package | packages/*/package.json
+s = Scripts | scripts
+d = Docs | docs/guide.md
+```
+
+gives `1 app package`, `2 blog package` and so on for each folder in `packages` with a
+`package.json`, keys counting on from the digit, and the menu opens on the app package
+anywhere in `packages/app`. Lines that are wrong are said when the menu opens, and the rest
+works. With text on the command line Ctrl+E goes to its end, as in bash; outside a repository it
+says so.
+
 ### Find
 
 Alt+F7 (or mc's Alt+?) searches below the active panel's folder the way
@@ -476,6 +508,7 @@ rmc shows the mono scheme.
 | `src/sandbox_tests/random.rs` | random colliding trees through every job and way of answering, the whole disk checked after each (`RMC_ROUNDS=2000 cargo test random_` for a long run) |
 | `src/archive.rs` | zip archives: the index, names (none that would land outside the folder), times |
 | `src/git.rs` | git: the branch, operation under way and worktrees from the repository's files; `git status` in the background |
+| `src/places.rs` | Ctrl+E: the places kept per git repository in `places.ini`, and the menu of them |
 | `src/watch.rs` | watching the panels' folders for changes (Windows change notifications, inotify) |
 | `src/history.rs` | folders visited and commands typed, kept in `history.txt`; what was typed into dialogs, in `inputs.txt` |
 | `src/compare.rs` | Shift+F2's comparison of two folders |

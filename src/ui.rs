@@ -939,6 +939,7 @@ fn draw_dialog(
             draw_options(frame, area, *cursor, edit, settings, automatic, settings_file, t)
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor, t)),
+        Dialog::Places { root, places, cursor, .. } => (None, draw_places(frame, area, root, places, *cursor, t)),
         // Drawn by `draw`, which has the rows.
         Dialog::History { .. }
         | Dialog::Earlier { .. }
@@ -1183,6 +1184,39 @@ fn draw_hotlist(frame: &mut Frame, area: Rect, hotlist: &Hotlist, cursor: usize,
     let shown = hotlist.dirs.len().saturating_sub(offset).min(list_h) as u16;
     let rows = (shown > 0).then(|| (Rect::new(inner.x, inner.y, inner.width, shown), offset));
     DialogHit { area: outer, buttons: Vec::new(), rows }
+}
+
+/// Ctrl+E: the repository's places with their keys and where each goes; the title names the
+/// checkout (which worktree).
+fn draw_places(frame: &mut Frame, area: Rect, root: &Path, places: &[crate::places::Place], cursor: usize, t: &Scheme) -> DialogHit {
+    let label_w = places.iter().map(|p| util::width(&p.label)).max().unwrap_or(0);
+    let texts: Vec<String> = places
+        .iter()
+        .map(|p| {
+            let key = p.key.unwrap_or(' ');
+            format!("{key}  {}  {}", util::pad(&p.label, label_w), p.shown(root))
+        })
+        .collect();
+    let hint = "key or Enter goes there · Ins adds · Del forgets · F4 edits · Esc";
+    let widest = texts.iter().map(|t| util::width(t)).max().unwrap_or(0).max(util::width(hint));
+    let width = (widest as u16 + 4).max(40);
+    let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let rows = places.len() as u16;
+    let (outer, inner) = dialog_frame(frame, area, width, rows + 4, &format!("Places: {name}"), false, t);
+    let style = t.dialog;
+    let mut lines: Vec<Line> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
+            Line::from(Span::styled(util::fit(text, inner.width as usize), row_style))
+        })
+        .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(hint, t.on_dialog(t.dialog_dim))).right_aligned());
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    let list = Rect::new(inner.x, inner.y, inner.width, rows.min(inner.height));
+    DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
 }
 
 /// Alt+A: a checkbox per attribute, [?] where the files differ.

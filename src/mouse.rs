@@ -294,6 +294,7 @@ impl App {
                         | Dialog::Branches { cursor, .. },
                     ) if i < list_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
+                    Some(Dialog::Places { cursor, places, .. }) if i < places.len() => *cursor = i,
                     Some(Dialog::Schemes { cursor, choices, .. }) if i < choices.len() => *cursor = i,
                     _ => return,
                 }
@@ -317,6 +318,7 @@ impl App {
                             | Dialog::Commands { .. }
                             | Dialog::Worktrees { .. }
                             | Dialog::Branches { .. }
+                            | Dialog::Places { .. }
                             | Dialog::Schemes { .. }
                             | Dialog::Attributes { .. }
                             | Dialog::Sort { .. }
@@ -405,6 +407,27 @@ mod tests {
         assert_eq!(app.panels[0].cursor, 0);
         mouse(&mut app, MouseEventKind::ScrollDown, x, y);
         assert_eq!(app.panels[0].cursor, 3);
+    }
+
+    /// The menu of places' rows are clickable; a click beside it closes it.
+    #[test]
+    fn places_menu_by_mouse() {
+        let tmp = TempDir::new("mouse-places");
+        let (checkout, file) = crate::places::tests::fake_workspace(&tmp);
+        let mut app = app(&checkout);
+        app.config.places_file = Some(file);
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        draw(&mut app);
+        let (rows, _) = app.hit.dialog.as_ref().unwrap().rows.unwrap();
+        // The last row: the top, app, blog, the scripts, the docs.
+        click(&mut app, rows.x + 2, rows.y + 4);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.active_panel().current().unwrap().name, "guide.md");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        draw(&mut app);
+        click(&mut app, 0, 0);
+        assert!(app.dialog.is_none());
     }
 
     #[test]

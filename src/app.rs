@@ -15,6 +15,7 @@ use crate::archive::{self, Archive};
 use crate::clipboard::{self, Clipboard, Effect};
 use crate::compare;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit, Recall};
+use crate::places::{self, Place};
 use crate::finder::{Field as FindField, Finder};
 use crate::git::{self, Branch, Tracker, Worktree};
 use crate::history::History;
@@ -128,6 +129,8 @@ pub struct Config {
     pub history_file: Option<PathBuf>,
     /// The user's colour schemes (`schemes` beside the settings); None in tests.
     pub schemes_dir: Option<PathBuf>,
+    /// Places in git repositories, for Ctrl+E (`places.ini` beside the settings).
+    pub places_file: Option<PathBuf>,
     /// What the terminal does with colours.
     pub colours: Colours,
     pub settings: Settings,
@@ -144,6 +147,7 @@ impl Config {
         };
         config.history_file = History::default_file();
         config.schemes_dir = scheme::default_dir();
+        config.places_file = places::File::default_path();
         config.colours = Colours::detect();
         config
     }
@@ -170,6 +174,7 @@ impl Config {
             settings_file,
             history_file: None,
             schemes_dir: None,
+            places_file: None,
             colours: Colours::default(),
             settings,
         }
@@ -866,6 +871,8 @@ impl App {
             KeyCode::Char('c') if alt && !ctrl => self.open_schemes(None),
             KeyCode::Char('w') if alt && !ctrl => self.open_worktrees(),
             KeyCode::Char('b') if alt && !ctrl => self.open_branches(),
+            // With text on the command line Ctrl+E goes to its end, as in bash.
+            KeyCode::Char('e') if ctrl && !alt && cmd_empty => self.open_places(),
             KeyCode::Char('f') if ctrl && !alt => {
                 let current = self.active_panel().filter.clone().unwrap_or_default();
                 self.start_input("Filter", "Show only files matching (empty shows all):", &current, InputAction::Filter);
@@ -1004,6 +1011,7 @@ impl App {
             Dialog::Branches { filter, cursor, branches, here, coming } => {
                 self.on_branches_key(&key, filter, cursor, branches, here, coming)
             }
+            Dialog::Places { root, id, places, cursor } => self.on_places_key(&key, root, id, places, cursor),
             Dialog::Attributes { paths, states, cursor } => self.on_attributes_key(&key, paths, states, cursor),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
                 let buttons = dialog::delete_buttons(&survey.tally());
@@ -1447,9 +1455,11 @@ impl App {
         let (hotlist_file, settings_file) = (self.config.hotlist_file.take(), self.config.settings_file.take());
         let history_file = self.config.history_file.take();
         let (schemes_dir, colours) = (self.config.schemes_dir.take(), self.config.colours);
+        let places_file = self.config.places_file.take();
         self.config = Config::new(settings, hotlist_file, settings_file);
         self.config.history_file = history_file;
         self.config.schemes_dir = schemes_dir;
+        self.config.places_file = places_file;
         self.config.colours = colours;
         if scheme_changed {
             self.scheme = self.saved_scheme();
@@ -2761,6 +2771,121 @@ impl App {
         true
     }
 
+    /// Ctrl+E: the places of the git repository the panel is in, the menu on the one the panel
+    /// is at. What is wrong in `places.ini` is said, and the rest works.
+    fn open_places(&mut self) {
+        let panel = self.active_panel();
+        let Some(repo) = panel.repo.as_ref().filter(|_| panel.remote.is_none()) else {
+            self.notice = Some("Not in a git repository (Ctrl+E lists the places you keep in one)".into());
+            return;
+        };
+        let (root, id) = (repo.root.clone(), places::identity(repo));
+        let (entries, problems) = places::File::load(self.config.places_file.clone()).entries(&id);
+        let places = places::places(&root, &entries);
+        let cursor = places::nearest(&places, &panel.cwd);
+        self.notice = problems.first().map(|problem| format!("places.ini, {problem}"));
+        self.dialog = Some(Dialog::Places { root, id, places, cursor });
+    }
+
+    /// The menu again after Ins or Del, the cursor on the place on `line` if it is there.
+    fn places_again(&mut self, root: PathBuf, id: String, line: Option<usize>, cursor: usize) -> Option<Dialog> {
+        let (entries, _) = places::File::load(self.config.places_file.clone()).entries(&id);
+        let places = places::places(&root, &entries);
+        let at = line.and_then(|line| places.iter().position(|p| p.line == Some(line)));
+        let cursor = at.unwrap_or(cursor).min(places.len().saturating_sub(1));
+        Some(Dialog::Places { root, id, places, cursor })
+    }
+
+    /// Keys in the menu of places: a place's key goes there at once, as do Enter and a click;
+    /// Ins adds where the panel is, Del forgets the place under the cursor, F4 edits the file;
+    /// Ctrl+E again closes it.
+    fn on_places_key(&mut self, key: &KeyEvent, root: PathBuf, id: String, places: Vec<Place>, mut cursor: usize) -> Option<Dialog> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let last = places.len().saturating_sub(1);
+        let chosen = match key.code {
+            KeyCode::Esc | KeyCode::F(10) => return None,
+            KeyCode::Char('e') if ctrl && !alt => return None,
+            KeyCode::Insert => {
+                let panel = self.active_panel();
+                let file = panel.current().filter(|e| !e.is_dir && !e.is_parent).map(|e| e.name.clone());
+                let Some((label, path)) = places::new_place(&root, &panel.cwd, file.as_deref()) else {
+                    self.notice = Some("The repository's top is always there (r)".into());
+                    return Some(Dialog::Places { root, id, places, cursor });
+                };
+                let mut file = places::File::load(self.config.places_file.clone());
+                let taken: Vec<char> = places.iter().filter_map(|p| p.key).collect();
+                let Some(key) = file.add(&id, &label, &path, &taken) else {
+                    self.notice = Some("Every key is taken: F4 edits the places".into());
+                    return Some(Dialog::Places { root, id, places, cursor });
+                };
+                if let Err(e) = file.save() {
+                    self.error(format!("Cannot save the places:\n{e}"));
+                    return None;
+                }
+                self.notice = Some(format!("{label} is place {key} in this repository"));
+                let (entries, _) = file.entries(&id);
+                let line = entries.iter().find(|e| e.key == key).map(|e| e.line);
+                return self.places_again(root, id, line, cursor);
+            }
+            KeyCode::Delete => {
+                let Some(line) = places.get(cursor).and_then(|p| p.line) else {
+                    self.notice = Some("The repository's top is always there".into());
+                    return Some(Dialog::Places { root, id, places, cursor });
+                };
+                let mut file = places::File::load(self.config.places_file.clone());
+                file.remove(line);
+                if let Err(e) = file.save() {
+                    self.error(format!("Cannot save the places:\n{e}"));
+                    return None;
+                }
+                return self.places_again(root, id, None, cursor);
+            }
+            KeyCode::F(4) => {
+                match places::File::load(self.config.places_file.clone()).for_editing(&id) {
+                    Ok((file, line)) => self.external = Some(External::Edit(file, Some(line))),
+                    Err(e) => self.error(format!("Cannot open the places:\n{e}")),
+                }
+                return None;
+            }
+            KeyCode::Up => {
+                cursor = cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                cursor = (cursor + 1).min(last);
+                None
+            }
+            KeyCode::Home | KeyCode::PageUp => {
+                cursor = 0;
+                None
+            }
+            KeyCode::End | KeyCode::PageDown => {
+                cursor = last;
+                None
+            }
+            KeyCode::Enter => places.get(cursor),
+            KeyCode::Char(c) if !ctrl && !alt => places.iter().find(|p| p.key == Some(c.to_ascii_lowercase())),
+            _ => None,
+        };
+        match chosen {
+            Some(place) => {
+                let place = place.clone();
+                self.go_to_place(&place);
+                None
+            }
+            None => Some(Dialog::Places { root, id, places, cursor }),
+        }
+    }
+
+    /// Into the place's folder, the cursor on its file.
+    fn go_to_place(&mut self, place: &Place) {
+        self.change_dir(self.active, place.dir.clone());
+        if let Some(file) = place.file.as_deref().filter(|_| self.dialog.is_none()) {
+            self.active_panel_mut().select_name(file);
+        }
+    }
+
     /// Into `worktree`, to the folder the panel is in within the working tree at `here` when
     /// it has that folder too (src\ui in one, src\ui in the other), else as near it as it has.
     fn go_to_worktree(&mut self, worktree: &Worktree, here: &Path) {
@@ -3719,6 +3844,95 @@ mod tests {
         // Outside a repository, a word on the command line.
         app.active = 1;
         app.on_key(alt(KeyCode::Char('w')));
+        assert!(app.dialog.is_none());
+        assert!(app.notice.as_deref().is_some_and(|n| n.starts_with("Not in a git repository")));
+    }
+
+    /// Ctrl+E in a git repository: its places from `places.ini`, the menu on the one the panel
+    /// is at, and a key goes there with the cursor on its file. Ins adds where the panel is and
+    /// Del forgets it. Outside a repository it says so, and with text on the command line
+    /// Ctrl+E goes to its end, as in bash.
+    #[test]
+    fn ctrl_e_goes_to_the_places_of_a_repository() {
+        let tmp = TempDir::new("app-places");
+        let (checkout, file) = crate::places::tests::fake_workspace(&tmp);
+        let app_folder = checkout.join("packages").join("app");
+        let mut app = test_app(&app_folder.join("src").join("components"), tmp.path());
+        app.config.places_file = Some(file.clone());
+
+        app.on_key(ctrl('e'));
+        let Some(Dialog::Places { places, cursor, .. }) = &app.dialog else { panic!("no places") };
+        assert_eq!(places[*cursor].label, "app package", "it opens on the place the panel is at");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.active_panel().cwd, app_folder);
+        assert_eq!(app.active_panel().current().unwrap().name, "package.json");
+
+        app.on_key(ctrl('e'));
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.active_panel().cwd, checkout.join("docs"));
+        assert_eq!(app.active_panel().current().unwrap().name, "guide.md");
+        app.on_key(alt(KeyCode::Left));
+        assert_eq!(app.active_panel().cwd, app_folder, "Alt+Left comes back");
+
+        app.on_key(ctrl('e'));
+        app.on_key(key(KeyCode::Char('S')));
+        assert_eq!(app.active_panel().cwd, checkout.join("scripts"));
+        app.on_key(ctrl('e'));
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.active_panel().cwd, checkout.join("packages").join("blog"));
+
+        // Back to the top, the cursor on the folder it came up from.
+        app.on_key(ctrl('e'));
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(app.active_panel().cwd, checkout);
+        assert_eq!(app.active_panel().current().unwrap().name, "packages");
+
+        // Ins adds where the panel is, under a key no place has; Del forgets it again, and the
+        // rest of the file stays.
+        app.change_dir(0, app_folder.join("src"));
+        app.on_key(ctrl('e'));
+        app.on_key(key(KeyCode::Insert));
+        assert_eq!(app.notice.as_deref(), Some("src is place 3 in this repository"));
+        assert!(fs::read_to_string(&file).unwrap().contains("3 = src | packages/app/src\n"));
+        let Some(Dialog::Places { places, cursor, .. }) = &app.dialog else { panic!("the menu stays") };
+        assert_eq!(places[*cursor].label, "src", "the cursor on the new place");
+        app.on_key(key(KeyCode::Delete));
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("packages/app/src") && text.contains("; the guide") && text.contains("[elsewhere]"), "{text}");
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Delete));
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("always there")), "the top can't go");
+
+        // A key that is no place keeps the menu; Ctrl+E again closes it.
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(app.dialog, Some(Dialog::Places { .. })));
+        app.on_key(ctrl('e'));
+        assert!(app.dialog.is_none());
+
+        // F12 finds it.
+        app.on_key(key(KeyCode::F(12)));
+        typing(&mut app, "places");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.dialog, Some(Dialog::Places { .. })));
+        app.on_key(key(KeyCode::Esc));
+
+        // Typing a command: Ctrl+E is the end of the line.
+        typing(&mut app, "ls");
+        app.on_key(key(KeyCode::Home));
+        app.on_key(ctrl('e'));
+        assert!(app.dialog.is_none());
+        typing(&mut app, " -l");
+        assert_eq!(app.cmdline.text(), "ls -l");
+        app.on_key(key(KeyCode::Esc));
+
+        // Outside a repository, a word on the command line.
+        app.active = 1;
+        app.on_key(ctrl('e'));
         assert!(app.dialog.is_none());
         assert!(app.notice.as_deref().is_some_and(|n| n.starts_with("Not in a git repository")));
     }

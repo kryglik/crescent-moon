@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::EditedCopy;
+use crate::places::Place;
 use crate::git::{Branch, Worktree};
 use crate::ops::Answer;
 use crate::options::OptionsAutomatic;
@@ -174,6 +175,9 @@ pub enum Dialog {
         here: PathBuf,
         coming: Option<Receiver<Result<Vec<Branch>, String>>>,
     },
+    /// Ctrl+E in the repository at `root`, known as `id` in `places.ini`: its places (see
+    /// `places`).
+    Places { root: PathBuf, id: String, places: Vec<Place>, cursor: usize },
     /// Alt+A: what to set for each of `platform::ATTRIBUTES` on `paths`; None leaves it as each
     /// file has it (they differ).
     Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize },
@@ -461,6 +465,7 @@ pub const COMMANDS: &[Command] = &[
     command("Other panel: the folder under the cursor", "Alt+O", KeyCode::Char('o'), ALT),
     command("Git worktrees: go to another one", "Alt+W", KeyCode::Char('w'), ALT),
     command("Git branches: find one, switch to it", "Alt+B", KeyCode::Char('b'), ALT),
+    command("Places in this git repository: go to one, add one", "Ctrl+E", KeyCode::Char('e'), CTRL),
     command("Open with… (Windows asks which app)", "Shift+Enter", KeyCode::Enter, SHIFT),
     command("Attributes: read-only, hidden… (permissions)", "Alt+A", KeyCode::Char('a'), ALT),
     command("Shell (switch to it and back)", "Ctrl+O", KeyCode::Char('o'), CTRL),
@@ -584,6 +589,12 @@ pub const HELP: &[&str] = &[
     "  Alt+B        branches, newest first: Enter switches to one",
     "               (asks first); + is checked out in another worktree",
     "               and Enter goes there",
+    "",
+    "  Ctrl+E       places in the repository, the same in all its",
+    "               worktrees: a key goes there, the cursor on the file",
+    "               if it is one. Ins adds where the panel is, Del",
+    "               forgets, F4 edits them all (places.ini). With text",
+    "               on the command line Ctrl+E goes to its end instead",
     "",
     "Mouse",
     "  click        select       double-click  open",

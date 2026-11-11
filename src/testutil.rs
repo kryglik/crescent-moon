@@ -22,6 +22,7 @@ pub fn config() -> Config {
         settings_file: None,
         history_file: None,
         schemes_dir: None,
+        places_file: None,
         colours: crate::scheme::Colours::default(),
         settings: Settings { git_status: false, ..Settings::default() },
     }

@@ -18,6 +18,7 @@ mod mouse;
 mod ops;
 mod options;
 mod panel;
+mod places;
 mod platform;
 mod preview;
 mod reading;
