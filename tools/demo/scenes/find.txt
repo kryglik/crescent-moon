@@ -1,0 +1,20 @@
+# Alt+F7: text found in files as it is typed, narrowed by name; Enter takes the panel there.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website M:\projects\api
+until changed 8000
+wait 800
+cut
+wait 1000
+key alt+f7
+wait 1000
+typedelay 140
+type gallery
+wait 1800
+key tab
+type *.js
+wait 1800
+key down*3
+wait 800
+key enter
+end 2500

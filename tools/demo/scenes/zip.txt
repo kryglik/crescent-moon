@@ -1,0 +1,33 @@
+# A zip opens as a folder; F5 copies out of it.
+size 100 30
+cwd M:\
+run ${CM} M:\downloads M:\backup
+until F10
+wait 800
+cut
+wait 1200
+key end
+wait 600
+key enter
+wait 1000
+key down
+key enter
+wait 1200
+key down*3
+key enter
+wait 1200
+key down*3
+key ins*2
+wait 600
+key f5
+wait 1500
+key enter
+wait 1500
+key backspace
+wait 500
+key backspace
+wait 500
+key backspace
+wait 1200
+key tab
+end 2000

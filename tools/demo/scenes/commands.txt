@@ -1,0 +1,21 @@
+# F12: every command with its key, found by typing part of its name.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website M:\downloads
+until changed 8000
+wait 800
+cut
+wait 1000
+key f12
+wait 1500
+typedelay 160
+type zip
+wait 1500
+key backspace*3
+type branch
+wait 1500
+key backspace*6
+type colour
+wait 1500
+key esc
+end 1000

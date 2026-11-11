@@ -1,0 +1,25 @@
+# Ctrl+Space sizes folders; Ctrl+F filters a panel by pattern.
+size 100 30
+cwd M:\
+run ${CM} M:\photos M:\videos
+until F10
+wait 800
+cut
+wait 1000
+key ctrl+space
+wait 2500
+key down*3
+key enter
+wait 1200
+key ctrl+f
+wait 800
+type *.CR3
+wait 400
+key enter
+wait 2500
+key ctrl+f
+wait 800
+key backspace*5
+wait 400
+key enter
+end 1500

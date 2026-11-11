@@ -1,0 +1,29 @@
+# Two panels, a git repository on the left: into folders and out, the other panel, quick search.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website "M:\photos\2024 Iceland"
+until F10
+wait 1500
+cut
+wait 1500
+key down*4
+key enter
+wait 1200
+key backspace
+wait 700
+key down*2
+key enter
+wait 1400
+key tab
+wait 500
+key ctrl+s
+type IMG_4115
+wait 1000
+key esc
+key down*2
+wait 500
+key backspace
+wait 700
+key down
+key enter
+end 2000

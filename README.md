@@ -558,6 +558,23 @@ tools\sendkey.ps1 -ProcessId <pid> -Keys 'ctrl+o', 'text:dir', 'enter'   # also 
 tools\readscreen.ps1 -ProcessId <pid>      # prints what the window shows
 ```
 
+## The feature page
+
+`site/` is the page at https://crescent-moon.starlume.eu: plain HTML and CSS, deployed by
+GitLab CI (`.gitlab-ci.yml`) when it changes on main. Its animations are the real program:
+
+```powershell
+tools\demo\record.ps1              # every scene in tools\demo\scenes, into site\gifs
+tools\demo\record.ps1 -Only git    # just one
+```
+
+The script builds cm and the recorder, `examples/record.rs`, which runs cm in a pseudo-console,
+plays a scene's keys and keeps every screen with its time. `tools/demo/make_world.py` makes the
+folders the scenes show (a git repository with branches, a worktree and changes, photos,
+downloads, a zip), afresh before each scene, and `subst` maps them to M: so no real path shows.
+`tools/demo/render.py` draws the screens as Windows Terminal would (Campbell colours, Cascadia
+Mono) into a GIF. It needs Python with Pillow, and git.
+
 ## Not there yet
 
 Writing into archives, other archive formats (7z, rar, tar), running commands over SSH, a user

@@ -1,0 +1,28 @@
+# Ctrl+E: the places kept for this repository, a key each; Ins adds where the panel is.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website M:\downloads
+until changed 8000
+wait 800
+cut
+wait 1200
+key ctrl+e
+wait 1800
+key c
+wait 1500
+key ctrl+e
+wait 1200
+key s
+wait 1500
+key ctrl+e
+wait 1000
+key d
+wait 1000
+key down*2
+wait 600
+key ctrl+e
+wait 1200
+key ins
+wait 2000
+key esc
+end 1500

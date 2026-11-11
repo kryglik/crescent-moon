@@ -1,0 +1,22 @@
+# The git row and marks, Alt+B's branches: found by typing, switched to after asking.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website\src M:\projects\website
+until changed 8000
+wait 800
+cut
+wait 1800
+key alt+b
+wait 1800
+type fix
+wait 1200
+key enter
+until Switch this worktree
+wait 1500
+key enter
+until fix/header-spacing ·
+wait 2000
+key alt+b
+wait 2000
+key esc
+end 1500

@@ -1,0 +1,18 @@
+# Alt+W: the repository's worktrees; Enter goes to the same subfolder in another one.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website\src\components M:\projects\website
+until changed 8000
+wait 800
+cut
+wait 1500
+key alt+w
+wait 1800
+key down
+wait 800
+key enter
+wait 2500
+key alt+w
+wait 1500
+key esc
+end 1500

@@ -1,0 +1,28 @@
+# Ctrl+Q: the other panel shows what is under the cursor: a folder, text, a picture's size.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website "M:\photos\2025 Prague"
+until changed 8000
+wait 800
+cut
+wait 1000
+key ctrl+q
+wait 1000
+key down*2
+wait 1200
+key end
+wait 1800
+key up
+wait 1800
+key up*2
+wait 1500
+typedelay 70
+type cd "../../photos/2025 Prague"
+key enter
+wait 1200
+key down
+wait 1800
+key end
+wait 1500
+key ctrl+q
+end 1500

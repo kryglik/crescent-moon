@@ -1,0 +1,24 @@
+# Shift+F2 compares the two folders and marks what the other side lacks; F5 brings it over.
+size 100 30
+cwd M:\
+run ${CM} "M:\photos\2025 Lisbon" M:\backup
+until F10
+wait 800
+key down
+key ins*4
+key f5
+wait 600
+key enter
+wait 2500
+key home
+cut
+wait 1200
+key shift+f2
+wait 2200
+key f5
+wait 1500
+key enter
+wait 3000
+key shift+f2
+wait 1500
+end 1500

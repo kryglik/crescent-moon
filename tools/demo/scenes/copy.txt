@@ -1,0 +1,19 @@
+# Marking files and copying them to the other panel, with the speed and the time left.
+size 100 30
+cwd M:\
+run ${CM} M:\videos M:\backup
+until F10
+wait 800
+cut
+wait 1000
+key down
+key ins*2
+wait 600
+key f5
+wait 1500
+key enter
+until Esc = cancel 5000
+gone Esc = cancel 60000
+wait 1000
+key tab
+end 2500

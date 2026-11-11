@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crescent Moon: a two-panel file manager for the terminal</title>
+<meta name="description" content="Crescent Moon (cm, mc turned around) is a Midnight Commander-style two-panel file manager for Windows and Linux, written in Rust.">
+<link rel="icon" href="moon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="brand">
+      <img src="moon.svg" alt="" width="56" height="56">
+      <div>
+        <h1>Crescent Moon</h1>
+        <p class="tagline"><code>cm</code>: mc turned around</p>
+      </div>
+    </div>
+    <p class="lead">A two-panel file manager for the terminal in the spirit of Midnight Commander and
+      Total Commander, written in Rust. Native on Windows (Windows Terminal, PowerShell) and on
+      Linux, WSL included. It's fast, it's careful with your files, and it knows about git.</p>
+    <nav class="toc" aria-label="Features">
+      <a href="#panels">Panels</a>
+      <a href="#copy">Copy &amp; move</a>
+      <a href="#git">Git</a>
+      <a href="#worktrees">Worktrees</a>
+      <a href="#places">Places</a>
+      <a href="#schemes">Colour schemes</a>
+      <a href="#zip">Zip</a>
+      <a href="#find">Find</a>
+      <a href="#quickview">Quick view</a>
+      <a href="#compare">Compare</a>
+      <a href="#shell">Shell</a>
+      <a href="#around">Getting around</a>
+      <a href="#sizes">Sizes &amp; filters</a>
+      <a href="#commands">F12</a>
+      <a href="#more">More</a>
+      <a href="#keys">Keys</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+<section class="feature" id="panels">
+  <h2>Two panels, the way your fingers remember</h2>
+  <p>Everything mc does where you expect it: <kbd>Tab</kbd> switches panels, <kbd>Enter</kbd> goes in,
+    <kbd>Backspace</kbd> goes up and puts the cursor back where you were, and the F-keys copy, move,
+    rename and delete. Quick search (<kbd>Ctrl+S</kbd>) jumps to a name as you type it.</p>
+  <ul>
+    <li>Left and Right go up and into folders, as mc's "Lynx-like motion" does.</li>
+    <li>Folders are read in the background, so a slow network share never freezes the screen.</li>
+    <li>Panels follow what other programs change (a download finishing, a build) by themselves.</li>
+    <li>Click, double-click, right-click to mark, the wheel scrolls; a click on a heading sorts by it.</li>
+  </ul>
+  <figure><img src="gifs/tour.gif" width="1000" height="600" alt="Moving through a project and a photo folder, then quick search" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="copy">
+  <h2>Copy and move without putting a file at risk</h2>
+  <p><kbd>Ins</kbd> marks files; <kbd>F5</kbd> copies them and <kbd>F6</kbd> moves them, with the speed and the
+    time left. <kbd>Esc</kbd> stops a job at once.</p>
+  <ul>
+    <li>An overwrite replaces the old file only once the new one is complete and on the disk.</li>
+    <li>A move to another drive deletes each file only after its copy is checked.</li>
+    <li>The same file under another name is recognised, and two names that land on one never replace each other.</li>
+    <li><kbd>F8</kbd> goes to the Recycle Bin; only <kbd>Shift+F8</kbd> deletes for good. Files only an administrator
+      may delete get an <strong>As admin</strong> button, as in Total Commander.</li>
+    <li>Paths over 260 characters, Czech and other non-ASCII names, and names Windows misreads
+      (<code>foo.</code>, <code>nul</code>) all work.</li>
+  </ul>
+  <figure><img src="gifs/copy.gif" width="1000" height="600" alt="Two video files marked and copied, with a progress window" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="git">
+  <h2>Git at a glance, and branches by typing</h2>
+  <p>In a repository, the row under the path tells the branch and how the work stands:
+    <code>main ↑1 · 3 changed · 1 untracked</code>. Beside each file is a mark, as in VS Code:
+    <b class="m">M</b> changed, <b class="a">A</b> added, <b class="u">?</b> new, <b class="c">!</b> in conflict,
+    and <b>•</b> on a folder with changes inside. What git ignores is dimmed.</p>
+  <ul>
+    <li><kbd>Alt+B</kbd> lists the branches, newest first, with when, how far ahead or behind, and the last commit.
+      Type to find one; <kbd>Enter</kbd> switches to it after asking.</li>
+    <li>A rebase or merge under way shows as git's prompt says it: <code>main REBASE 2/5</code>.</li>
+    <li><code>git status</code> runs in the background and never takes git's locks.</li>
+  </ul>
+  <figure><img src="gifs/git.gif" width="1000" height="600" alt="The branch list, narrowed to fix, and a switch to that branch" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="worktrees">
+  <h2>Worktrees, into the same subfolder</h2>
+  <p><kbd>Alt+W</kbd> lists the repository's worktrees, the most recently used first. <kbd>Enter</kbd> goes to
+    one, into the same subfolder you are in, so <code>src\components</code> in one is
+    <code>src\components</code> in the other. In a linked worktree the branch shows in cyan. Handy with
+    tools that work in worktrees of their own, such as coding agents.</p>
+  <figure><img src="gifs/worktrees.gif" width="1000" height="600" alt="Jumping from the main worktree to a feature worktree, same subfolder" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="places">
+  <h2>Places you keep, per repository</h2>
+  <p>In a repository, <kbd>Ctrl+E</kbd> opens the places you keep going back to there: <kbd>r</kbd> is the
+    top, and a key each for the rest. <kbd>Ins</kbd> adds where the panel is, a folder or the file under
+    the cursor. Places are kept per remote, so they are the same in every clone and worktree, and a
+    <code>*</code> in a path makes a place of every folder that matches.</p>
+  <figure><img src="gifs/places.gif" width="1000" height="600" alt="The places menu: jumping to components, styles and docs, then adding a file" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="schemes">
+  <h2>Fourteen colour schemes, shown as you choose</h2>
+  <p><kbd>Alt+C</kbd> shows each scheme on the whole screen as the cursor moves through the list:
+    mc's classic blue and classic-v2 (darker, with a yellow bar), dark, the terminal's own colours,
+    light, Nord, Gruvbox, Dracula, Tokyo Night, Catppuccin, One Dark, Solarized dark and light, and mono.
+    <kbd>F4</kbd> turns one into a file of your own to change. Archives, pictures, media, leftovers and
+    hidden files have colours of their own.</p>
+  <figure><img src="gifs/schemes.gif" width="1000" height="600" alt="Moving through all fourteen colour schemes" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="zip">
+  <h2>Zip archives open as folders</h2>
+  <p><kbd>Enter</kbd> on a zip opens it in the panel; <kbd>F5</kbd> copies out of it, <kbd>F3</kbd> views a file in
+    it, and quick view reads straight from it. <kbd>Alt+F5</kbd> packs the marked files into a new zip and
+    <kbd>Alt+F9</kbd> unpacks one, as in Total Commander. Names that would land outside the folder
+    (<code>../x</code>) are left out.</p>
+  <figure><img src="gifs/zip.gif" width="1000" height="600" alt="Browsing a zip and copying two files out of it" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="find">
+  <h2>Find text in files, as you type</h2>
+  <p><kbd>Alt+F7</kbd> searches below the panel's folder with ripgrep's own crates: in parallel, skipping what
+    <code>.gitignore</code> ignores, hidden and binary files. Results come while you type, grouped by
+    file. <kbd>Tab</kbd> narrows by name (<code>*.js</code>, <code>!*test*</code>), <kbd>Enter</kbd> takes the panel
+    there, and <kbd>F4</kbd> opens the file at the matching line.</p>
+  <figure><img src="gifs/find.gif" width="1000" height="600" alt="Searching for gallery, narrowed to JavaScript files" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="quickview">
+  <h2>Quick view</h2>
+  <p><kbd>Ctrl+Q</kbd> turns the other panel into a view of what is under the cursor: a folder's contents,
+    the start of a text file, a hex dump of a binary one, a picture's format and size. It is read in
+    the background, so moving stays quick. Typing <code>cd</code> on the command line moves the panel too.</p>
+  <figure><img src="gifs/quickview.gif" width="1000" height="600" alt="Quick view of a folder, a readme, package.json and photos" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="compare">
+  <h2>Compare two folders</h2>
+  <p><kbd>Shift+F2</kbd> marks on each side the files the other side lacks or has an older copy of, so
+    <kbd>F5</kbd> brings the other side up to date.</p>
+  <figure><img src="gifs/compare.gif" width="1000" height="600" alt="Comparing photos with a backup and copying what is missing" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="shell">
+  <h2>One shell for the whole session</h2>
+  <p>Typing anywhere goes to the command line, and <kbd>Enter</kbd> runs it in a shell that lives as long as
+    cm does: PowerShell on Windows, bash or zsh on Linux. <kbd>Ctrl+O</kbd> switches between the panels and
+    the shell. If you <code>cd</code> there, the panel follows; move the panel, and the shell follows,
+    quietly. Variables stay, and a long command keeps running while you work in the panels.</p>
+  <figure><img src="gifs/shell.gif" width="1000" height="600" alt="git log run from the command line, then cd docs in the shell, which the panel follows" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="around">
+  <h2>Favourite folders, tabs and history</h2>
+  <p><kbd>Ctrl+D</kbd> is the hotlist: a digit jumps. <kbd>Ctrl+T</kbd> opens a folder tab, <kbd>Alt+1</kbd>…<kbd>9</kbd>
+    goes to one. <kbd>Alt+Left</kbd> and <kbd>Alt+Right</kbd> go back and forward, and <kbd>Alt+H</kbd> lists the
+    folders visited lately, kept between sessions.</p>
+  <figure><img src="gifs/getting-around.gif" width="1000" height="600" alt="The hotlist, a second tab, and the folder history" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="sizes">
+  <h2>Sizes and filters</h2>
+  <p><kbd>Ctrl+Space</kbd> measures the folder under the cursor (on <code>..</code>, all of them). <kbd>Ctrl+F</kbd>
+    shows only what matches (<code>*.jpg *.cr3</code>), or not (<code>!*.tmp</code>); folders stay.</p>
+  <figure><img src="gifs/sizes.gif" width="1000" height="600" alt="Folder sizes, then a filter for raw photos" loading="lazy"></figure>
+</section>
+
+<section class="feature" id="commands">
+  <h2>Every command, by typing</h2>
+  <p><kbd>F12</kbd> lists every command with its key; type part of a name (<code>zip</code>, <code>branch</code>,
+    <code>colour</code>) and <kbd>Enter</kbd> runs it. <kbd>F1</kbd> has the whole list of keys.</p>
+  <figure><img src="gifs/commands.gif" width="1000" height="600" alt="The command list narrowed by typing" loading="lazy"></figure>
+</section>
+
+<section id="more">
+  <h2>And more</h2>
+  <div class="cards">
+    <article>
+      <h3>SSH panels</h3>
+      <p><kbd>Ctrl+N</kbd> shows a folder on another computer. <kbd>F5</kbd>, <kbd>F6</kbd>, <kbd>F7</kbd>,
+        <kbd>F8</kbd>, <kbd>F2</kbd>, <kbd>F3</kbd> and <kbd>F4</kbd> work there, between computers too. Your own
+        <code>ssh</code> logs in, with your keys, agent and <code>~/.ssh/config</code>; cm never sees a password.</p>
+    </article>
+    <article>
+      <h3>Works with Explorer</h3>
+      <p><kbd>Ctrl+C</kbd> and <kbd>Ctrl+X</kbd> put files on the clipboard the way Explorer does, <kbd>Alt+V</kbd>
+        pastes what Explorer copied, <kbd>Shift+Enter</kbd> asks Windows which app to open a file in, and a
+        shortcut to a folder opens the folder.</p>
+    </article>
+    <article>
+      <h3>The bar follows your hands</h3>
+      <p>On Windows, hold <kbd>Shift</kbd>, <kbd>Ctrl</kbd> or <kbd>Alt</kbd> for a moment and the bottom bar shows
+        what that key does. A click there works as the key does.</p>
+    </article>
+    <article>
+      <h3>Your editor</h3>
+      <p><kbd>F3</kbd> and <kbd>F4</kbd> open files in Neovim, or the editor you set; big files go to
+        <code>less</code>. A file on another computer comes back when you save it.</p>
+    </article>
+    <article>
+      <h3>Deletes that ask the right question</h3>
+      <p>The question counts what would go while you decide, says which file you may not delete and why,
+        and never reaches through a link or junction, nor on Linux into a mounted disk.</p>
+    </article>
+    <article>
+      <h3>Settings in plain text</h3>
+      <p><kbd>Ctrl+P</kbd> edits the options; they live in a plain <code>settings.ini</code>. Hidden files,
+        natural sort ("day 2" before "day 10"), the mouse, the editor and shell: all one row each.</p>
+    </article>
+  </div>
+</section>
+
+<section id="keys">
+  <h2>The keys</h2>
+  <div class="keys">
+    <dl>
+      <dt><kbd>Tab</kbd></dt><dd>other panel</dd>
+      <dt><kbd>Enter</kbd> / <kbd>Backspace</kbd></dt><dd>in / up</dd>
+      <dt><kbd>Ctrl+S</kbd></dt><dd>quick search</dd>
+      <dt><kbd>Alt+F1</kbd> <kbd>Alt+F2</kbd></dt><dd>drives</dd>
+      <dt><kbd>Ctrl+D</kbd></dt><dd>favourite folders</dd>
+      <dt><kbd>Alt+H</kbd></dt><dd>folder history</dd>
+      <dt><kbd>Ctrl+T</kbd> <kbd>Alt+1…9</kbd></dt><dd>tabs</dd>
+    </dl>
+    <dl>
+      <dt><kbd>F3</kbd> <kbd>F4</kbd></dt><dd>view, edit</dd>
+      <dt><kbd>F5</kbd> <kbd>F6</kbd></dt><dd>copy, move</dd>
+      <dt><kbd>F7</kbd> <kbd>F8</kbd></dt><dd>new folder, delete</dd>
+      <dt><kbd>F2</kbd></dt><dd>rename</dd>
+      <dt><kbd>Ins</kbd> <kbd>+</kbd> <kbd>*</kbd></dt><dd>mark</dd>
+      <dt><kbd>Alt+F5</kbd> <kbd>Alt+F9</kbd></dt><dd>pack, unpack</dd>
+      <dt><kbd>Shift+F2</kbd></dt><dd>compare folders</dd>
+    </dl>
+    <dl>
+      <dt><kbd>Alt+B</kbd></dt><dd>git branches</dd>
+      <dt><kbd>Alt+W</kbd></dt><dd>git worktrees</dd>
+      <dt><kbd>Ctrl+E</kbd></dt><dd>places</dd>
+      <dt><kbd>Alt+F7</kbd></dt><dd>find</dd>
+      <dt><kbd>Ctrl+Q</kbd></dt><dd>quick view</dd>
+      <dt><kbd>Ctrl+O</kbd></dt><dd>shell</dd>
+      <dt><kbd>F12</kbd></dt><dd>every command</dd>
+    </dl>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Crescent Moon is written in Rust with <a href="https://ratatui.rs">ratatui</a>. It builds with
+      <code>cargo install --path .</code> into a single <code>cm.exe</code> (or <code>cm</code>) that needs nothing else.</p>
+    <p class="small">The animations are the real program, recorded in a made-up folder tree.</p>
+  </div>
+</footer>
+
+</body>
+</html>

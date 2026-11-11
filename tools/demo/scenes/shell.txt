@@ -1,0 +1,35 @@
+# Ctrl+O: one shell for the session. A command typed in cm runs there; the panel follows its cd.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website M:\projects\api
+until changed 8000
+key ctrl+o
+until PS M:
+# Nothing of this demo goes into the history file (a line with "token" in it isn't saved).
+typedelay 5
+type Set-PSReadLineOption -PredictionSource None -HistorySaveStyle SaveNothing # no token
+key enter
+type Clear-Host
+key enter
+wait 1500
+key ctrl+o
+wait 1000
+cut
+wait 1200
+typedelay 90
+type git log --oneline -6
+wait 500
+key enter
+wait 2500
+key ctrl+o
+wait 1200
+key ctrl+o
+wait 1000
+type cd docs
+key enter
+wait 800
+type git diff --stat
+key enter
+wait 2000
+key ctrl+o
+end 2500

@@ -1,0 +1,16 @@
+# The feature page: site/ goes to https://crescent-moon.starlume.eu when it changes on main.
+# (cm itself has no pipeline: it is built and installed with cargo.)
+include:
+  - project: web/deploy
+    file: ci/deploy.yml
+
+variables:
+  APP: crescent-moon
+  PUBLISH: site
+
+deploy:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - site/**/*
+        - .gitlab-ci.yml

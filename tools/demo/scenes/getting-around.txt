@@ -1,0 +1,28 @@
+# Favourite folders (Ctrl+D), folder tabs (Ctrl+T, Alt+1..9) and the folder history (Alt+H).
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website M:\photos
+until changed 8000
+wait 800
+cut
+wait 1000
+key ctrl+d
+wait 1500
+key 3
+wait 1200
+key ctrl+t
+wait 1000
+key ctrl+d
+wait 1000
+key 4
+wait 1200
+key alt+1
+wait 1200
+key alt+2
+wait 1200
+key alt+h
+wait 1800
+key down*2
+wait 600
+key enter
+end 2000

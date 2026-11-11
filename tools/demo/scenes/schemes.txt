@@ -1,0 +1,16 @@
+# Alt+C: every colour scheme on the whole screen, as the cursor moves through the list.
+size 100 30
+cwd M:\
+run ${CM} M:\projects\website "M:\photos\2025 Prague"
+until changed 8000
+wait 800
+cut
+wait 1000
+key alt+c
+wait 1200
+key home
+wait 1300
+keydelay 1300
+key down*13
+key esc
+end 1500
