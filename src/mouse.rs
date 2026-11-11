@@ -106,7 +106,7 @@ impl App {
             self.on_find_mouse(event.kind, pos);
             return;
         }
-        if self.job.is_some() || self.connecting.is_some() {
+        if self.job.is_some() || self.connecting.is_some() || self.switching.is_some() {
             return;
         }
         self.quicksearch = None;
@@ -280,6 +280,7 @@ impl App {
                     Some(Dialog::Worktrees { filter, worktrees, .. }) => {
                         crate::dialog::worktree_rows(worktrees, filter.text()).len()
                     }
+                    Some(Dialog::Branches { filter, branches, .. }) => crate::dialog::branch_rows(branches, filter.text()).len(),
                     _ => 0,
                 };
                 match &mut self.dialog {
@@ -289,7 +290,8 @@ impl App {
                         Dialog::History { cursor, .. }
                         | Dialog::Earlier { cursor, .. }
                         | Dialog::Commands { cursor, .. }
-                        | Dialog::Worktrees { cursor, .. },
+                        | Dialog::Worktrees { cursor, .. }
+                        | Dialog::Branches { cursor, .. },
                     ) if i < list_len => *cursor = i,
                     Some(Dialog::Sort { cursor, .. }) if i < SortBy::ALL.len() => *cursor = i,
                     Some(Dialog::Schemes { cursor, choices, .. }) if i < choices.len() => *cursor = i,
@@ -314,6 +316,7 @@ impl App {
                             | Dialog::Earlier { .. }
                             | Dialog::Commands { .. }
                             | Dialog::Worktrees { .. }
+                            | Dialog::Branches { .. }
                             | Dialog::Schemes { .. }
                             | Dialog::Attributes { .. }
                             | Dialog::Sort { .. }

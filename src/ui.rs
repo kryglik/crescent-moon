@@ -18,7 +18,7 @@ use crate::mouse::{DialogHit, HitAreas, PanelHit};
 use crate::ops::Running;
 use crate::dialog::LineEdit;
 use crate::finder::{Field as FindField, Finder, Row};
-use crate::git::{Head, Mark, Repo, Status, Tracker, Worktree};
+use crate::git::{Branch, Head, Mark, Repo, Status, Tracker, Worktree};
 use unicode_width::UnicodeWidthChar;
 use crate::options::{self, OptionsAutomatic};
 use crate::panel::{Entry, Panel, SortBy};
@@ -113,6 +113,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let lines = [format!("Connecting to {}…", connecting.target), "Esc stops".to_string()];
         draw_message(frame, area, "SSH", &lines, &[], 0, false, t);
     }
+    if let Some(switching) = &app.switching {
+        let lines = [format!("Switching to {}…", switching.branch), "git isn't stopped halfway".to_string()];
+        draw_message(frame, area, "Git", &lines, &[], 0, false, t);
+    }
     // Help can't scroll past its end (or keys up would first have to undo the excess).
     if let Some(Dialog::Help { scroll }) = &mut app.dialog {
         let visible = help_height(area).saturating_sub(2) as usize;
@@ -120,24 +124,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(Dialog::History { filter, cursor }) = &app.dialog {
         let rows: Vec<String> = app.history_rows(filter.text()).iter().map(|d| d.display().to_string()).collect();
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Folder history", &rows, filter, *cursor, HISTORY_HINT, t);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Folder history", &rows, filter, *cursor, HISTORY_HINT, None, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Earlier { filter, cursor, back }) = &app.dialog {
         let rows = dialog::earlier_rows(back, filter.text());
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Typed here before", &rows, filter, *cursor, EARLIER_HINT, t);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Typed here before", &rows, filter, *cursor, EARLIER_HINT, None, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Commands { filter, cursor }) = &app.dialog {
         let commands = dialog::matching_commands(filter.text());
         let label_w = commands.iter().map(|c| util::width(c.label)).max().unwrap_or(0);
         let rows: Vec<String> = commands.iter().map(|c| format!("{}  {}", util::pad(c.label, label_w), c.keys)).collect();
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Commands", &rows, filter, *cursor, COMMANDS_HINT, t);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Commands", &rows, filter, *cursor, COMMANDS_HINT, None, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Worktrees { filter, cursor, worktrees, here }) = &app.dialog {
         let rows = worktree_rows(&dialog::worktree_rows(worktrees, filter.text()), here);
-        let (position, dialog_hit) = draw_filtered_list(frame, area, "Git worktrees", &rows, filter, *cursor, WORKTREES_HINT, t);
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Git worktrees", &rows, filter, *cursor, WORKTREES_HINT, None, t);
+        frame.set_cursor_position(position);
+        hit.dialog = Some(dialog_hit);
+    } else if let Some(Dialog::Branches { filter, cursor, branches, here, coming }) = &app.dialog {
+        let rows = branch_rows(&dialog::branch_rows(branches, filter.text()), here);
+        let waiting = coming.as_ref().map(|_| "Asking git…");
+        let (position, dialog_hit) = draw_filtered_list(frame, area, "Git branches", &rows, filter, *cursor, BRANCHES_HINT, waiting, t);
         frame.set_cursor_position(position);
         hit.dialog = Some(dialog_hit);
     } else if let Some(Dialog::Schemes { cursor, choices, .. }) = &app.dialog {
@@ -930,7 +940,12 @@ fn draw_dialog(
         }
         Dialog::Hotlist { cursor } => (None, draw_hotlist(frame, area, hotlist, *cursor, t)),
         // Drawn by `draw`, which has the rows.
-        Dialog::History { .. } | Dialog::Earlier { .. } | Dialog::Commands { .. } | Dialog::Worktrees { .. } | Dialog::Schemes { .. } => {
+        Dialog::History { .. }
+        | Dialog::Earlier { .. }
+        | Dialog::Commands { .. }
+        | Dialog::Worktrees { .. }
+        | Dialog::Branches { .. }
+        | Dialog::Schemes { .. } => {
             (None, DialogHit::default())
         }
         Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor, t)),
@@ -1207,6 +1222,30 @@ const HISTORY_HINT: &str = "type to narrow · Enter goes there · Del forgets ·
 const COMMANDS_HINT: &str = "type to narrow · Enter runs it · Esc";
 const EARLIER_HINT: &str = "type to narrow · Enter takes it · Del forgets · Esc";
 const WORKTREES_HINT: &str = "type to narrow · Enter goes there (same subfolder) · Esc";
+const BRANCHES_HINT: &str = "type to narrow · Enter switches, asking first · Esc";
+
+/// The Alt+B list's rows, as `git branch` marks them: `*` on the branch the panel's worktree
+/// is on, `+` on one another worktree has; then the name, the newest commit's time, how it
+/// stands against what it follows, and that commit's first line (which gives way first).
+fn branch_rows(branches: &[&Branch], here: &Path) -> Vec<String> {
+    let now = std::time::SystemTime::now();
+    let name_w = branches.iter().map(|b| util::width(&b.name)).max().unwrap_or(0).min(40);
+    let track_w = branches.iter().map(|b| util::width(&b.track)).max().unwrap_or(0);
+    branches
+        .iter()
+        .map(|b| {
+            let mark = match &b.worktree {
+                Some(tree) if util::same_path(tree, here) => "*",
+                Some(_) => "+",
+                None => " ",
+            };
+            let name = util::pad(util::take_width(&b.name, 40), name_w);
+            let when = b.when.map(|time| util::format_time(time, now)).unwrap_or_default();
+            let track = if track_w > 0 { format!("  {}", util::pad(&b.track, track_w)) } else { String::new() };
+            format!("{mark} {name}  {when:<12}{track}  \t{}", b.subject)
+        })
+        .collect()
+}
 
 /// The Alt+W list's rows: `*` on the one the panel is in, the branch, then the folder (which
 /// gives way from the left when the box is narrow) and what is unusual about it.
@@ -1242,6 +1281,7 @@ fn draw_filtered_list(
     filter: &LineEdit,
     cursor: usize,
     hint: &str,
+    waiting: Option<&str>,
     t: &Scheme,
 ) -> (Position, DialogHit) {
     let height = (rows.len() as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
@@ -1259,7 +1299,11 @@ fn draw_filtered_list(
     let cursor = cursor.min(rows.len().saturating_sub(1));
     let offset = (cursor + 1).saturating_sub(list_h);
     if rows.is_empty() {
-        let empty = if filter.text().is_empty() { "Nothing here yet." } else { "Nothing matches." };
+        let empty = match waiting {
+            Some(note) => note,
+            None if filter.text().is_empty() => "Nothing here yet.",
+            None => "Nothing matches.",
+        };
         lines.push(Line::from(Span::styled(empty, grey)));
     }
     for (i, row) in rows.iter().enumerate().skip(offset).take(list_h) {

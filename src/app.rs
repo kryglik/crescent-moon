@@ -16,7 +16,7 @@ use crate::clipboard::{self, Clipboard, Effect};
 use crate::compare;
 use crate::dialog::{self, ButtonOutcome, ConfirmAction, Dialog, InputAction, LineEdit, Recall};
 use crate::finder::{Field as FindField, Finder};
-use crate::git::{self, Tracker, Worktree};
+use crate::git::{self, Branch, Tracker, Worktree};
 use crate::history::History;
 use crate::hotlist::Hotlist;
 use crate::lfs;
@@ -86,6 +86,12 @@ pub struct Connecting {
     pub target: Target,
     answer: Receiver<Result<Arc<Connection>, Failure>>,
     then: AfterConnect,
+}
+
+/// git switching a worktree to `branch`; keys wait for it.
+pub struct Switching {
+    pub branch: String,
+    answer: Receiver<Result<String, String>>,
 }
 
 /// Something to run outside the TUI; the main loop gives it the terminal.
@@ -274,6 +280,8 @@ pub struct App {
     putting_back: Option<(PathBuf, Option<PathBuf>)>,
     /// A connection being made; keys wait for it.
     pub connecting: Option<Connecting>,
+    /// git switching a branch, under the panels; keys wait for it.
+    pub switching: Option<Switching>,
     /// What to do once `ssh` has logged in at the terminal.
     login_then: Option<AfterConnect>,
     /// The panel the running job started from: its marks are the ones the job uses up.
@@ -389,6 +397,7 @@ impl App {
             edited_copy: None,
             putting_back: None,
             connecting: None,
+            switching: None,
             login_then: None,
             job_side: 0,
             overwrite_asked: None,
@@ -552,8 +561,8 @@ impl App {
     /// Reloads a panel whose folder another program changed. Not while a job runs or the
     /// shell is shown: both reload the panels when they end.
     fn follow_changes(&mut self) -> bool {
-        // No watches while a job runs (see `start_job`).
-        if self.job.is_some() {
+        // No watches while a job runs (see `start_job`), nor while git switches a branch.
+        if self.job.is_some() || self.switching.is_some() {
             return false;
         }
         let now = Instant::now();
@@ -584,7 +593,7 @@ impl App {
     /// Starts `git status` where the shown panels need it, and takes what arrived. A status
     /// can follow a checkout, so the branch is read again with it.
     fn tick_git(&mut self) -> bool {
-        let job_running = self.job.is_some();
+        let job_running = self.job.is_some() || self.switching.is_some();
         let shown: Vec<&git::Repo> = (0..2)
             // No watches while a job runs (see `start_job`).
             .filter(|&side| !job_running && !(self.quick_view && side != self.active))
@@ -613,8 +622,11 @@ impl App {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
         let finding = self.finder.as_ref().is_some_and(Finder::working);
         let surveying = matches!(&self.dialog, Some(Dialog::Delete { survey, .. }) if !survey.is_done());
+        let listing = matches!(&self.dialog, Some(Dialog::Branches { coming: Some(_), .. }));
         self.job.is_some()
             || self.connecting.is_some()
+            || self.switching.is_some()
+            || listing
             || self.sizer.as_ref().is_some_and(Sizer::is_busy)
             || drives_pending
             || finding
@@ -682,6 +694,8 @@ impl App {
             if key.code == KeyCode::Esc {
                 self.connecting = None;
             }
+        } else if self.switching.is_some() {
+            // git is changing the files under the panels, and isn't stopped halfway.
         } else if self.dialog.is_some() {
             self.on_dialog_key(key);
         } else if self.find_shown {
@@ -851,6 +865,7 @@ impl App {
             KeyCode::Char('a') if alt && !ctrl => self.open_attributes(),
             KeyCode::Char('c') if alt && !ctrl => self.open_schemes(None),
             KeyCode::Char('w') if alt && !ctrl => self.open_worktrees(),
+            KeyCode::Char('b') if alt && !ctrl => self.open_branches(),
             KeyCode::Char('f') if ctrl && !alt => {
                 let current = self.active_panel().filter.clone().unwrap_or_default();
                 self.start_input("Filter", "Show only files matching (empty shows all):", &current, InputAction::Filter);
@@ -985,6 +1000,9 @@ impl App {
             Dialog::Commands { filter, cursor } => self.on_commands_key(&key, filter, cursor),
             Dialog::Worktrees { filter, cursor, worktrees, here } => {
                 self.on_worktrees_key(&key, filter, cursor, worktrees, here)
+            }
+            Dialog::Branches { filter, cursor, branches, here, coming } => {
+                self.on_branches_key(&key, filter, cursor, branches, here, coming)
             }
             Dialog::Attributes { paths, states, cursor } => self.on_attributes_key(&key, paths, states, cursor),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
@@ -1671,6 +1689,7 @@ impl App {
             ConfirmAction::Pack(sources, dest) => self.start_job(Job::Pack { sources, dest }),
             ConfirmAction::DeleteThere(connection, paths) => self.start_job(Job::DeleteThere { connection, paths }),
             ConfirmAction::PutBack(copy) => self.put_back(*copy),
+            ConfirmAction::Switch { root, branch } => self.switch_branch(root, branch),
         }
     }
 
@@ -2002,6 +2021,8 @@ impl App {
             changed |= finder.tick();
         }
         changed |= self.tick_connecting();
+        changed |= self.take_branches(false);
+        changed |= self.tick_switching();
         changed |= self.tick_readings();
         // Not over a dialog: it may say where a file went. It comes when that one is read.
         for side in 0..2 {
@@ -2609,6 +2630,137 @@ impl App {
         Some(Dialog::Worktrees { filter, cursor, worktrees, here })
     }
 
+    /// Alt+B: the branches of the repository the panel is in, newest first, to find one and
+    /// switch to it. git lists them on a thread of its own; a quick list is there at once.
+    fn open_branches(&mut self) {
+        let Some(repo) = self.active_panel().repo.as_ref() else {
+            self.notice = Some("Not in a git repository (Alt+B lists its branches)".into());
+            return;
+        };
+        let here = repo.root.clone();
+        let coming = Some(git::branches(&here));
+        self.dialog = Some(Dialog::Branches { filter: LineEdit::default(), cursor: 0, branches: Vec::new(), here, coming });
+        self.take_branches(true);
+    }
+
+    /// The branches git has listed for Alt+B, if they are in; with `wait`, after a moment's
+    /// wait for them. The cursor starts on the newest one that isn't this worktree's. Returns
+    /// whether anything came.
+    fn take_branches(&mut self, wait: bool) -> bool {
+        let Some(Dialog::Branches { coming: Some(coming), .. }) = &self.dialog else { return false };
+        let answer = if wait {
+            match coming.recv_timeout(crate::reading::a_moment()) {
+                Ok(answer) => answer,
+                Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err("git ended without a word".into()),
+            }
+        } else {
+            match coming.try_recv() {
+                Ok(answer) => answer,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Err("git ended without a word".into()),
+            }
+        };
+        match answer {
+            Ok(list) => {
+                if let Some(Dialog::Branches { filter, cursor, branches, here, coming }) = &mut self.dialog {
+                    if filter.text().is_empty() {
+                        let elsewhere = |b: &Branch| !b.worktree.as_ref().is_some_and(|tree| util::same_path(tree, here));
+                        *cursor = list.iter().position(elsewhere).unwrap_or(0);
+                    }
+                    (*branches, *coming) = (list, None);
+                }
+            }
+            Err(why) => {
+                self.dialog = None;
+                self.error(format!("Cannot list the branches:\n{why}"));
+            }
+        }
+        true
+    }
+
+    fn on_branches_key(
+        &mut self,
+        key: &KeyEvent,
+        mut filter: LineEdit,
+        mut cursor: usize,
+        branches: Vec<Branch>,
+        here: PathBuf,
+        coming: Option<Receiver<Result<Vec<Branch>, String>>>,
+    ) -> Option<Dialog> {
+        let rows = dialog::branch_rows(&branches, filter.text());
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => return None,
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => return None,
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(last),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+            KeyCode::PageDown => cursor = (cursor + 10).min(last),
+            KeyCode::Enter => {
+                if let Some(branch) = rows.get(cursor) {
+                    let branch = (*branch).clone();
+                    self.choose_branch(branch, &here);
+                }
+                return None;
+            }
+            _ => {
+                let before = filter.text().to_string();
+                filter.handle_key(key);
+                if filter.text() != before {
+                    cursor = 0;
+                }
+            }
+        }
+        Some(Dialog::Branches { filter, cursor, branches, here, coming })
+    }
+
+    /// Enter on a branch: to the worktree that has it checked out, or this worktree switched to
+    /// it once the user says so.
+    fn choose_branch(&mut self, branch: Branch, here: &Path) {
+        match branch.worktree.clone() {
+            Some(tree) if util::same_path(&tree, here) => {
+                self.notice = Some(format!("This worktree is on {} already", branch.name));
+            }
+            Some(tree) => self.go_into_worktree(&tree, here),
+            None => {
+                let mut lines = vec![format!("Switch this worktree to {}?", branch.name), here.display().to_string()];
+                if let Some((_, short)) = branch.name.split_once('/').filter(|_| branch.remote) {
+                    lines.push(format!("A branch {short} that follows it is made here."));
+                }
+                lines.push("Changes not committed go along; git refuses if they would be lost.".into());
+                let action = ConfirmAction::Switch { root: here.to_path_buf(), branch };
+                self.dialog = Some(Dialog::Confirm { title: "Switch branch".into(), lines, focus: 0, danger: false, action });
+            }
+        }
+    }
+
+    /// git switches the worktree at `root` to `branch`, with the watches closed so that none
+    /// holds a folder it removes; keys wait meanwhile.
+    fn switch_branch(&mut self, root: PathBuf, branch: Branch) {
+        self.watches = [None, None];
+        self.git.close_watches();
+        let answer = git::switch(&root, &branch);
+        self.switching = Some(Switching { branch: branch.name, answer });
+    }
+
+    /// The end of a switch: the panels read again, and what git said.
+    fn tick_switching(&mut self) -> bool {
+        let Some(switching) = &self.switching else { return false };
+        let answer = match switching.answer.try_recv() {
+            Ok(answer) => answer,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("git ended without a word".into()),
+        };
+        let Some(Switching { branch, .. }) = self.switching.take() else { return false };
+        self.reload_panels();
+        match answer {
+            Ok(said) => self.notice = Some(said.lines().next().map_or_else(|| format!("Switched to {branch}"), String::from)),
+            Err(why) => self.error(format!("Cannot switch to {branch}:\n{why}")),
+        }
+        true
+    }
+
     /// Into `worktree`, to the folder the panel is in within the working tree at `here` when
     /// it has that folder too (src\ui in one, src\ui in the other), else as near it as it has.
     fn go_to_worktree(&mut self, worktree: &Worktree, here: &Path) {
@@ -2616,9 +2768,15 @@ impl App {
             let path = worktree.path.display();
             return self.error(format!("The worktree's folder is gone:\n{path}\n(git worktree prune forgets it)"));
         }
+        self.go_into_worktree(&worktree.path, here);
+    }
+
+    /// Into the worktree at `tree`, to the folder the panel is in within the one at `here`, or
+    /// as near it as `tree` has.
+    fn go_into_worktree(&mut self, tree: &Path, here: &Path) {
         let inside = self.active_panel().cwd.strip_prefix(here).map(Path::to_path_buf).unwrap_or_default();
-        let target = worktree.path.join(inside);
-        let places = target.ancestors().take_while(|dir| dir.starts_with(&worktree.path)).map(Path::to_path_buf).collect();
+        let target = tree.join(inside);
+        let places = target.ancestors().take_while(|dir| dir.starts_with(tree)).map(Path::to_path_buf).collect();
         self.go_to_first(self.active, places);
     }
 
@@ -3442,6 +3600,91 @@ mod tests {
 
     /// Alt+W lists the repository's worktrees; Enter goes to the same subfolder in the one
     /// chosen, or as near it as that one has. Outside a repository it says so.
+    /// Alt+B: the branches newest first, one of a remote only when none here has it, and typing
+    /// narrows them. Enter asks, then git switches; what git refuses is said; a branch another
+    /// worktree has checked out takes the panel there.
+    #[test]
+    fn alt_b_finds_a_branch_and_switches_to_it() {
+        use crate::git::Head;
+        use crate::git::tests::{git_available, run_git};
+        if !git_available() {
+            eprintln!("git isn't installed: skipped");
+            return;
+        }
+        let tmp = TempDir::new("app-branches");
+        let upstream = tmp.dir("upstream");
+        run_git(&upstream, &["init", "-q", "-b", "main"], None);
+        fs::write(upstream.join("a.txt"), "a").unwrap();
+        run_git(&upstream, &["add", "."], None);
+        run_git(&upstream, &["commit", "-q", "--no-verify", "-m", "first"], Some("2026-01-01T12:00:00"));
+        run_git(&upstream, &["branch", "old"], None);
+        run_git(&upstream, &["switch", "-q", "-c", "feature"], None);
+        fs::write(upstream.join("f.txt"), "f").unwrap();
+        run_git(&upstream, &["add", "."], None);
+        run_git(&upstream, &["commit", "-q", "--no-verify", "-m", "the feature"], Some("2026-01-03T12:00:00"));
+        run_git(&upstream, &["switch", "-q", "main"], None);
+        run_git(tmp.path(), &["clone", "-q", "upstream", "repo"], None);
+        let repo = tmp.path().join("repo");
+        run_git(&repo, &["worktree", "add", "-q", "-b", "elsewhere", "../wt"], None);
+        let mut app = test_app(&repo, &repo);
+        let alt_b = with_mods(KeyCode::Char('b'), KeyModifiers::ALT);
+
+        app.on_key(alt_b);
+        let Some(Dialog::Branches { branches, cursor, .. }) = &app.dialog else { panic!("no branch list") };
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["origin/feature", "elsewhere", "main", "origin/old"], "origin/main is main's");
+        assert_eq!(*cursor, 0, "on the newest one this worktree isn't on");
+        assert!(branches[2].worktree.as_ref().is_some_and(|tree| util::same_path(tree, &repo)));
+        assert!(branches[1].worktree.as_ref().is_some_and(|tree| util::same_path(tree, &tmp.path().join("wt"))));
+
+        // In the way of the switch: git says so, and nothing changes.
+        fs::write(repo.join("f.txt"), "mine").unwrap();
+        typing(&mut app, "feat");
+        app.on_key(key(KeyCode::Enter));
+        let Some(Dialog::Confirm { lines, .. }) = &app.dialog else { panic!("no question") };
+        assert_eq!(lines[0], "Switch this worktree to origin/feature?");
+        assert!(lines.iter().any(|line| line == "A branch feature that follows it is made here."), "{lines:?}");
+        app.on_key(key(KeyCode::Enter));
+        let wait_for_git = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.switching.is_some() {
+                assert!(Instant::now() < deadline, "git never finished");
+                std::thread::sleep(Duration::from_millis(20));
+                app.tick();
+            }
+        };
+        wait_for_git(&mut app);
+        let Some(Dialog::Message { lines, error: true, .. }) = &app.dialog else { panic!("no error: {:?}", app.notice) };
+        assert!(lines[0].starts_with("Cannot switch to origin/feature"), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("f.txt")), "{lines:?}");
+        assert_eq!(fs::read_to_string(repo.join("f.txt")).unwrap(), "mine");
+        app.on_key(key(KeyCode::Enter));
+
+        // Out of the way: switched, and the panel shows the branch's files.
+        fs::remove_file(repo.join("f.txt")).unwrap();
+        app.on_key(alt_b);
+        typing(&mut app, "feat");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Enter));
+        wait_for_git(&mut app);
+        assert!(app.dialog.is_none(), "{:?}", app.notice);
+        assert_eq!(app.active_panel().repo.as_ref().map(|repo| repo.head.clone()), Some(Head::Branch("feature".into())));
+        assert!(app.active_panel().entries.iter().any(|e| e.name == "f.txt"));
+        assert!(app.notice.as_deref().is_some_and(|said| said.contains("feature")), "{:?}", app.notice);
+
+        // A branch another worktree is on: the panel goes there, nothing asked.
+        app.on_key(alt_b);
+        typing(&mut app, "elsewhere");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none());
+        assert!(util::same_path(&app.active_panel().cwd, &tmp.path().join("wt")));
+        // And the one it is on is said to be that.
+        app.on_key(alt_b);
+        typing(&mut app, "elsewhere");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.notice.as_deref(), Some("This worktree is on elsewhere already"));
+    }
+
     #[test]
     fn alt_w_goes_to_the_same_folder_in_another_worktree() {
         use crate::git::tests::{fake_repo, fake_worktree};

@@ -85,6 +85,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Alt+F1, Alt+F2 | drive picker for the left / right panel |
 | Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
 | Alt+W | the git repository's worktrees: Enter goes to one, into the same subfolder (see Git) |
+| Alt+B | the git repository's branches, newest first: type to find one, Enter switches to it after asking (see Git) |
 | Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
 | Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
 | Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
@@ -275,6 +276,17 @@ dimmed.
   narrows the list by branch or folder, and Enter goes there: into the same subfolder when the
   other worktree has it (`src\ui` in one, `src\ui` in the other), else as near it as it has.
   Handy with tools that work in worktrees of their own, such as Claude Code's sessions.
+- **Alt+B** lists the repository's branches, the one with the newest commit first: the
+  branches here, and those of a remote that no branch here has or follows (`origin/fix`). Each
+  shows when its newest commit was made, how it stands against what it follows (`↑1 ↓2`,
+  `gone`) and that commit's first line; typing narrows the list by name or by that line. As in
+  `git branch`, `*` marks the branch this worktree is on and `+` one another worktree has.
+  Enter on a `+` branch goes to that worktree, like Alt+W. On any other branch rmc asks, then
+  runs `git switch` (`git switch --track origin/fix` for a remote one, which makes a branch
+  `fix` that follows it). Changes not committed go along, and git refuses when they would be
+  lost; rmc then shows what git said. The switch is never stopped halfway, and keys wait
+  until it is done. git lists the branches on a thread of its own, so a slow share doesn't
+  hold the screen.
 
 ### Find
 

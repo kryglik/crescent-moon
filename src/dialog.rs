@@ -2,13 +2,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::EditedCopy;
-use crate::git::Worktree;
+use crate::git::{Branch, Worktree};
 use crate::ops::Answer;
 use crate::options::OptionsAutomatic;
 use crate::panel::SortBy;
@@ -31,6 +31,8 @@ pub enum ConfirmAction {
     DeleteThere(Arc<Connection>, Vec<String>),
     /// A file edited here replaces the one on the other computer, which has changed meanwhile.
     PutBack(Box<EditedCopy>),
+    /// The worktree at `root` goes over to `branch`.
+    Switch { root: PathBuf, branch: Branch },
 }
 
 /// What was typed into a kind of field before, for Up and Down to go through. (The fields'
@@ -162,6 +164,16 @@ pub enum Dialog {
     /// Alt+W: the worktrees of the repository whose working tree at `here` the panel is in,
     /// narrowed by what is typed (`worktree_rows`).
     Worktrees { filter: LineEdit, cursor: usize, worktrees: Vec<Worktree>, here: PathBuf },
+    /// Alt+B: the branches of the repository whose working tree at `here` the panel is in,
+    /// newest first, narrowed by what is typed (`branch_rows`); `coming` until git has listed
+    /// them.
+    Branches {
+        filter: LineEdit,
+        cursor: usize,
+        branches: Vec<Branch>,
+        here: PathBuf,
+        coming: Option<Receiver<Result<Vec<Branch>, String>>>,
+    },
     /// Alt+A: what to set for each of `platform::ATTRIBUTES` on `paths`; None leaves it as each
     /// file has it (they differ).
     Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize },
@@ -448,6 +460,7 @@ pub const COMMANDS: &[Command] = &[
     command("Other panel: this folder", "Alt+I", KeyCode::Char('i'), ALT),
     command("Other panel: the folder under the cursor", "Alt+O", KeyCode::Char('o'), ALT),
     command("Git worktrees: go to another one", "Alt+W", KeyCode::Char('w'), ALT),
+    command("Git branches: find one, switch to it", "Alt+B", KeyCode::Char('b'), ALT),
     command("Open with… (Windows asks which app)", "Shift+Enter", KeyCode::Enter, SHIFT),
     command("Attributes: read-only, hidden… (permissions)", "Alt+A", KeyCode::Char('a'), ALT),
     command("Shell (switch to it and back)", "Ctrl+O", KeyCode::Char('o'), CTRL),
@@ -478,6 +491,11 @@ pub fn take_earlier(back: &mut Dialog, row: &str) {
     if let Dialog::Input { edit, recall, .. } = back {
         recall.picked(edit, row);
     }
+}
+
+/// The branches whose name or newest commit holds every word of `filter`.
+pub fn branch_rows<'a>(branches: &'a [Branch], filter: &str) -> Vec<&'a Branch> {
+    branches.iter().filter(|b| matches_words(&format!("{} {}", b.name, b.subject), filter)).collect()
 }
 
 /// The worktrees whose branch or folder holds every word of `filter`.
@@ -563,6 +581,9 @@ pub const HELP: &[&str] = &[
     "  ! conflict  • changes inside a folder; ignored files are dim",
     "  Alt+W        worktrees of the repository: Enter goes to one",
     "               (to the same folder in it, when it has one)",
+    "  Alt+B        branches, newest first: Enter switches to one",
+    "               (asks first); + is checked out in another worktree",
+    "               and Enter goes there",
     "",
     "Mouse",
     "  click        select       double-click  open",

@@ -8,14 +8,14 @@
 //! have changed: rmc reloaded the panels, files in the repository changed (watched), or some
 //! time passed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::util;
 use crate::watch::Watch;
@@ -139,6 +139,137 @@ impl Repo {
         list.extend(linked);
         list
     }
+}
+
+/// A branch, as Alt+B lists them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Branch {
+    /// `main`, or for a branch only on a remote, `origin/feature`.
+    pub name: String,
+    /// Only on a remote: switching to it makes a branch here that follows it.
+    pub remote: bool,
+    /// When its newest commit was made.
+    pub when: Option<SystemTime>,
+    /// How it stands against the branch it follows: `↑1 ↓2`, `gone`, or nothing.
+    pub track: String,
+    /// The worktree that has it checked out.
+    pub worktree: Option<PathBuf>,
+    /// The first line of its newest commit.
+    pub subject: String,
+}
+
+/// What `git for-each-ref` says of each branch, one per line.
+const BRANCH_FORMAT: &str =
+    "--format=%(refname)%00%(committerdate:unix)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(worktreepath)%00%(subject)";
+
+impl Branch {
+    /// The branches in `output` of `git for-each-ref` with `BRANCH_FORMAT`, newest first: the
+    /// ones here, and those of a remote that none here has by name or follows. Paths are read as
+    /// seen from `base`.
+    fn parse(output: &[u8], base: &Path) -> Vec<Branch> {
+        let text = String::from_utf8_lossy(output);
+        let (mut here, mut there) = (Vec::new(), Vec::new());
+        let mut followed = HashSet::new();
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split('\0').collect();
+            let [refname, date, upstream, track, worktree, subject] = fields[..] else { continue };
+            let mut branch = Branch {
+                name: String::new(),
+                remote: false,
+                when: date.parse().ok().map(|secs| UNIX_EPOCH + Duration::from_secs(secs)),
+                track: track_text(track),
+                worktree: (!worktree.is_empty()).then(|| native_path(worktree, base)),
+                subject: subject.to_string(),
+            };
+            if let Some(name) = refname.strip_prefix("refs/heads/") {
+                if !upstream.is_empty() {
+                    followed.insert(upstream.to_string());
+                }
+                branch.name = name.to_string();
+                here.push(branch);
+            } else if let Some(name) = refname.strip_prefix("refs/remotes/").filter(|name| !name.ends_with("/HEAD")) {
+                (branch.name, branch.remote, branch.track, branch.worktree) = (name.to_string(), true, String::new(), None);
+                there.push(branch);
+            }
+        }
+        let names: HashSet<&str> = here.iter().map(|b| b.name.as_str()).collect();
+        there.retain(|b| !followed.contains(&b.name) && !b.name.split_once('/').is_some_and(|(_, short)| names.contains(short)));
+        let mut all: Vec<Branch> = here.into_iter().chain(there).collect();
+        all.sort_by(|a, b| b.when.cmp(&a.when));
+        all
+    }
+}
+
+/// `ahead 1, behind 2` as the git row shows it: `↑1 ↓2`.
+fn track_text(track: &str) -> String {
+    track
+        .split(", ")
+        .filter_map(|part| match part.split_once(' ') {
+            Some(("ahead", n)) => Some(format!("↑{n}")),
+            Some(("behind", n)) => Some(format!("↓{n}")),
+            _ if part == "gone" => Some("gone".to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A git command in the working tree at `root`: in the repository asked about, whatever rmc
+/// was started with, and never asking anything.
+fn git_at(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root);
+    for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
+        command.env_remove(name);
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
+    command
+}
+
+/// What git said on its way out, for the user: its first lines.
+fn said(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|line| !line.is_empty()).take(8).collect();
+    lines.join("\n")
+}
+
+/// The branches of the repository at `root`, newest first. git lists them on a thread of its
+/// own, as a share that has gone away takes its time here too; the answer comes on the channel.
+pub fn branches(root: &Path) -> Receiver<Result<Vec<Branch>, String>> {
+    let (tx, answer) = mpsc::channel();
+    let root = root.to_path_buf();
+    thread::spawn(move || {
+        let mut command = git_at(&root);
+        command.args(["--no-optional-locks", "for-each-ref", "--sort=-committerdate", BRANCH_FORMAT, "refs/heads", "refs/remotes"]);
+        let _ = tx.send(match command.output() {
+            Ok(output) if output.status.success() => Ok(Branch::parse(&output.stdout, &root)),
+            Ok(output) => Err(said(&output.stderr)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("git isn't installed".into()),
+            Err(e) => Err(e.to_string()),
+        });
+    });
+    answer
+}
+
+/// Switches the worktree at `root` to `branch`; one only on a remote gets a branch here that
+/// follows it. On a thread of its own, and never stopped: a checkout stopped halfway would
+/// leave the files of neither branch. What git said comes on the channel.
+pub fn switch(root: &Path, branch: &Branch) -> Receiver<Result<String, String>> {
+    let (tx, answer) = mpsc::channel();
+    let mut command = git_at(root);
+    command.arg("switch");
+    if branch.remote {
+        command.arg("--track");
+    }
+    command.arg(&branch.name);
+    thread::spawn(move || {
+        let _ = tx.send(match command.output() {
+            Ok(output) if output.status.success() => Ok(said(&output.stderr)),
+            Ok(output) => Err(said(&output.stderr)),
+            Err(e) => Err(e.to_string()),
+        });
+    });
+    answer
 }
 
 /// One of a repository's working trees, as `git worktree list` shows them.
@@ -428,19 +559,15 @@ fn status_of(root: &Path) -> Outcome {
 }
 
 fn run_status(root: &Path, ignored: bool) -> Outcome {
-    let mut command = Command::new("git");
+    let mut command = git_at(root);
     // No optional locks: a status must never write the index, nor get in the way of the
     // user's own git commands.
-    command.arg("--no-optional-locks").arg("-C").arg(root).args(["status", "--porcelain=v2", "--branch", "-z"]);
+    command.arg("--no-optional-locks").args(["status", "--porcelain=v2", "--branch", "-z"]);
     if ignored {
         command.arg("--ignored=matching");
     }
-    // The repository is the one asked about, whatever rmc was started with.
-    for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
-        command.env_remove(name);
-    }
-    command.env("GIT_OPTIONAL_LOCKS", "0").env("GIT_TERMINAL_PROMPT", "0");
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Outcome::NoGit,
@@ -779,8 +906,51 @@ pub mod tests {
         fs::write(path.join(".git"), format!("gitdir: {}\n", slashes(&admin))).unwrap();
     }
 
-    fn git_available() -> bool {
+    pub fn git_available() -> bool {
         Command::new("git").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+
+    /// Runs git in `dir` as a test sets a repository up: nobody's own settings, and commits
+    /// dated `date` when one is given, so that they come in a known order.
+    pub fn run_git(dir: &Path, args: &[&str], date: Option<&str>) {
+        let mut command = Command::new("git");
+        command
+            .args(["-c", "user.name=rmc", "-c", "user.email=rmc@example.com", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(date) = date {
+            command.env("GIT_AUTHOR_DATE", date).env("GIT_COMMITTER_DATE", date);
+        }
+        assert!(command.status().unwrap().success(), "git {args:?}");
+    }
+
+    /// What `git for-each-ref` says becomes the list: newest first, a remote branch only when
+    /// none here has it, and where each one is checked out.
+    #[test]
+    fn branches_are_read_newest_first() {
+        let base = Path::new(if cfg!(windows) { r"E:\repo" } else { "/repo" });
+        let line = |fields: [&str; 6]| fields.join("\0");
+        let output = [
+            line(["refs/heads/main", "100", "origin/main", "ahead 1, behind 2", "E:/repo", "first"]),
+            line(["refs/heads/topic", "300", "", "", "", "newest"]),
+            line(["refs/heads/gone", "50", "origin/gone", "gone", "", "old"]),
+            line(["refs/remotes/origin/HEAD", "100", "", "", "", "first"]),
+            line(["refs/remotes/origin/main", "100", "", "", "", "first"]),
+            line(["refs/remotes/origin/topic", "290", "", "", "", "theirs"]),
+            line(["refs/remotes/origin/fresh", "200", "", "", "", "from there"]),
+        ]
+        .join("\n");
+        let branches = Branch::parse(output.as_bytes(), base);
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["topic", "origin/fresh", "main", "gone"]);
+        assert_eq!(branches[2].track, "↑1 ↓2");
+        assert_eq!(branches[3].track, "gone");
+        assert!(branches[1].remote && !branches[0].remote);
+        assert_eq!(branches[2].worktree.as_deref(), Some(Path::new(if cfg!(windows) { r"E:\repo" } else { "/mnt/e/repo" })));
+        assert_eq!(branches[1].subject, "from there");
     }
 
     #[test]
