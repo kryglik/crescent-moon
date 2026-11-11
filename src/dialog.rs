@@ -478,10 +478,15 @@ pub fn matching_commands(filter: &str) -> Vec<&'static Command> {
     COMMANDS.iter().filter(|c| matches_words(&format!("{} {}", c.label, c.keys), filter)).collect()
 }
 
-/// Whether `text` holds every word of `filter`, in any case ("color" finds "colour" too).
+/// Whether `text` holds every word of `filter`, in any case ("color" finds "colour" too, and
+/// "colou", on the way to typing it, still does).
 fn matches_words(text: &str, filter: &str) -> bool {
-    let text = text.to_lowercase().replace("colour", "color");
-    filter.split_whitespace().all(|word| text.contains(&word.to_lowercase().replace("colour", "color")))
+    let text = text.to_lowercase();
+    let american = text.replace("colour", "color");
+    filter.split_whitespace().all(|word| {
+        let word = word.to_lowercase();
+        text.contains(&word) || american.contains(&word.replace("colour", "color"))
+    })
 }
 
 /// The earlier texts of the input dialog `back`, newest first, each holding every word of
@@ -640,6 +645,17 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// F12 finds the colour scheme by either spelling, and at every step of typing one: "colou"
+    /// found nothing once, between "colo" and "colour".
+    #[test]
+    fn colour_is_found_while_it_is_typed() {
+        for typed in ["col", "colo", "colou", "colour", "color", "COLOU", "scheme colou"] {
+            let found: Vec<&str> = matching_commands(typed).iter().map(|c| c.label).collect();
+            assert!(found.iter().any(|label| label.starts_with("Colour scheme")), "{typed:?}: {found:?}");
+        }
+        assert!(matching_commands("colours").iter().all(|c| !c.label.starts_with("Colour scheme")));
     }
 
     /// A selected text goes with the first character typed, or Backspace or Delete. Anything
