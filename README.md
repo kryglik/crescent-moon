@@ -108,7 +108,9 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 
 | Key | Action |
 | --- | --- |
-| Insert, Shift+Up/Down, `+` `-` `*` | mark files |
+| Insert, Shift+Up/Down | mark files |
+| `+` / `-` | mark / unmark what matches a pattern (`*.txt`), files and folders; a slash at the end (`*/`, `src*/`) takes folders only. The option "+ and - mark folders too" (Ctrl+P) off makes it files only, as in mc |
+| `*` | invert the marks on files |
 | Ctrl+A | mark everything (with an empty command line) |
 | F2 | rename: the name is selected, so typing replaces it and the arrows edit it |
 | F5 / F6 / F7 | copy / move / make directory; the progress shows the speed and the time left |
@@ -400,6 +402,7 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | Left/Right go up and into folders | on: with an empty command line, Left is the parent folder and Right the folder under the cursor |
 | Numbers in names by value | on: "day 2" sorts before "day 10", as in Explorer |
 | Git: mark changed and new files | on: in a repository `git status` runs in the background (see Git); off, only the branch shows |
+| + and - mark folders too | on: `+` and `-` take folders as well as files; off, files only, as in mc. A pattern ending in a slash (`*/`) takes folders either way |
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |

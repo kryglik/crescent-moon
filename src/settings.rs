@@ -22,6 +22,9 @@ pub struct Settings {
     /// In a git repository, `git status` runs now and then so the panels mark changed, new and
     /// ignored files. (The branch shows either way: it is read from the repository's files.)
     pub git_status: bool,
+    /// + and - (mark and unmark by pattern) take folders as well as files. A pattern that ends
+    /// in a slash (`*/`) takes folders only, either way.
+    pub mark_folders: bool,
     /// The colour scheme's name (see `scheme`): a built-in one, or a file in `schemes`.
     pub scheme: String,
     /// Files bigger than this many megabytes go to the pager, and the editor asks first.
@@ -42,6 +45,7 @@ impl Default for Settings {
             arrows_navigate: true,
             natural_sort: true,
             git_status: true,
+            mark_folders: true,
             scheme: "classic".into(),
             big_file_mb: 10,
             editor: String::new(),
@@ -94,6 +98,7 @@ impl Settings {
                 "arrows_navigate" => settings.arrows_navigate = flag(settings.arrows_navigate),
                 "natural_sort" => settings.natural_sort = flag(settings.natural_sort),
                 "git_status" => settings.git_status = flag(settings.git_status),
+                "mark_folders" => settings.mark_folders = flag(settings.mark_folders),
                 "scheme" if !value.is_empty() => settings.scheme = value.to_string(),
                 "big_file_mb" => {
                     if let Ok(mb) = value.parse::<u64>()
@@ -122,6 +127,7 @@ impl Settings {
              arrows_navigate = {}\n\
              natural_sort = {}\n\
              git_status = {}\n\
+             mark_folders = {}\n\
              scheme = {}\n\
              big_file_mb = {}\n\
              editor = {}\n\
@@ -134,6 +140,7 @@ impl Settings {
             self.arrows_navigate,
             self.natural_sort,
             self.git_status,
+            self.mark_folders,
             self.scheme,
             self.big_file_mb,
             self.editor,
@@ -160,6 +167,7 @@ mod tests {
             confirm_quit: true,
             mouse: false,
             git_status: false,
+            mark_folders: false,
             scheme: "nord".into(),
             big_file_mb: 25,
             editor: r#""C:\Program Files\Neovim\bin\nvim.exe" -p"#.into(),

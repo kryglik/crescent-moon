@@ -860,10 +860,12 @@ impl App {
             KeyCode::Char('p') if alt && !ctrl => self.history_step(-1),
             KeyCode::Char('n') if alt && !ctrl => self.history_step(1),
             KeyCode::Char('+') if cmd_empty && plain => {
-                self.start_input("Select", "Mark files matching:", "*", InputAction::Select)
+                let prompt = format!("Mark {}", self.what_patterns_mark());
+                self.start_input("Select", &prompt, "*", InputAction::Select)
             }
             KeyCode::Char('-') if cmd_empty && plain => {
-                self.start_input("Unselect", "Unmark files matching:", "*", InputAction::Unselect)
+                let prompt = format!("Unmark {}", self.what_patterns_mark());
+                self.start_input("Unselect", &prompt, "*", InputAction::Unselect)
             }
             KeyCode::Char('*') if cmd_empty && plain => self.active_panel_mut().invert_marks(),
             KeyCode::Char('a') if ctrl && !alt && cmd_empty => self.active_panel_mut().mark_all(),
@@ -1773,11 +1775,9 @@ impl App {
             InputAction::Rename(from) => self.rename(&from, &text),
             InputAction::Mkdir => self.mkdir(&cwd, &text),
             InputAction::NewFile => self.new_file(&cwd, &text),
-            InputAction::Select => {
-                self.active_panel_mut().mark_matching(&text, true);
-            }
-            InputAction::Unselect => {
-                self.active_panel_mut().mark_matching(&text, false);
+            InputAction::Select | InputAction::Unselect => {
+                let (mark, folders) = (matches!(action, InputAction::Select), self.config.settings.mark_folders);
+                self.active_panel_mut().mark_matching(&text, mark, folders);
             }
             InputAction::Connect => {
                 if text.trim().is_empty() {
@@ -1956,6 +1956,16 @@ impl App {
         match then {
             AfterConnect::Go { side, place } => self.change_dir(side, place),
             AfterConnect::Transfer { sources, text, moving, keep_marks } => self.transfer(&sources, &text, moving, keep_marks),
+        }
+    }
+
+    /// The rest of the prompt of + and -, by the option (and a slash at the end for folders).
+    /// Short enough for an 80-column terminal, where the field is 49 wide.
+    fn what_patterns_mark(&self) -> &'static str {
+        if self.config.settings.mark_folders {
+            "files and folders (*/ folders only):"
+        } else {
+            "files matching (*/ for folders):"
         }
     }
 
@@ -4639,6 +4649,10 @@ mod tests {
         assert!(app.config.settings.git_status);
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.config.settings.git_status);
+        // + and - take folders too (on): files only.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.mark_folders);
         // The colour scheme isn't typed: letters do nothing there (Enter opens the list).
         app.on_key(key(KeyCode::Down));
         typing(&mut app, "x");
@@ -4664,6 +4678,51 @@ mod tests {
         let saved = Settings::load(Some(&file)).unwrap();
         assert_eq!(saved, app.config.settings);
         assert_eq!((saved.big_file_mb, saved.editor.as_str(), saved.mouse), (25, "micro", false));
+    }
+
+    /// + and - take folders as well as files, unless the option says files only; a slash at
+    /// the end of the pattern takes folders only either way.
+    #[test]
+    fn plus_and_minus_take_folders_unless_the_option_says_files_only() {
+        let tmp = TempDir::new("app-plus");
+        tmp.file("notes.txt", "");
+        tmp.file("main.rs", "");
+        tmp.dir("src");
+        tmp.dir("old.txt");
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), crate::testutil::config());
+        app.reload_panels();
+        let marked = |app: &App| {
+            let mut names: Vec<String> = app.active_panel().marked.iter().cloned().collect();
+            names.sort();
+            names
+        };
+        let pattern = |app: &mut App, start: char, text: &str| {
+            app.on_key(key(KeyCode::Char(start)));
+            app.on_key(key(KeyCode::Backspace));
+            typing(app, text);
+            app.on_key(key(KeyCode::Enter));
+        };
+
+        app.on_key(key(KeyCode::Char('+')));
+        let Some(Dialog::Input { prompt, .. }) = &app.dialog else { panic!("no dialog") };
+        assert_eq!(prompt, "Mark files and folders (*/ folders only):");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(marked(&app), ["main.rs", "notes.txt", "old.txt", "src"], "* takes everything");
+        pattern(&mut app, '-', "*.txt");
+        assert_eq!(marked(&app), ["main.rs", "src"], "the folder old.txt too");
+        pattern(&mut app, '-', "*/");
+        assert_eq!(marked(&app), ["main.rs"], "folders only");
+
+        // Files only, as in mc.
+        app.config.settings.mark_folders = false;
+        pattern(&mut app, '+', "*.txt");
+        assert_eq!(marked(&app), ["main.rs", "notes.txt"]);
+        app.on_key(key(KeyCode::Char('-')));
+        let Some(Dialog::Input { prompt, .. }) = &app.dialog else { panic!("no dialog") };
+        assert_eq!(prompt, "Unmark files matching (*/ for folders):");
+        app.on_key(key(KeyCode::Esc));
+        pattern(&mut app, '+', "*.txt/");
+        assert_eq!(marked(&app), ["main.rs", "notes.txt", "old.txt"], "a slash: the folder, files only or not");
     }
 
     /// A config whose settings (loaded from there, as cm starts) and schemes live in `dir`.

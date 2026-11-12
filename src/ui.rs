@@ -1956,7 +1956,7 @@ mod tests {
 
         // classic-v2: classic's colours on a darker blue, a yellow cursor bar, yellow marks.
         app.scheme = scheme::built_in("classic-v2").unwrap();
-        app.active_panel_mut_for_tests().mark_matching("*.zip", true);
+        app.active_panel_mut_for_tests().mark_matching("*.zip", true, false);
         let [zip, jpg, _, _, txt] = colours(&mut app);
         let (blue, yellow) = (Color::Rgb(0x14, 0x3d, 0xaa), Color::Rgb(0xff, 0xde, 0x5f));
         assert_eq!((jpg.fg, jpg.bg), (Color::Rgb(0x61, 0xd6, 0xd6), blue));

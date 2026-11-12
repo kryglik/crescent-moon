@@ -889,12 +889,17 @@ impl Panel {
         }
     }
 
-    /// Marks or unmarks files (not directories) matching a wildcard pattern, like mc's + and -.
-    pub fn mark_matching(&mut self, pattern: &str, mark: bool) -> usize {
+    /// Marks or unmarks what matches a wildcard pattern, like mc's + and -: files, and folders
+    /// too with `folders`. A pattern that ends in a slash (`*/`, `src*/`) takes folders only.
+    pub fn mark_matching(&mut self, pattern: &str, mark: bool, folders: bool) -> usize {
+        let pattern = pattern.trim();
+        let folders_only = pattern.ends_with(['/', '\\']);
+        let pattern = pattern.trim_end_matches(['/', '\\']);
+        let takes = |e: &Entry| if folders_only { e.is_dir } else { folders || !e.is_dir };
         let names: Vec<String> = self
             .entries
             .iter()
-            .filter(|e| !e.is_parent && !e.is_dir && util::glob_match(pattern, &e.name))
+            .filter(|e| !e.is_parent && takes(e) && util::glob_match(pattern, &e.name))
             .map(|e| e.name.clone())
             .collect();
         for name in &names {
@@ -1259,7 +1264,10 @@ mod tests {
         tmp.file("c.rs", "");
         tmp.dir("dir.txt");
         let mut panel = Panel::new(tmp.path().to_path_buf(), true);
-        assert_eq!(panel.mark_matching("*.txt", true), 2, "directories are not marked by pattern");
+        assert_eq!(panel.mark_matching("*.txt", true, false), 2, "files only: the folder is left");
+        assert_eq!(panel.selection().len(), 2);
+        assert_eq!(panel.mark_matching("*.txt", true, true), 3, "with folders it is marked too");
+        assert_eq!(panel.mark_matching("*/", false, false), 1, "a slash at the end: folders only");
         assert_eq!(panel.selection().len(), 2);
         panel.invert_marks();
         let selected: Vec<_> = panel.selection().iter().map(|p| p.file_name().unwrap().to_owned()).collect();
