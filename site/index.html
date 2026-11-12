@@ -78,7 +78,8 @@
 <section class="feature" id="git">
   <h2>Git at a glance, and branches by typing</h2>
   <p>In a repository, the row under the path tells the branch and how the work stands:
-    <code>main ↑1 · 3 changed · 1 untracked</code>. Beside each file is a mark, as in VS Code:
+    <code>main ↑1 · 3 changed · 1 untracked</code>. The branch, with the commits ahead and behind, sits on
+    a green badge of its own, so it never passes for one more folder. Beside each file is a mark, as in VS Code:
     <b class="m">M</b> changed, <b class="a">A</b> added, <b class="u">?</b> new, <b class="c">!</b> in conflict,
     and <b>•</b> on a folder with changes inside. What git ignores is dimmed.</p>
   <ul>
@@ -94,7 +95,7 @@
   <h2>Worktrees, into the same subfolder</h2>
   <p><kbd>Alt+W</kbd> lists the repository's worktrees, the most recently used first. <kbd>Enter</kbd> goes to
     one, into the same subfolder you are in, so <code>src\components</code> in one is
-    <code>src\components</code> in the other. In a linked worktree the branch shows in cyan. Handy with
+    <code>src\components</code> in the other. In a linked worktree the branch's badge is cyan. Handy with
     tools that work in worktrees of their own, such as coding agents.</p>
   <figure><img src="gifs/worktrees.gif" width="1000" height="600" alt="Jumping from the main worktree to a feature worktree, same subfolder" loading="lazy"></figure>
 </section>

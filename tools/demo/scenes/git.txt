@@ -14,7 +14,7 @@ key enter
 until Switch this worktree
 wait 1500
 key enter
-until fix/header-spacing ·
+until fix/header-spacing  ·
 wait 2000
 key alt+b
 wait 2000
