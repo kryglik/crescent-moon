@@ -702,30 +702,51 @@ fn branch_name(repo: &Repo, status: Option<&Status>) -> String {
     }
 }
 
+/// Whether a part is drawn as a badge, on a background of its own (or in reverse video).
+fn is_badge(style: Style) -> bool {
+    style.bg.is_some() || style.add_modifier.contains(Modifier::REVERSED)
+}
+
+/// A badge's colour as text beside it: its background becomes the letters' colour.
+fn badge_as_text(style: Style) -> Style {
+    let text = Style::new().add_modifier(style.add_modifier.difference(Modifier::REVERSED));
+    match style.bg.or(style.fg) {
+        Some(colour) => text.fg(colour),
+        None => text,
+    }
+}
+
 /// The git row below a panel's path, in as many words as fit in `room` columns: the branch
-/// (cyan in a linked worktree), an operation under way, commits ahead/behind, "worktree", and
-/// how many files are in conflict, changed or untracked. ` main ↑1 · 3 changed · 1 untracked`,
-/// then the counts as signs (` main ↑1 ~3 ?1`), without them, and the branch cut short last.
+/// with commits ahead/behind, on a badge of its own (green; cyan in a linked worktree) so it
+/// doesn't look like one more folder, an operation under way, "worktree", and how many files
+/// are in conflict, changed or untracked. `  main ↑1  · 3 changed · 1 untracked`, then the
+/// counts as signs (`  main ↑1  ~3 ?1`), without them, and the branch cut short last. A
+/// scheme whose branch has no background gets the branch as plain text.
 fn git_line(repo: &Repo, status: Option<&Status>, room: usize, t: &Scheme) -> Line<'static> {
     let base = t.panel;
-    let branch_style = t.on_panel(if repo.linked { t.git_worktree } else { t.git_branch });
+    let look = if repo.linked { t.git_worktree } else { t.git_branch };
+    let (branch_style, pad) = (t.on_panel(look), if is_badge(look) { 2 } else { 0 });
     let branch = branch_name(repo, status);
-    let name = |text: String| vec![Span::styled(" ", base), Span::styled(text, branch_style)];
-    let mut bare = name(branch.clone());
-    if let Some(state) = &repo.state {
-        bare.push(Span::styled(format!(" {state}"), t.on_panel(t.git_state)));
-    }
-    let mut head = bare.clone();
-    if let Some((ahead, behind)) = status.and_then(|s| s.ahead_behind) {
-        let arrows: String =
-            [(ahead, "↑"), (behind, "↓")].into_iter().filter(|(n, _)| *n > 0).map(|(n, arrow)| format!("{arrow}{n}")).collect();
-        if !arrows.is_empty() {
-            head.push(Span::styled(format!(" {arrows}"), t.on_panel(t.git_branch)));
-        }
-    }
+    let name = |text: String| {
+        let text = if pad > 0 { format!(" {text} ") } else { text };
+        vec![Span::styled(" ", base), Span::styled(text, branch_style)]
+    };
+    let state = repo.state.as_ref().map(|state| Span::styled(format!(" {state}"), t.on_panel(t.git_state)));
+    let arrows: String = status
+        .and_then(|s| s.ahead_behind)
+        .map(|(ahead, behind)| {
+            [(ahead, "↑"), (behind, "↓")].into_iter().filter(|(n, _)| *n > 0).map(|(n, arrow)| format!("{arrow}{n}")).collect()
+        })
+        .unwrap_or_default();
+    let bare: Vec<Span<'static>> = name(branch.clone()).into_iter().chain(state.clone()).collect();
+    let head: Vec<Span<'static>> = if arrows.is_empty() {
+        bare.clone()
+    } else {
+        name(format!("{branch} {arrows}")).into_iter().chain(state).collect()
+    };
     let mut worktree = head.clone();
     if repo.linked {
-        worktree.extend([Span::styled(" · ", base), Span::styled("worktree", t.on_panel(t.git_worktree))]);
+        worktree.extend([Span::styled(" · ", base), Span::styled("worktree", t.on_panel(badge_as_text(t.git_worktree)))]);
     }
     // How many, in words, as a sign, and in what colour; conflicts first, as they need you.
     let counts: Vec<(usize, String, &str, Style)> = status.map_or_else(Vec::new, |s| {
@@ -748,8 +769,10 @@ fn git_line(repo: &Repo, status: Option<&Status>, room: usize, t: &Scheme) -> Li
         .into_iter()
         .map(Line::from)
         .find(|line| line.width() <= room)
-        // A space, at least one letter and "…".
-        .unwrap_or_else(|| if room >= 3 { Line::from(name(format!("{}…", util::take_width(&branch, room - 2)))) } else { Line::default() })
+        // A space, at least one letter and "…", on the badge.
+        .unwrap_or_else(|| {
+            if room >= 3 + pad { Line::from(name(format!("{}…", util::take_width(&branch, room - 2 - pad)))) } else { Line::default() }
+        })
 }
 
 /// A file's look: the panel's, its kind's (folder, program, archive…), dimmed when hidden or
@@ -1518,17 +1541,23 @@ mod tests {
         if std::env::var_os("CM_PRINT").is_some() {
             println!("{screen}");
         }
-        // Git's row below the path: the branch and how the working tree stands; a linked
-        // worktree's branch in cyan, and saying so (its status isn't known here). (Columns
-        // counted in characters: the lines hold │ and ─.)
+        // Git's row below the path: the branch on a green badge, unlike any folder, and how
+        // the working tree stands; a linked worktree's branch on cyan, and saying so (its
+        // status isn't known here). (Columns counted in characters: the lines hold │ and ─.)
         let left = |y: usize| lines[y].chars().take(70).collect::<String>();
         let right = |y: usize| lines[y].chars().skip(70).collect::<String>();
         let column = |y: usize, text: &str| lines[y][..lines[y].find(text).unwrap()].chars().count() as u16;
-        assert!(left(1).starts_with("│ main ↑1 · 2 changed · 1 untracked  "), "{screen}");
-        assert!(right(1).starts_with("│ login · worktree  "), "{screen}");
-        assert_eq!(buffer[(column(1, "main"), 1)].fg, Color::White);
-        assert_eq!(buffer[(column(1, "login"), 1)].fg, Color::LightCyan);
-        assert_eq!(buffer[(column(1, "worktree"), 1)].fg, Color::LightCyan);
+        assert!(left(1).starts_with("│  main ↑1  · 2 changed · 1 untracked  "), "{screen}");
+        assert!(right(1).starts_with("│  login  · worktree  "), "{screen}");
+        let look = |x: u16| (buffer[(x, 1)].fg, buffer[(x, 1)].bg);
+        let main = column(1, "main");
+        for x in [main - 1, main, main + 5, main + 7] {
+            assert_eq!(look(x), (Color::Black, Color::Green), "the badge, from its space before to its space after");
+        }
+        assert_eq!(look(main - 2).1, Color::Blue, "and only that");
+        assert_eq!(look(main + 8).1, Color::Blue);
+        assert_eq!(look(column(1, "login")), (Color::Black, Color::LightCyan));
+        assert_eq!(look(column(1, "worktree")), (Color::LightCyan, Color::Blue), "the word in the badge's colour");
         // The headings below it; the path alone on the top line, the free space alone on the
         // bottom one.
         assert!(left(2).contains("Name↑") && right(2).contains("Name↑"), "{screen}");
@@ -1548,7 +1577,7 @@ mod tests {
 
         // Narrow: the counts as signs.
         let screen = render(&mut app, 60, 16);
-        assert!(screen.contains("│ main ↑1 ~2 ?1 "), "{screen}");
+        assert!(screen.contains("│  main ↑1  ~2 ?1 "), "{screen}");
         // Too short a panel for the row: the list keeps its rows.
         let screen = render(&mut app, 140, 9);
         assert!(!screen.contains("main ↑1") && screen.lines().nth(1).unwrap().contains("Name↑"), "{screen}");
@@ -1581,18 +1610,24 @@ mod tests {
         let output = ["# branch.ab +1 -0", "1 .M N... 100644 100644 100644 a a changed.txt", "? new.txt", ""].join("\0");
         let status = Status::parse(output.as_bytes());
         let text = |repo: &Repo, room| git_line(repo, Some(&status), room, &scheme::classic()).spans.iter().map(|s| s.content.to_string()).collect::<String>();
-        let long = " claude/gentle-fox REBASE 2/5 ↑1 · worktree · 1 changed · 1 untracked";
+        // The branch and ↑↓ on the badge, a space inside it at each end.
+        let long = "  claude/gentle-fox ↑1  REBASE 2/5 · worktree · 1 changed · 1 untracked";
         assert_eq!(text(&repo, 100), long);
         assert_eq!(text(&repo, util::width(long)), long);
-        assert_eq!(text(&repo, 60), " claude/gentle-fox REBASE 2/5 ↑1 · worktree ~1 ?1");
-        assert_eq!(text(&repo, 45), " claude/gentle-fox REBASE 2/5 ↑1 ~1 ?1");
-        assert_eq!(text(&repo, 35), " claude/gentle-fox REBASE 2/5");
-        assert_eq!(text(&repo, 20), " claude/gentle-fox");
-        assert_eq!(text(&repo, 8), " claude…");
-        assert_eq!(text(&repo, 2), "");
+        assert_eq!(text(&repo, 60), "  claude/gentle-fox ↑1  REBASE 2/5 · worktree ~1 ?1");
+        assert_eq!(text(&repo, 45), "  claude/gentle-fox ↑1  REBASE 2/5 ~1 ?1");
+        assert_eq!(text(&repo, 35), "  claude/gentle-fox  REBASE 2/5");
+        assert_eq!(text(&repo, 20), "  claude/gentle-fox ");
+        assert_eq!(text(&repo, 8), "  clau… ");
+        assert_eq!(text(&repo, 4), "");
+        assert_eq!(text(&repo, 7).chars().count(), 7, "cut short to the room, badge and all");
         // A commit checked out; nothing to count.
         let detached = Repo { head: Head::Detached("1a2b3c4".into()), linked: false, state: None, ..repo };
-        assert_eq!(git_line(&detached, None, 100, &scheme::classic()).spans.iter().map(|s| s.content.as_ref()).collect::<String>(), " (1a2b3c4)");
+        let row = |scheme: &Scheme| git_line(&detached, None, 100, scheme).spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        assert_eq!(row(&scheme::classic()), "  (1a2b3c4) ");
+        // A scheme file whose branch has no background: plain text, as before.
+        let plain = Scheme { git_branch: Style::new().fg(Color::White).add_modifier(Modifier::BOLD), ..scheme::classic() };
+        assert_eq!(row(&plain), " (1a2b3c4)");
     }
 
     #[test]

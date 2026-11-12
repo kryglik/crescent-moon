@@ -89,9 +89,9 @@ parts! {
     document,
     /// leftovers: .bak, .tmp, .swp, names ending in ~
     temp,
-    /// the branch, and ↑↓ commits ahead and behind
+    /// the branch with ↑↓ commits ahead and behind, a badge when it has a background
     git_branch,
-    /// the branch in a linked worktree, and the word "worktree"
+    /// the same in a linked worktree; the word "worktree" in its badge's colour
     git_worktree,
     /// a rebase or merge under way
     git_state,
@@ -405,8 +405,8 @@ pub fn classic() -> Scheme {
         source: s(),
         document: s(),
         temp: s().dark_gray(),
-        git_branch: s().white().bold(),
-        git_worktree: s().light_cyan().bold(),
+        git_branch: s().black().on_green(),
+        git_worktree: s().black().on_light_cyan(),
         git_state: s().yellow().bold(),
         git_changed: s().yellow(),
         git_new: s().light_green(),
@@ -472,8 +472,8 @@ fn classic_v2() -> Scheme {
         source: s(),
         document: s(),
         temp: s().fg(DARK_GRAY),
-        git_branch: s().fg(WHITE).bold(),
-        git_worktree: s().fg(LIGHT_CYAN).bold(),
+        git_branch: s().fg(BLACK).bg(GREEN),
+        git_worktree: s().fg(BLACK).bg(LIGHT_CYAN),
         git_state: s().fg(LIGHT_YELLOW).bold(),
         git_changed: s().fg(GOLD),
         git_new: s().fg(LIGHT_GREEN),
@@ -540,8 +540,8 @@ fn terminal() -> Scheme {
         source: s(),
         document: s(),
         temp: s().dark_gray(),
-        git_branch: s().bold(),
-        git_worktree: s().cyan().bold(),
+        git_branch: s().black().on_green(),
+        git_worktree: s().black().on_cyan(),
         git_state: s().yellow().bold(),
         git_changed: s().yellow(),
         git_new: s().green(),
@@ -581,8 +581,8 @@ pub fn mono() -> Scheme {
         dim: s().dim(),
         hidden: s().dim(),
         temp: s().dim(),
-        git_branch: s().bold(),
-        git_worktree: s().bold().underlined(),
+        git_branch: s().reversed(),
+        git_worktree: s().reversed().underlined(),
         git_state: s().bold(),
         git_conflict: s().bold(),
         git_ignored: s().dim(),
@@ -613,7 +613,7 @@ struct Palette {
     text: Color,
     /// Hints; hidden, ignored and leftover files; the other panel's path.
     faint: Color,
-    /// The branch, the keys on the bottom bar, typed text.
+    /// The keys on the bottom bar, typed text.
     bright: Color,
     /// The cursor bar's text and background (the focus in dialogs too).
     cursor: (Color, Color),
@@ -630,9 +630,9 @@ struct Palette {
     yellow: Color,
     /// Conflicts.
     red: Color,
-    /// New files.
+    /// New files; the branch's badge.
     green: Color,
-    /// Worktrees.
+    /// Worktrees: their branch's badge.
     cyan: Color,
     /// A rebase or merge under way.
     orange: Color,
@@ -661,8 +661,8 @@ fn from_palette(p: &Palette) -> Scheme {
         source: s(),
         document: s(),
         temp: s().fg(p.faint),
-        git_branch: s().fg(p.bright).bold(),
-        git_worktree: s().fg(p.cyan).bold(),
+        git_branch: s().fg(p.bg).bg(p.green).bold(),
+        git_worktree: s().fg(p.bg).bg(p.cyan).bold(),
         git_state: s().fg(p.orange).bold(),
         git_changed: s().fg(p.yellow),
         git_new: s().fg(p.green),

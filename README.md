@@ -253,14 +253,16 @@ Connections stay open until cm ends. The server has to offer SFTP, as OpenSSH do
 
 ### Git
 
-In a git repository the row below the panel's path is git's: the branch and how the working
-tree stands, in as many words as fit: `main ↑1 · 3 changed · 1 untracked`, or in a narrow
-panel `main ↑1 ~3 ?1`. ↑ and ↓ count the commits ahead of and behind the upstream branch,
-and files in conflict come first (`· 2 conflicts`). A rebase, merge, cherry-pick or bisect
-under way shows the way git's prompt names it (`main REBASE 2/5`, `main MERGING`), and a
-detached HEAD shows its commit (`(1a2b3c4)`). In a linked worktree the branch is cyan and
-the row says so: `login · worktree · 2 changed`; a narrow panel leaves the cyan alone to
-tell. A panel too short for the row keeps its rows for files.
+In a git repository the row below the panel's path is git's: the branch on a green badge of
+its own, so it can't pass for one more folder, and how the working tree stands, in as many
+words as fit: `main ↑1 · 3 changed · 1 untracked`, or in a narrow panel `main ↑1 ~3 ?1`. ↑
+and ↓ (on the badge) count the commits ahead of and behind the upstream branch, and files in
+conflict come first (`· 2 conflicts`). A rebase, merge, cherry-pick or bisect under way
+shows the way git's prompt names it (`main REBASE 2/5`, `main MERGING`), and a detached
+HEAD shows its commit (`(1a2b3c4)`). In a linked worktree the badge is cyan and the row says
+so: `login · worktree · 2 changed`; a narrow panel leaves the cyan alone to tell. A panel
+too short for the row keeps its rows for files. The badge is the scheme's `git_branch` (and
+`git_worktree`): a scheme file that gives it no background shows the branch as plain text.
 
 Beside each name is a mark, as in VS Code: **M** changed (staged or not), **A** added, **R**
 renamed, **?** untracked, **!** in conflict, and **•** on a folder with changes inside, in
