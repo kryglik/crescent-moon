@@ -130,12 +130,27 @@ pub fn has_password(text: &str) -> bool {
     })
 }
 
-/// What the connect field takes besides `parse`: a bare `host` or `user@host`.
+/// What the connect field takes besides `parse`: a bare `host` or `user@host`, and a port
+/// after the colon, `user@host:2222` or `user@host:2222/srv`. (Elsewhere, as for scp, that
+/// would be a file called 2222 in the home folder.)
 pub fn parse_connect(text: &str) -> Result<(Target, String), String> {
     match parse_typed(text)? {
+        Some((target, path)) if target.port.is_none() => {
+            let (digits, rest) = path.find('/').map_or((path.as_str(), ""), |at| path.split_at(at));
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Ok((target, path));
+            }
+            match digits.parse::<u16>() {
+                Ok(port) if port > 0 => Ok((Target { port: Some(port), ..target }, rest.to_string())),
+                _ => Err(format!("{digits} is not a port: ports go from 1 to 65535.")),
+            }
+        }
         Some(parsed) => Ok(parsed),
         None => Target::from_text(text.trim()).map(|target| (target, String::new())).ok_or_else(|| {
-            format!("\"{}\" is not an address cm can read.\nThe forms are host, user@host, host:/path, ssh://user@host:port/path", text.trim())
+            format!(
+                "\"{}\" is not an address cm can read.\nThe forms are host, user@host, user@host:port, host:/path, ssh://user@host:port/path",
+                text.trim()
+            )
         }),
     }
 }
@@ -620,6 +635,21 @@ pub mod tests {
         assert_eq!(parse_connect("nas"), Ok((target(None, "nas", None), String::new())));
         assert_eq!(parse_connect(" me@nas "), Ok((target(Some("me"), "nas", None), String::new())));
         assert_eq!(parse_connect("nas:/srv").map(|(_, path)| path), Ok("/srv".to_string()));
+        // A number after the colon is the port here.
+        assert_eq!(parse_connect("me@nas:2222"), Ok((target(Some("me"), "nas", Some(2222)), String::new())));
+        assert_eq!(parse_connect("nas:2222/srv"), Ok((target(None, "nas", Some(2222)), "/srv".into())));
+        assert_eq!(parse_connect("[fe80::1]:2222"), Ok((target(None, "[fe80::1]", Some(2222)), String::new())));
+        assert_eq!(parse_connect("ssh://nas:2222/2024"), Ok((target(None, "nas", Some(2222)), "/2024".into())));
+        assert_eq!(parse_connect("nas:2024a"), Ok((target(None, "nas", None), "2024a".into())), "not a number: a path");
+        assert_eq!(parse_connect("nas:./2024"), Ok((target(None, "nas", None), "./2024".into())), "a folder called 2024");
+        assert!(parse_connect("nas:65536").unwrap_err().contains("not a port"));
+        assert!(parse_connect("nas:0").unwrap_err().contains("not a port"));
+        assert_eq!(parse("nas:2222"), Some((target(None, "nas", None), "2222".into())), "elsewhere a file, as for scp");
+        // And `ssh` is told the port.
+        let (dialled, _) = parse_connect("me@nas:2222").unwrap();
+        assert!(ssh_arguments(&dialled, Login::Quiet).windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert_eq!(dialled.place(""), "ssh://me@nas:2222", "and the place it makes reads back with the port");
+        assert_eq!(parse(&dialled.place("/srv")), Some((dialled.clone(), "/srv".into())));
         assert!(parse_connect("not a host").is_err());
         assert!(parse_connect("-oProxyCommand=evil").is_err());
         assert!(parse_connect("ssh://me:secret@nas/x").unwrap_err().contains("no password"));

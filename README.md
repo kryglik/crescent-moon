@@ -199,8 +199,11 @@ say so.
 
 ### SSH
 
-**Ctrl+N** connects the panel to another computer: `host`, `user@host`, `host:/path`, or
-`ssh://user@host:port/path`. `cd host:/path` on the command line does the same, and the drive
+**Ctrl+N** connects the panel to another computer: `host`, `user@host`, `host:/path`,
+`user@host:port` (`user@host:2222/srv` with a folder), or `ssh://user@host:port/path`. In this
+field a number after the colon is the port; anywhere else `host:2222` is, as for scp, a file
+called 2222 in the home folder (`host:./2222` is that file here too). A `Port` in
+`~/.ssh/config` works as well. `cd host:/path` on the command line does the same, and the drive
 picker (Alt+F1 / Alt+F2) lists the computers connected to lately and the hosts of
 `~/.ssh/config`. Addresses go in the hotlist and the folder history like folders do.
 

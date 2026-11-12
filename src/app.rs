@@ -782,7 +782,7 @@ impl App {
             KeyCode::Char('p') if ctrl && !alt => self.open_options(),
             KeyCode::Char('q') if ctrl && !alt => self.toggle_quick_view(),
             KeyCode::Char('n') if ctrl && !alt => {
-                self.start_input("Connect over SSH", "Connect to (host, user@host, host:/path):", "", InputAction::Connect);
+                self.start_input("Connect over SSH", "Connect to (host, user@host:port, host:/path):", "", InputAction::Connect);
             }
             KeyCode::Char('c') if ctrl && !alt => self.copy_to_clipboard(Effect::Copy),
             KeyCode::Char('C') if ctrl && !alt => self.copy_paths(),
