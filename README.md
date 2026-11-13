@@ -135,7 +135,11 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 
 Typing anywhere goes to the command line; Enter runs it in the shell (see below), in the
 active panel's folder. `cd DIR` is handled by cm itself and changes the panel's folder; it
-reads quotes and environment variables as the shell would, and `cd -` goes back.
+reads quotes and environment variables as the shell would, and `cd -` goes back. Its prompt
+starts as bash's does, with who and where: `me@nas /home/me/src>` (`#` instead of
+`>` for root), so a cm over ssh says which computer it is on. The host is named up to its
+first dot; on Windows it is `USERNAME@COMPUTERNAME`. It is left out under 60 columns, and the
+option "user@host before the command line" (Ctrl+P) turns it off.
 
 On Windows the bar at the bottom follows Shift, Ctrl and Alt: hold one for a moment and it shows
 what that key does, and a click there works as with the key held. A terminal on Linux or over ssh
@@ -408,6 +412,7 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | Numbers in names by value | on: "day 2" sorts before "day 10", as in Explorer |
 | Git: mark changed and new files | on: in a repository `git status` runs in the background (see Git); off, only the branch shows |
 | + and - mark folders too | on: `+` and `-` take folders as well as files; off, files only, as in mc. A pattern ending in a slash (`*/`) takes folders either way |
+| user@host before the command line | on: the command line's prompt starts with who and where, as bash's: `me@nas /home/me/src>` |
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |

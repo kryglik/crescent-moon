@@ -248,6 +248,38 @@ pub fn process_alive(pid: u32) -> bool {
     alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Who cm runs as and on which computer, for the command line's prompt, as bash's `\u@\h`
+/// says it: `me@nas`, the host's name up to its first dot. None when either is unknown.
+pub fn user_at_host() -> Option<String> {
+    let known = |text: Option<String>| text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    #[cfg(windows)]
+    let (user, host) = (std::env::var("USERNAME").ok(), std::env::var("COMPUTERNAME").ok());
+    #[cfg(not(windows))]
+    let (user, host) = {
+        let user = if is_root() {
+            Some("root".to_string())
+        } else {
+            std::env::var("USER").ok().filter(|u| !u.is_empty()).or_else(|| std::env::var("LOGNAME").ok())
+        };
+        let mut buffer = [0u8; 256];
+        let host = (unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0).then(|| {
+            let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+            String::from_utf8_lossy(&buffer[..end]).into_owned()
+        });
+        (user, host)
+    };
+    let host = known(host)?.split('.').next().unwrap_or_default().to_string();
+    Some(format!("{}@{host}", known(user)?)).filter(|_| !host.is_empty())
+}
+
+/// Whether cm runs as root, whose prompt ends in `#` as bash's does. (Never on Windows.)
+pub fn is_root() -> bool {
+    #[cfg(windows)]
+    return false;
+    #[cfg(not(windows))]
+    return unsafe { libc::geteuid() } == 0;
+}
+
 #[cfg(windows)]
 pub fn is_hidden(_name: &str, meta: Option<&Metadata>) -> bool {
     use std::os::windows::fs::MetadataExt;

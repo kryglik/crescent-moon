@@ -801,14 +801,25 @@ fn entry_style(entry: Option<&Entry>, marked: bool, on_cursor: bool, ignored: bo
     style
 }
 
+/// The command line: `user@host folder>` as bash and fish show it (`#` for root), so a cm
+/// over ssh says which computer it is on, then what is typed. user@host is left out when
+/// the option is off or the line is under 60 columns, and kept to a quarter of it.
 fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
     let t = &app.scheme;
+    let width = area.width as usize;
+    let who = app.user_at_host.as_deref().filter(|_| app.config.settings.prompt_host && width >= 60);
+    let mut spans = Vec::new();
+    if let Some(who) = who {
+        let who = if util::width(who) > width / 4 { format!("{}…", util::take_width(who, width / 4 - 1)) } else { who.to_string() };
+        spans.extend([Span::styled(who, t.on_bar(t.prompt_host)), Span::raw(" ")]);
+    }
     let cwd = app.active_panel().place().display().to_string();
-    let prompt = format!("{}>", util::fit_left(&cwd, (area.width as usize / 3).max(10)));
-    let prompt_w = util::width(&prompt) + 1;
-    let room = (area.width as usize).saturating_sub(prompt_w + 1);
+    let end = if app.as_root { '#' } else { '>' };
+    let prompt = format!("{}{end}", util::fit_left(&cwd, (width / 3).max(10)));
+    let prompt_w = spans.iter().map(|s| s.width()).sum::<usize>() + util::width(&prompt) + 1;
+    let room = width.saturating_sub(prompt_w + 1);
     let (text, cursor) = app.cmdline.view(room);
-    let mut spans = vec![Span::raw(prompt), Span::raw(" "), Span::raw(text)];
+    spans.extend([Span::raw(prompt), Span::raw(" "), Span::raw(text)]);
     // A short message from the last action, until the next key.
     if app.cmdline.is_empty()
         && let Some(notice) = &app.notice
@@ -1445,6 +1456,39 @@ mod tests {
 
     fn app_for(tmp: &TempDir) -> App {
         App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), crate::testutil::config())
+    }
+
+    /// The command line starts with user@host, as bash's prompt does, in its own colour; `#`
+    /// for root; left out with the option off or on a narrow screen, cut short when long.
+    #[test]
+    fn the_prompt_says_who_and_where() {
+        let tmp = TempDir::new("ui-prompt");
+        let mut app = app_for(&tmp);
+        app.user_at_host = Some("me@box".into());
+        let command_line = |app: &mut App, width: u16| {
+            let screen = render(app, width, 12);
+            screen.lines().nth(10).unwrap_or_default().to_string()
+        };
+        let line = command_line(&mut app, 100);
+        assert!(line.starts_with("me@box ") && line.ends_with('>'), "{line}");
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 10)].fg, Color::LightGreen);
+        assert!(buffer[(0, 10)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(7, 10)].fg, scheme::classic().command_line.fg.unwrap_or(Color::Reset), "the folder as before");
+
+        app.as_root = true;
+        assert!(command_line(&mut app, 100).ends_with('#'), "root's prompt");
+        app.as_root = false;
+        app.user_at_host = Some("someone@a-very-long-computer-name".into());
+        assert!(command_line(&mut app, 80).starts_with("someone@a-very-long… "), "a quarter of the line at most");
+        assert!(!command_line(&mut app, 59).contains("someone@"), "narrow: the folder only");
+        app.config.settings.prompt_host = false;
+        assert!(!command_line(&mut app, 100).contains("someone@"), "the option off");
+        app.config.settings.prompt_host = true;
+        app.user_at_host = None;
+        assert!(command_line(&mut app, 100).ends_with('>'), "nothing known: the folder alone");
     }
 
     #[test]

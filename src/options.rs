@@ -13,6 +13,7 @@ pub enum Row {
     NaturalSort,
     GitStatus,
     MarkFolders,
+    PromptHost,
     Scheme,
     BigFile,
     Editor,
@@ -21,7 +22,7 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 13] = [
+pub const ROWS: [Row; 14] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
@@ -29,6 +30,7 @@ pub const ROWS: [Row; 13] = [
     Row::NaturalSort,
     Row::GitStatus,
     Row::MarkFolders,
+    Row::PromptHost,
     Row::Scheme,
     Row::BigFile,
     Row::Editor,
@@ -47,6 +49,7 @@ impl Row {
             Row::NaturalSort => "Numbers in names by value (2 before 10)",
             Row::GitStatus => "Git: mark changed and new files",
             Row::MarkFolders => "+ and - mark folders too",
+            Row::PromptHost => "user@host before the command line",
             Row::Scheme => "Colour scheme (Alt+C)",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
@@ -58,7 +61,7 @@ impl Row {
 
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
-        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus | Row::MarkFolders)
+        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus | Row::MarkFolders | Row::PromptHost)
     }
 
     /// Picked from a list (Enter opens it) rather than typed.
@@ -75,6 +78,7 @@ impl Row {
             Row::NaturalSort => settings.natural_sort,
             Row::GitStatus => settings.git_status,
             Row::MarkFolders => settings.mark_folders,
+            Row::PromptHost => settings.prompt_host,
             _ => false,
         }
     }
@@ -88,6 +92,7 @@ impl Row {
             Row::NaturalSort => settings.natural_sort = !settings.natural_sort,
             Row::GitStatus => settings.git_status = !settings.git_status,
             Row::MarkFolders => settings.mark_folders = !settings.mark_folders,
+            Row::PromptHost => settings.prompt_host = !settings.prompt_host,
             _ => {}
         }
     }

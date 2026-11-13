@@ -333,7 +333,7 @@ def settings():
     folder = os.path.join(APPDATA, "crescent-moon")
     os.makedirs(folder)
     files = {
-        "settings.ini": "confirm_quit = false\nscheme = classic-v2\n",
+        "settings.ini": "confirm_quit = false\nscheme = classic-v2\nprompt_host = false\n",
         "hotlist.txt": "M:\\projects\\website\nM:\\photos\nM:\\downloads\nM:\\projects\\notes\n",
         "places.ini": f"; Ctrl+E: places kept per git repository\n[{REMOTE}]\n"
                       "c = Components | src/components\np = Pages | src/pages\nd = Docs | docs\n"

@@ -365,6 +365,10 @@ pub struct App {
     pub(crate) typed_ahead: VecDeque<KeyEvent>,
     /// What is held down, which the key bar shows what it does.
     pub held: Held,
+    /// `user@host` for the command line's prompt (see `platform::user_at_host`), and whether
+    /// cm runs as root, for whom it ends in `#`.
+    pub user_at_host: Option<String>,
+    pub as_root: bool,
 }
 
 impl App {
@@ -382,6 +386,8 @@ impl App {
         };
         let scheme = scheme.for_terminal(config.colours);
         App {
+            user_at_host: crate::platform::user_at_host(),
+            as_root: crate::platform::is_root(),
             mouse: config.settings.mouse,
             mouse_allowed: true,
             finder: None,
@@ -4653,6 +4659,10 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.config.settings.mark_folders);
+        // user@host on the command line (on): off.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.prompt_host);
         // The colour scheme isn't typed: letters do nothing there (Enter opens the list).
         app.on_key(key(KeyCode::Down));
         typing(&mut app, "x");

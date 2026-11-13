@@ -109,6 +109,8 @@ parts! {
     found_text,
     /// the command line
     command_line,
+    /// user@host before the folder on the command line
+    prompt_host,
     /// messages on the command line
     notice,
     /// the keys on the bar at the bottom
@@ -415,6 +417,7 @@ pub fn classic() -> Scheme {
         found_file: s().light_cyan().bold(),
         found_text: s().black().on_yellow(),
         command_line: s(),
+        prompt_host: s().light_green().bold(),
         notice: s().yellow(),
         key_number: s().black().on_cyan(),
         key_label: s(),
@@ -483,6 +486,7 @@ fn classic_v2() -> Scheme {
         // Not yellow: Find's matches have to show on the cursor bar too.
         found_text: s().fg(BLACK).bg(LIGHT_CYAN),
         command_line: s(),
+        prompt_host: s().fg(LIGHT_GREEN).bold(),
         notice: s().fg(GOLD),
         key_number: s().fg(BLACK).bg(CYAN),
         key_label: s().fg(WHITE),
@@ -550,6 +554,7 @@ fn terminal() -> Scheme {
         found_file: s().cyan().bold(),
         found_text: s().black().on_yellow(),
         command_line: s(),
+        prompt_host: s().green().bold(),
         notice: s().yellow(),
         key_number: s().reversed(),
         key_label: s(),
@@ -588,6 +593,7 @@ pub fn mono() -> Scheme {
         git_ignored: s().dim(),
         found_file: s().bold(),
         found_text: s().reversed(),
+        prompt_host: s().bold(),
         notice: s().bold(),
         key_number: s().reversed(),
         tab_shown: s().underlined(),
@@ -671,6 +677,7 @@ fn from_palette(p: &Palette) -> Scheme {
         found_file: s().fg(p.accent).bold(),
         found_text: s().fg(p.bg).bg(p.marked),
         command_line: s().fg(p.text).bg(p.bg),
+        prompt_host: s().fg(p.green).bold(),
         notice: s().fg(p.yellow),
         key_number: s().fg(p.bright).bg(p.field),
         key_label: s().fg(p.text),

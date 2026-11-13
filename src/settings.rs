@@ -25,6 +25,8 @@ pub struct Settings {
     /// + and - (mark and unmark by pattern) take folders as well as files. A pattern that ends
     /// in a slash (`*/`) takes folders only, either way.
     pub mark_folders: bool,
+    /// The command line's prompt starts with user@host, as bash's does.
+    pub prompt_host: bool,
     /// The colour scheme's name (see `scheme`): a built-in one, or a file in `schemes`.
     pub scheme: String,
     /// Files bigger than this many megabytes go to the pager, and the editor asks first.
@@ -46,6 +48,7 @@ impl Default for Settings {
             natural_sort: true,
             git_status: true,
             mark_folders: true,
+            prompt_host: true,
             scheme: "classic".into(),
             big_file_mb: 10,
             editor: String::new(),
@@ -99,6 +102,7 @@ impl Settings {
                 "natural_sort" => settings.natural_sort = flag(settings.natural_sort),
                 "git_status" => settings.git_status = flag(settings.git_status),
                 "mark_folders" => settings.mark_folders = flag(settings.mark_folders),
+                "prompt_host" => settings.prompt_host = flag(settings.prompt_host),
                 "scheme" if !value.is_empty() => settings.scheme = value.to_string(),
                 "big_file_mb" => {
                     if let Ok(mb) = value.parse::<u64>()
@@ -128,6 +132,7 @@ impl Settings {
              natural_sort = {}\n\
              git_status = {}\n\
              mark_folders = {}\n\
+             prompt_host = {}\n\
              scheme = {}\n\
              big_file_mb = {}\n\
              editor = {}\n\
@@ -141,6 +146,7 @@ impl Settings {
             self.natural_sort,
             self.git_status,
             self.mark_folders,
+            self.prompt_host,
             self.scheme,
             self.big_file_mb,
             self.editor,
@@ -168,6 +174,7 @@ mod tests {
             mouse: false,
             git_status: false,
             mark_folders: false,
+            prompt_host: false,
             scheme: "nord".into(),
             big_file_mb: 25,
             editor: r#""C:\Program Files\Neovim\bin\nvim.exe" -p"#.into(),
