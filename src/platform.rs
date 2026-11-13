@@ -111,7 +111,15 @@ fn parent_of(pid: u32) -> Option<u32> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn parent_of(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (got == size).then_some(info.pbi_ppid)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn parent_of(_pid: u32) -> Option<u32> {
     None
 }
@@ -835,23 +843,60 @@ mod unix {
         dir: PathBuf,
         source: String,
         fstype: String,
+        /// macOS marks the system's own volumes as not to be shown (`nobrowse`).
+        hidden: bool,
+    }
+
+    fn just_the_root() -> Vec<Mount> {
+        vec![Mount { dir: "/".into(), source: String::new(), fstype: String::new(), hidden: false }]
     }
 
     /// The mounted file systems, from /proc/self/mounts (Linux). Elsewhere just `/`.
+    #[cfg(not(target_os = "macos"))]
     fn mounts() -> Vec<Mount> {
         let Ok(text) = std::fs::read_to_string("/proc/self/mounts") else {
-            return vec![Mount { dir: "/".into(), source: String::new(), fstype: String::new() }];
+            return just_the_root();
         };
         text.lines()
             .filter_map(|line| {
                 let mut fields = line.split(' ');
                 let (source, dir, fstype) = (fields.next()?, fields.next()?, fields.next()?);
-                Some(Mount { dir: PathBuf::from(unescape(dir)), source: unescape(source), fstype: fstype.to_string() })
+                Some(Mount { dir: PathBuf::from(unescape(dir)), source: unescape(source), fstype: fstype.to_string(), hidden: false })
+            })
+            .collect()
+    }
+
+    /// The mounted file systems on macOS, from getfsstat into a list of cm's own (getmntinfo
+    /// hands out one the system reuses, and cm asks from several threads). MNT_NOWAIT: what the
+    /// system knows already, without asking each file system, which a server gone away would hold up.
+    #[cfg(target_os = "macos")]
+    fn mounts() -> Vec<Mount> {
+        use std::ffi::{CStr, OsStr};
+        let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        if count <= 0 {
+            return just_the_root();
+        }
+        // Room for a few mounted meanwhile.
+        let mut list: Vec<libc::statfs> = Vec::with_capacity(count as usize + 8);
+        let bytes = (list.capacity() * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+        let got = unsafe { libc::getfsstat(list.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+        if got <= 0 {
+            return just_the_root();
+        }
+        unsafe { list.set_len(got as usize) };
+        let field = |chars: &[libc::c_char]| unsafe { CStr::from_ptr(chars.as_ptr()) }.to_bytes().to_vec();
+        list.iter()
+            .map(|fs| Mount {
+                dir: PathBuf::from(OsStr::from_bytes(&field(&fs.f_mntonname))),
+                source: String::from_utf8_lossy(&field(&fs.f_mntfromname)).into_owned(),
+                fstype: String::from_utf8_lossy(&field(&fs.f_fstypename)).into_owned(),
+                hidden: fs.f_flags as i64 & libc::MNT_DONTBROWSE as i64 != 0,
             })
             .collect()
     }
 
     /// /proc/mounts writes spaces, tabs, newlines and backslashes in octal: `\040`.
+    #[cfg(not(target_os = "macos"))]
     fn unescape(field: &str) -> String {
         let bytes = field.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
@@ -886,10 +931,11 @@ mod unix {
     /// must never go down into one (a chroot's /dev and /home, an sshfs of a server). A
     /// device of its own shows that, a bind mount of the same disk only in the mount list. A
     /// btrfs subvolume has a device of its own too without being mounted: the root of one is
-    /// inode 256, and the list says whether it is.
+    /// inode 256, and the list says whether it is. (Elsewhere 256 is just a number: APFS
+    /// counts its files from 2 up.)
     pub fn is_mount(path: &Path, meta: &std::fs::Metadata, mounts: &[PathBuf]) -> bool {
         let parent = path.parent().and_then(|parent| std::fs::metadata(parent).ok());
-        let subvolume = meta.ino() == 256 && !mounts.is_empty();
+        let subvolume = cfg!(target_os = "linux") && meta.ino() == 256 && !mounts.is_empty();
         parent.is_some_and(|parent| parent.dev() != meta.dev()) && !subvolume
             || std::fs::canonicalize(path).is_ok_and(|real| mounts.contains(&real))
     }
@@ -898,6 +944,7 @@ mod unix {
     /// rename; where that can't work it falls back on copying everything to the home trash
     /// and then deleting it, with no progress, no way to stop it, hanging on a pipe in the
     /// tree, and leaving things half deleted when the folder may not be changed.
+    #[cfg(not(target_os = "macos"))]
     pub fn trash_refusal(path: &Path) -> Option<String> {
         if let Some(denied) = delete_denied(path) {
             return Some(denied.to_string());
@@ -926,6 +973,14 @@ mod unix {
         })
     }
 
+    /// macOS: the system's trash takes things from any disk that has one (other volumes keep
+    /// theirs in `.Trashes`) by moving them, and refuses itself where there is none, as on a
+    /// network share. Only a folder that may not be changed is refused beforehand.
+    #[cfg(target_os = "macos")]
+    pub fn trash_refusal(path: &Path) -> Option<String> {
+        delete_denied(path).map(|denied| denied.to_string())
+    }
+
     fn mount_of(path: &Path) -> Option<Mount> {
         mounts().into_iter().filter(|m| util::is_inside(path, &m.dir)).max_by_key(|m| m.dir.components().count())
     }
@@ -939,14 +994,18 @@ mod unix {
     }
 
     /// Whether the system can run the file as a program: a script (`#!`) or a binary (ELF;
-    /// in WSL a Windows .exe too). A text file or a document with execute bits isn't one:
-    /// bash would run its lines as commands.
+    /// Mach-O on macOS, also a universal one; in WSL a Windows .exe too). A text file or a
+    /// document with execute bits isn't one: bash would run its lines as commands.
     pub fn runs_as_program(path: &Path) -> bool {
         use std::io::Read;
+        const MACH_O: [&[u8]; 3] = [b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"];
         let mut head = [0u8; 4];
         let n = std::fs::File::open(path).and_then(|mut file| file.read(&mut head)).unwrap_or(0);
         let head = &head[..n];
-        head.starts_with(b"#!") || head.starts_with(b"\x7fELF") || (is_wsl() && head.starts_with(b"MZ"))
+        head.starts_with(b"#!")
+            || head.starts_with(b"\x7fELF")
+            || (cfg!(target_os = "macos") && MACH_O.iter().any(|magic| head.starts_with(magic)))
+            || (is_wsl() && head.starts_with(b"MZ"))
     }
 
     /// Whether two paths live on one file system (so a move is a rename). A path that doesn't
@@ -956,7 +1015,27 @@ mod unix {
         device(a) == device(b)
     }
 
+    /// What the drive picker calls a mount on macOS, or None to leave it out: the system's own
+    /// volumes under /System/Volumes are marked not to be shown, as are /dev and the
+    /// automounter's maps. What is left is `/` and the volumes in /Volumes.
+    #[cfg(target_os = "macos")]
+    fn kind(mount: &Mount) -> Option<&'static str> {
+        if mount.dir == Path::new("/") {
+            return Some("root");
+        }
+        if matches!(mount.fstype.as_str(), "devfs" | "autofs" | "nullfs") {
+            return None;
+        }
+        Some(match mount.fstype.as_str() {
+            "smbfs" | "afpfs" | "nfs" | "webdav" | "ftp" | "cifs" => "network",
+            // macFUSE: sshfs and the like.
+            t if t.starts_with("macfuse") || t.starts_with("osxfuse") || t.starts_with("fuse") => "network",
+            _ => "disk",
+        })
+    }
+
     /// What the drive picker calls a mount, or None to leave it out (system and virtual ones).
+    #[cfg(not(target_os = "macos"))]
     fn kind(mount: &Mount) -> Option<&'static str> {
         let dir = mount.dir.to_string_lossy();
         if dir == "/" {
@@ -986,7 +1065,7 @@ mod unix {
     pub fn drives() -> Vec<DriveInfo> {
         let mut drives: Vec<DriveInfo> = Vec::new();
         for mount in mounts() {
-            let Some(kind) = kind(&mount) else { continue };
+            let Some(kind) = kind(&mount).filter(|kind| *kind == "root" || !mount.hidden) else { continue };
             // A later mount on the same folder hides the earlier one.
             drives.retain(|d| d.root != mount.dir);
             let slow = matches!(kind, "network" | "windows");
@@ -1006,7 +1085,7 @@ mod unix {
     }
 
     /// Opens a file with the desktop's default app:
-    /// - macOS: `open`;
+    /// - macOS: `open`, except over ssh;
     /// - WSL: the Windows app for it, via `wslview` or `explorer.exe` (WSLg's DISPLAY would
     ///   make xdg-open look usable, but without a Linux desktop app it falls back to a
     ///   terminal program, which then fights cm for the screen);
@@ -1017,6 +1096,10 @@ mod unix {
         let found = |program: &str| util::find_in_path(program).is_some();
         let graphical = ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
         let (opener, arg) = if cfg!(target_os = "macos") {
+            // Over ssh, `open` would show it on the Mac's own screen, not where the user is.
+            if std::env::var_os("SSH_CONNECTION").is_some() {
+                return Err(OpenError::NoOpener);
+            }
             ("open", path.as_os_str().to_owned())
         } else if is_wsl() {
             if found("wslview") {
@@ -1076,6 +1159,7 @@ mod unix {
             }
         }
 
+        #[cfg(not(target_os = "macos"))]
         #[test]
         fn mount_fields_are_unescaped() {
             assert_eq!(unescape(r"/mnt/my\040disk"), "/mnt/my disk");
@@ -1089,8 +1173,20 @@ mod unix {
             let root = drives.iter().find(|d| d.root == Path::new("/")).expect("/ is listed");
             assert!(root.space.is_some_and(|(free, total)| free <= total && total > 0));
             assert!(drives.iter().all(|d| !d.root.starts_with("/proc") && !d.root.starts_with("/sys")));
+            #[cfg(target_os = "linux")]
             assert_eq!(mount_point(Path::new("/proc/self")), Some(PathBuf::from("/proc")));
             assert!(same_device(Path::new("/"), Path::new("/no/such/file")), "a missing path counts by its parent");
+        }
+
+        /// macOS: `/` and what is in /Volumes, none of the system's own volumes; /dev is a
+        /// mount of its own all the same.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_lists_the_volumes_a_user_sees() {
+            let drives = drives();
+            assert!(drives.iter().all(|d| d.root == Path::new("/") || d.root.starts_with("/Volumes")), "{:?}", drives.iter().map(|d| &d.root).collect::<Vec<_>>());
+            assert_eq!(mount_point(Path::new("/dev/null")), Some(PathBuf::from("/dev")));
+            assert!(mount_dirs().iter().any(|dir| dir.starts_with("/System/Volumes")), "the system's volumes are mounts all the same");
         }
     }
 }

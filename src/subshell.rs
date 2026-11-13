@@ -192,6 +192,13 @@ impl Subshell {
         if cfg!(unix) {
             command.env("TERM", "xterm-256color");
         }
+        // cm's screen copy reads UTF-8, so the shell is in a UTF-8 terminal, which it should
+        // know when nothing says otherwise: on macOS over ssh no locale is set at all (Terminal
+        // sets one itself), and zsh then shows `Účty` as `\M-^Z…`, and bash 3.2's readline
+        // garbles it typed.
+        if cfg!(target_os = "macos") && ["LC_ALL", "LC_CTYPE", "LANG"].iter().all(|v| std::env::var_os(v).is_none_or(|s| s.is_empty())) {
+            command.env("LC_CTYPE", "UTF-8");
+        }
         // A Windows process keeps the folder it starts in from being moved or deleted for as
         // long as it runs, and PowerShell's `cd` doesn't let go of it: so it starts elsewhere
         // and goes there itself (see PWSH_SHELL_INIT).
@@ -200,7 +207,15 @@ impl Subshell {
                 command.cwd(home);
                 command.env("CM_START_DIR", cwd);
             }
-            _ => command.cwd(cwd),
+            _ => {
+                command.cwd(cwd);
+                // The folder as the panel spells it: bash and zsh keep a $PWD that names the
+                // folder they are in, and otherwise take its real path (macOS's /tmp/x is
+                // /private/tmp/x), which the panel would then follow.
+                if cfg!(unix) {
+                    command.env("PWD", cwd);
+                }
+            }
         }
         command.env("CM_CWD_FILE", &report_file);
         command.env("CM_REQUEST_FILE", &request_file);
@@ -656,9 +671,20 @@ mod tests {
         wait_for("exit", || shell.has_exited());
     }
 
-    /// bash and zsh, with cm's start-up files: the same as the PowerShell test above.
+    /// Waits for `text` on the shell's screen, and shows the screen if it never comes.
     #[cfg(unix)]
-    fn posix_shell_keeps_its_state_and_follows_the_panel(program: &str, set_prompt: &str) {
+    fn wait_for_screen(shell: &Subshell, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !screen_text(shell).contains(text) {
+            assert!(Instant::now() < deadline, "timed out waiting for {text:?} on the screen:\n{}", screen_text(shell));
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// bash and zsh, with cm's start-up files: the same as the PowerShell test above. Without
+    /// the follow key (`silent` false: bash before 4.4, such as macOS's 3.2) cm types a `cd`.
+    #[cfg(unix)]
+    fn posix_shell_keeps_its_state_and_follows_the_panel(program: &str, set_prompt: &str, silent: bool) {
         let shell_kind = Shell::Posix(program.into());
         let tmp = TempDir::new("subshell-posix");
         let other = tmp.dir("Účty");
@@ -669,15 +695,21 @@ mod tests {
         shell.send_text(&format!("{set_prompt}; x=$((6 * 7)); echo answer=$x\r"));
         wait_for("the command's output", || screen_text(&shell).contains("answer=42"));
         wait_for("the next prompt", || shell.is_idle());
+        // Where the panel is, spelled as the panel does (a Mac's temp folder is under /var,
+        // a link to /private/var).
+        let started = shell.report().map(|r| r.dir);
+        assert_eq!(started.as_deref(), Some(tmp.path()), "the shell starts in the panel's folder, in its spelling");
 
-        assert!(shell.report().is_some_and(|r| r.can_follow), "the follow key is bound");
+        assert_eq!(shell.report().map(|r| r.can_follow), Some(silent), "the follow key is bound, or not");
         shell.follow_panel(&other);
         wait_for("the cd", || shell.report().is_some_and(|r| util::same_path(&r.dir, &other)));
-        wait_for("the redrawn prompt", || screen_text(&shell).contains("[Účty]> "));
+        wait_for_screen(&shell, "[Účty]> ");
         let screen = screen_text(&shell);
-        assert!(!screen.contains("cd --") && !screen.contains("__cm"), "no visible cd:\n{screen}");
-        assert_eq!(screen.matches("]> ").count(), 1, "the prompt is redrawn in place:\n{screen}");
-        assert!(shell.is_idle(), "still idle after the silent cd");
+        if silent {
+            assert!(!screen.contains("cd --") && !screen.contains("__cm"), "no visible cd:\n{screen}");
+            assert_eq!(screen.matches("]> ").count(), 1, "the prompt is redrawn in place:\n{screen}");
+        }
+        wait_for("idle after the cd", || shell.is_idle());
         assert_eq!(shell.moved_to(), None, "cm's own cd doesn't count as the user moving");
 
         shell.send_text("echo still=$x; cd ..\r");
@@ -695,7 +727,10 @@ mod tests {
             eprintln!("no bash here; skipped");
             return;
         };
-        posix_shell_keeps_its_state_and_follows_the_panel(&bash.to_string_lossy(), r"PS1='[\W]''> '");
+        let version = std::process::Command::new(&bash).args(["-c", "echo ${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"]).output().unwrap();
+        let version: Vec<u32> = String::from_utf8_lossy(&version.stdout).split_whitespace().filter_map(|n| n.parse().ok()).collect();
+        let silent = version >= vec![4, 4];
+        posix_shell_keeps_its_state_and_follows_the_panel(&bash.to_string_lossy(), r"PS1='[\W]''> '", silent);
     }
 
     /// CM_TEST_ZSH can point at a zsh that isn't on the PATH.
@@ -711,7 +746,7 @@ mod tests {
         let tmp = TempDir::new("zsh-link");
         let link = tmp.path().join("zsh");
         std::os::unix::fs::symlink(&zsh, &link).unwrap();
-        posix_shell_keeps_its_state_and_follows_the_panel(&link.to_string_lossy(), "PROMPT='[%1~]''> '");
+        posix_shell_keeps_its_state_and_follows_the_panel(&link.to_string_lossy(), "PROMPT='[%1~]''> '", true);
     }
 
     /// Text typed while a command runs waits at the next prompt: that prompt isn't idle, so

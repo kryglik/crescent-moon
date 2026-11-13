@@ -391,7 +391,33 @@ fn native_path(text: &str, base: &Path) -> PathBuf {
     } else {
         text.to_string()
     };
-    util::normalize(&base.join(path))
+    spelled_as(util::normalize(&base.join(path)), base)
+}
+
+/// `path` in the spelling of `base`'s folders. git writes paths with their links resolved:
+/// on macOS /var and /tmp are links into /private, so a worktree in /tmp/x is /private/tmp/x
+/// to git, and wouldn't match the panel's /tmp/x. The deepest folder above `base` whose real
+/// path holds `path` gives the start back.
+#[cfg(unix)]
+fn spelled_as(path: PathBuf, base: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path;
+    }
+    for above in base.ancestors() {
+        if path.starts_with(above) {
+            return path;
+        }
+        let Ok(real) = fs::canonicalize(above) else { continue };
+        if let Ok(rest) = path.strip_prefix(&real) {
+            return above.join(rest);
+        }
+    }
+    path
+}
+
+#[cfg(windows)]
+fn spelled_as(path: PathBuf, _base: &Path) -> PathBuf {
+    path
 }
 
 /// How a file stands with git, from the least to the most worth seeing: a folder shows the
@@ -1060,6 +1086,22 @@ pub mod tests {
             assert_eq!(native_path("E:/devel/x/.git", Path::new("/")), PathBuf::from("/mnt/e/devel/x/.git"));
             assert_eq!(native_path("/srv/x/.git", Path::new("/home")), PathBuf::from("/srv/x/.git"));
         }
+    }
+
+    /// git writes real paths; read through a link (macOS's /tmp and /var are links into
+    /// /private) they come back in the link's spelling, which the panels use.
+    #[cfg(unix)]
+    #[test]
+    fn paths_git_resolved_are_spelled_as_the_panel_does() {
+        let tmp = TempDir::new("git-spelling");
+        let real = fs::canonicalize(tmp.dir("real")).unwrap();
+        tmp.dir("real/repo");
+        tmp.dir("real/wt");
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let repo = tmp.path().join("link/repo");
+        assert_eq!(native_path(&real.join("wt").to_string_lossy(), &repo), tmp.path().join("link/wt"));
+        assert_eq!(native_path("../wt", &repo), tmp.path().join("link/wt"), "relative: as it is");
+        assert_eq!(native_path("/srv/x", &repo), PathBuf::from("/srv/x"), "elsewhere: as git says");
     }
 
     #[test]

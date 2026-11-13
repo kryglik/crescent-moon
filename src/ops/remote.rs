@@ -1279,6 +1279,10 @@ mod tests {
     #[test]
     fn two_names_landing_on_one_lose_nothing() {
         let here = TempDir::new("remote-case-here");
+        if crate::testutil::ignores_case(here.path()) {
+            eprintln!("case doesn't count here either (a Mac's disk): the two names can't be made; not tested");
+            return;
+        }
         let there = TempDir::in_target("remote-case-there");
         let Some(connection) = local_connection(there.path()) else { return };
         here.file("tree/Makefile", "capital");

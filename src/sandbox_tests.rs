@@ -374,8 +374,13 @@ fn unusual_names_survive_copy_move_and_delete() {
         "semi;colon=equals,comma.txt",
         "$dollar `tick` ~tilde!.txt",
     ];
-    let names_in: Vec<&str> =
-        names_in.into_iter().filter(|name| cfg!(unix) || !name.contains('"')).collect();
+    // On a Mac's disk the two écoles are one name.
+    let one_ecole = crate::testutil::ignores_normalization(tmp.path());
+    let names_in: Vec<&str> = names_in
+        .into_iter()
+        .filter(|name| cfg!(unix) || !name.contains('"'))
+        .filter(|name| !(one_ecole && *name == "e\u{301}cole.txt"))
+        .collect();
     for name in &names_in {
         tmp.file(&format!("src/{name}"), name);
     }
@@ -556,13 +561,9 @@ fn an_overwrite_replaces_a_link_not_its_target() {
 fn two_files_differing_in_case_stay_two() {
     let tmp = TempDir::new("edge-case-two");
     let dir = tmp.dir("d");
-    #[cfg(windows)]
-    {
-        let made = std::process::Command::new("fsutil").args(["file", "setCaseSensitiveInfo"]).arg(&dir).arg("enable").output().unwrap();
-        if !made.status.success() {
-            eprintln!("no case-sensitive folders here; not tested");
-            return;
-        }
+    if !crate::testutil::respects_case(&dir) {
+        eprintln!("no folder that respects case here; not tested");
+        return;
     }
     let lower = tmp.file("d/readme.md", "lower");
     let upper = tmp.file("d/README.md", "upper");
@@ -747,6 +748,10 @@ fn packing_keeps_links_and_permissions() {
 #[test]
 fn names_differing_in_case_are_two_files_where_case_counts() {
     let tmp = TempDir::new("edge-case-counts");
+    if crate::testutil::ignores_case(tmp.path()) {
+        eprintln!("case doesn't count here (a Mac's disk); not tested");
+        return;
+    }
     let first = tmp.file("src/Readme.md", "first");
     let second = tmp.file("src/README.md", "second");
     tmp.file("dst/README.md", "old");
@@ -859,6 +864,10 @@ fn a_copy_never_puts_a_link_over_what_it_leads_to() {
 #[test]
 fn a_link_isnt_a_case_rename_of_its_target() {
     let tmp = TempDir::new("edge-case-link");
+    if crate::testutil::ignores_case(tmp.path()) {
+        eprintln!("case doesn't count here (a Mac's disk): the two names can't be made; not tested");
+        return;
+    }
     let target = tmp.file("notes.txt", "precious");
     std::os::unix::fs::symlink("notes.txt", tmp.path().join("Notes.txt")).unwrap();
     let link = tmp.path().join("Notes.txt");

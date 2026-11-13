@@ -68,6 +68,39 @@ impl TempDir {
     }
 }
 
+/// Whether the disk holding `dir` takes names differing only in letter case for one name
+/// (Windows, macOS, WSL's /mnt/c), as a probe file there shows.
+pub fn ignores_case(dir: &Path) -> bool {
+    one_name(dir, "cm-case-probe", "CM-CASE-PROBE")
+}
+
+/// Whether the disk holding `dir` takes `é` as one character and as `e` with an accent for
+/// one name (macOS's APFS does).
+pub fn ignores_normalization(dir: &Path) -> bool {
+    one_name(dir, "cm-norm-probe-\u{e9}", "cm-norm-probe-e\u{301}")
+}
+
+fn one_name(dir: &Path, written: &str, asked: &str) -> bool {
+    let probe = dir.join(written);
+    fs::write(&probe, "").unwrap();
+    let same = dir.join(asked).exists();
+    fs::remove_file(&probe).unwrap();
+    same
+}
+
+/// Makes `dir` respect letter case where that can be asked for (a folder flag on Windows),
+/// and says whether it does: a Mac's disk usually doesn't, nor does Windows without WSL.
+pub fn respects_case(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let made = std::process::Command::new("fsutil").args(["file", "setCaseSensitiveInfo"]).arg(dir).arg("enable").output();
+        if !made.is_ok_and(|made| made.status.success()) {
+            return false;
+        }
+    }
+    !ignores_case(dir)
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);

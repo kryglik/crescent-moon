@@ -4899,28 +4899,24 @@ mod tests {
     }
 
     /// Shift+F6 to another letter case where that names another file (a folder that respects
-    /// case, as WSL makes them): refused, and both files stay. Where the two names are one
-    /// file (the usual Windows folder), it renames.
+    /// case: Linux's, one WSL makes): refused, and both files stay. Where the two names are one
+    /// file (the usual Windows or Mac folder), it renames.
     #[test]
     fn a_rename_never_lands_on_another_file_that_differs_in_case() {
         let tmp = TempDir::new("app-rename-case");
         let dir = tmp.dir("strict");
-        #[cfg(windows)]
-        {
-            let made = std::process::Command::new("fsutil").args(["file", "setCaseSensitiveInfo"]).arg(&dir).arg("enable").output().unwrap();
-            if !made.status.success() {
-                return;
-            }
+        if crate::testutil::respects_case(&dir) {
+            let lower = tmp.file("strict/readme.md", "lower");
+            let upper = tmp.file("strict/README.md", "upper");
+            let mut app = test_app(&dir, &dir);
+            app.rename(&lower, "README.md");
+            assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "an error: it exists");
+            assert_eq!((fs::read_to_string(&lower).unwrap(), fs::read_to_string(&upper).unwrap()), ("lower".into(), "upper".into()));
+        } else {
+            eprintln!("no folder that respects case here: that half not tested");
         }
-        let lower = tmp.file("strict/readme.md", "lower");
-        let upper = tmp.file("strict/README.md", "upper");
-        let mut app = test_app(&dir, &dir);
-        app.rename(&lower, "README.md");
-        assert!(matches!(app.dialog, Some(Dialog::Message { .. })), "an error: it exists");
-        assert_eq!((fs::read_to_string(&lower).unwrap(), fs::read_to_string(&upper).unwrap()), ("lower".into(), "upper".into()));
 
-        #[cfg(windows)]
-        {
+        if crate::testutil::ignores_case(tmp.path()) {
             let one = tmp.file("Plain.txt", "one");
             let mut app = test_app(tmp.path(), tmp.path());
             app.rename(&one, "PLAIN.txt");

@@ -1254,11 +1254,27 @@ impl Worker {
             if let Some(reason) = platform::trash_refusal(path) {
                 return Err(io::Error::other(reason));
             }
-            trash::delete(path).map_err(|e| trash_error(path, &e))
+            to_the_trash(path).map_err(|e| trash_error(path, &e))
         })?;
         self.advance((1, 0));
         Ok(())
     }
+}
+
+/// macOS: through the system's file manager (NSFileManager), not by asking Finder, the trash
+/// crate's default: Finder needs the user's leave to be controlled, a desktop session (none
+/// over ssh), and plays its sound. The price: Finder's "Put Back" may not know the place.
+#[cfg(target_os = "macos")]
+fn to_the_trash(path: &Path) -> Result<(), trash::Error> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut context = trash::TrashContext::default();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context.delete(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn to_the_trash(path: &Path) -> Result<(), trash::Error> {
+    trash::delete(path)
 }
 
 /// Whether the folder still lists `path`'s exact name (on a disk that ignores case, a

@@ -2,8 +2,8 @@
 //! download finishing, a build writing files) without Ctrl+R, as Explorer and Total
 //! Commander do.
 //!
-//! Windows uses change notifications (FindFirstChangeNotification), Linux inotify. Both are
-//! polled from the main loop; neither needs a thread. Removable and optical drives aren't
+//! Windows uses change notifications (FindFirstChangeNotification), Linux inotify, macOS a
+//! kqueue. All are polled from the main loop; none needs a thread. Removable and optical drives aren't
 //! watched on Windows: an open watch would keep Windows from ejecting them.
 
 use std::path::{Path, PathBuf};
@@ -226,8 +226,87 @@ mod sys {
     }
 }
 
-/// Elsewhere (macOS is untried): no watching, Ctrl+R reloads.
-#[cfg(not(any(windows, target_os = "linux")))]
+/// macOS: a kqueue on the folder itself. Like inotify it watches one folder, not what is below
+/// it; unlike inotify it hears of names added, removed and renamed there (the folder itself is
+/// written), not of a file in it growing: a download shows in full at its final rename, as
+/// browsers make them, or after Ctrl+R.
+#[cfg(target_os = "macos")]
+mod sys {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// The kqueue, and the folder open only to be watched (O_EVTONLY: it doesn't keep its
+    /// disk from being ejected).
+    pub struct Handle {
+        queue: i32,
+        dir: i32,
+    }
+
+    impl Handle {
+        pub fn open(dir: &Path, subtree: bool) -> Option<Handle> {
+            if subtree {
+                return None;
+            }
+            let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                return None;
+            }
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                unsafe { libc::close(fd) };
+                return None;
+            }
+            let handle = Handle { queue, dir: fd };
+            let watch = libc::kevent {
+                ident: fd as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                // EV_CLEAR: reported once, then quiet until the next change.
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_ATTRIB
+                    | libc::NOTE_LINK
+                    | libc::NOTE_RENAME
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_REVOKE,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let added = unsafe { libc::kevent(queue, &watch, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            (added == 0).then_some(handle)
+        }
+
+        /// Whether events arrived since the last look (they are read and dropped).
+        pub fn changed(&mut self) -> bool {
+            let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let mut events: [libc::kevent; 8] = unsafe { std::mem::zeroed() };
+            let mut any = false;
+            loop {
+                let n = unsafe {
+                    libc::kevent(self.queue, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as libc::c_int, &now)
+                };
+                if n <= 0 {
+                    return any;
+                }
+                any = true;
+            }
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.queue);
+                libc::close(self.dir);
+            }
+        }
+    }
+}
+
+/// Elsewhere: no watching, Ctrl+R reloads.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod sys {
     use std::path::Path;
 

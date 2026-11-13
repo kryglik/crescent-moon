@@ -2,8 +2,8 @@
 
 Crescent Moon (`cm`, mc turned around) is a small Midnight Commander-style two-panel file
 manager for the terminal, written in Rust.
-It runs natively on Windows (Windows Terminal, PowerShell) and on Linux, including WSL
-(bash or zsh). It should build on macOS too, but that hasn't been tried.
+It runs natively on Windows (Windows Terminal, PowerShell), on Linux, including WSL (bash or
+zsh), and on macOS (Terminal or iTerm2, zsh or bash).
 
 What it does differently from the Windows port of mc:
 
@@ -29,7 +29,8 @@ What it does differently from the Windows port of mc:
   new one is complete and on the disk, a move to another drive deletes each file only after
   that, and the same file under another name is recognised. Two names that land on one (from
   a disk that respects case to one that doesn't) never replace each other.
-- Deleting never reaches through a link or junction, nor on Linux into a mounted file system.
+- Deleting never reaches through a link or junction, nor on Linux or macOS into a mounted file
+  system.
 - Long paths (over 260 characters) work, as do Czech and other non-ASCII names everywhere. So
   do names Windows itself reads as something else: `foo.` and `foo ` (from WSL, Linux or a Mac)
   are copied, moved and deleted as themselves and never taken for `foo`, and a file called
@@ -67,6 +68,32 @@ CARGO_TARGET_DIR=~/cm-target cargo install --path .
   the Windows app, via `wslview` or `explorer.exe`). Without one, it opens in the viewer.
 - The editor defaults to nvim, or the first of vim, vi and nano that is installed.
 - Terminals send Ctrl+\ as Ctrl+4; both open the hotlist.
+
+### On macOS
+
+Rust comes from [rustup](https://rustup.rs), the C linker from Apple's Command Line Tools
+(`xcode-select --install`); then `cargo install --path .` puts `cm` into `~/.cargo/bin`.
+
+- **Alt keys** reach cm only when Option acts as Meta: in Terminal, Settings → Profiles →
+  Keyboard → "Use Option as Meta key"; in iTerm2, Profiles → Keys → Left Option key: Esc+.
+- **F1–F12** need fn held, unless System Settings → Keyboard has "Use F1, F2, etc. keys as
+  standard function keys" on. A few are taken by macOS's own shortcuts (Mission Control),
+  which Keyboard Shortcuts there can free.
+- F8 moves things to the **Trash** through the system, as Finder's Delete does but without
+  asking Finder: no prompt for permission, and it works over ssh too. Finder's "Put Back" may
+  not know where such an item came from.
+- The drive picker (Alt+F1/F2) lists `/` and the volumes in `/Volumes`: disks, disk images,
+  network shares. The system's own volumes are left out.
+- Panels show what other programs change: names added, removed or renamed at once; a file
+  still growing once it is finished, or with Ctrl+R.
+- Enter on a file opens it in its app (`open`); over ssh, in the viewer instead.
+- **Ctrl+O** works with zsh, the Mac's default. The bash that comes with macOS is 3.2: cm
+  follows the panel there by typing a `cd`, and a newer bash (Homebrew's) moves silently.
+- Most Mac disks ignore letter case: Shift+F6 from `readme.md` to `README.md` renames in place,
+  and files whose names differ only in case (from a Linux disk or server) never replace each
+  other on the way. `/tmp` and `/var` are links into `/private`; panels and the shell keep the
+  short spelling.
+- Settings are in `~/.config/crescent-moon`, as on Linux.
 
 ## Keys
 
@@ -552,7 +579,18 @@ cm shows the mono scheme.
 ## Testing in a real terminal
 
 `cargo test` covers most things, including a real shell in the embedded terminal: pwsh on
-Windows, bash and zsh on Linux (`CM_TEST_ZSH` can point at a zsh that isn't on the PATH).
+Windows, bash and zsh on Linux and macOS (`CM_TEST_ZSH` can point at a zsh that isn't on the
+PATH). A Mac's disk ignores letter case and is usually the only one, so the tests for folders
+that respect case and for moves between disks skip themselves there; with `TMPDIR` on a
+case-sensitive disk image they run too:
+
+```bash
+hdiutil create -size 300m -fs "Case-sensitive APFS" -volname cmtest -type SPARSE /tmp/cmtest
+hdiutil attach -nobrowse -mountpoint /tmp/cmtest-vol /tmp/cmtest.sparseimage
+mkdir /tmp/cmtest-vol/tmp && TMPDIR=/tmp/cmtest-vol/tmp/ cargo test
+hdiutil detach /tmp/cmtest-vol && rm /tmp/cmtest.sparseimage
+```
+
 Run the Linux tests from Windows with WSL:
 
 ```bash
