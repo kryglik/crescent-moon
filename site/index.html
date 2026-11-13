@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Crescent Moon: a two-panel file manager for the terminal</title>
-<meta name="description" content="Crescent Moon (cm, mc turned around) is a Midnight Commander-style two-panel file manager for Windows and Linux, written in Rust.">
+<meta name="description" content="Crescent Moon (cm, mc turned around) is a Midnight Commander-style two-panel file manager for Windows, Linux and macOS, written in Rust.">
 <link rel="icon" href="moon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -20,8 +20,9 @@
       </div>
     </div>
     <p class="lead">A two-panel file manager for the terminal in the spirit of Midnight Commander and
-      Total Commander, written in Rust. Native on Windows (Windows Terminal, PowerShell) and on
-      Linux, WSL included. It's fast, it's careful with your files, and it knows about git.</p>
+      Total Commander, written in Rust. Native on Windows (Windows Terminal, PowerShell), on
+      Linux, WSL included, and on macOS. It's fast, it's careful with your files, and it knows
+      about git.</p>
     <nav class="toc" aria-label="Features">
       <a href="#panels">Panels</a>
       <a href="#copy">Copy &amp; move</a>
@@ -67,7 +68,7 @@
     <li>An overwrite replaces the old file only once the new one is complete and on the disk.</li>
     <li>A move to another drive deletes each file only after its copy is checked.</li>
     <li>The same file under another name is recognised, and two names that land on one never replace each other.</li>
-    <li><kbd>F8</kbd> goes to the Recycle Bin; only <kbd>Shift+F8</kbd> deletes for good. Files only an administrator
+    <li><kbd>F8</kbd> goes to the Recycle Bin (on a Mac, the Trash); only <kbd>Shift+F8</kbd> deletes for good. Files only an administrator
       may delete get an <strong>As admin</strong> button, as in Total Commander.</li>
     <li>Paths over 260 characters, Czech and other non-ASCII names, and names Windows misreads
       (<code>foo.</code>, <code>nul</code>) all work.</li>
@@ -155,7 +156,7 @@
 <section class="feature" id="shell">
   <h2>One shell for the whole session</h2>
   <p>Typing anywhere goes to the command line, and <kbd>Enter</kbd> runs it in a shell that lives as long as
-    cm does: PowerShell on Windows, bash or zsh on Linux. <kbd>Ctrl+O</kbd> switches between the panels and
+    cm does: PowerShell on Windows, bash or zsh on Linux and macOS. <kbd>Ctrl+O</kbd> switches between the panels and
     the shell. If you <code>cd</code> there, the panel follows; move the panel, and the shell follows,
     quietly. Variables stay, and a long command keeps running while you work in the panels.</p>
   <figure><img src="gifs/shell.gif" width="1000" height="600" alt="git log run from the command line, then cd docs in the shell, which the panel follows" loading="lazy"></figure>
@@ -211,7 +212,7 @@
     <article>
       <h3>Deletes that ask the right question</h3>
       <p>The question counts what would go while you decide, says which file you may not delete and why,
-        and never reaches through a link or junction, nor on Linux into a mounted disk.</p>
+        and never reaches through a link or junction, nor on Linux or a Mac into a mounted disk.</p>
     </article>
     <article>
       <h3>Settings in plain text</h3>
