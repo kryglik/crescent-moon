@@ -592,3 +592,12 @@ Mono) into a GIF. It needs Python with Pillow, and git.
 
 Writing into archives, other archive formats (7z, rar, tar), running commands over SSH, a user
 menu.
+
+## Licence
+
+Crescent Moon is under the MIT licence ([LICENSE-MIT](LICENSE-MIT)) or the Apache License 2.0
+([LICENSE-APACHE](LICENSE-APACHE)), whichever you choose, as most Rust crates are. Unless you
+say otherwise, a contribution you send in for it is under both as well, with no other terms.
+
+`vendor/crossterm` is a patched copy of crossterm (see `vendor/README.md`) and keeps its own MIT
+licence, [vendor/crossterm/LICENSE](vendor/crossterm/LICENSE).

@@ -3,6 +3,7 @@ name = "crescent-moon"
 version = "0.1.0"
 edition = "2024"
 description = "Crescent Moon: a small Midnight Commander-style two-panel file manager for the terminal"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "cm"
