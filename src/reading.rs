@@ -77,6 +77,8 @@ pub struct Asked {
     /// read, is worth saying.
     pub past_gone_only: bool,
     pub show_hidden: bool,
+    /// The long listing (Alt+T): owners and groups are looked up.
+    pub long: bool,
     pub filter: Option<String>,
     pub sort: SortBy,
     pub reverse: bool,
@@ -298,7 +300,7 @@ fn list_at_once(spot: &Spot, asked: &Asked, stop: &AtomicBool) -> io::Result<Lis
     };
     match spot {
         Spot::Here(dir) => {
-            listing.entries = panel::read_entries(dir, asked.show_hidden, filter.as_ref(), stop)?;
+            listing.entries = panel::read_entries(dir, asked.show_hidden, asked.long, filter.as_ref(), stop)?;
             panel::sort_entries(&mut listing.entries, asked.sort, asked.reverse, &asked.sizes);
             // On Windows a drive root gets ".." too: it opens the drive picker.
             if dir.parent().is_some() || cfg!(windows) {

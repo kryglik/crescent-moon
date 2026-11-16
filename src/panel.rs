@@ -89,7 +89,23 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     /// Where a link or a junction leads, as the system words it.
     pub leads_to: Option<String>,
+    /// What the long listing (Alt+T) shows of it.
+    pub details: Details,
     sort_name: String,
+}
+
+/// An entry's permissions, owner and attributes, for the long listing. Each is there only
+/// where the system has it: the mode on Linux, macOS and servers, a group nowhere on Windows.
+/// The entry's own, a link's not followed, as `ls -l` shows them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Details {
+    /// The type and permission bits, as unix keeps them (`st_mode`).
+    pub mode: Option<u32>,
+    /// By name, or the number where there is none; only read while the listing is long.
+    pub owner: Option<String>,
+    pub group: Option<String>,
+    /// The system's own attributes: Windows' FILE_ATTRIBUTE_* or macOS's flags (`st_flags`).
+    pub attributes: Option<u32>,
 }
 
 impl Entry {
@@ -106,6 +122,7 @@ impl Entry {
             size: 0,
             modified,
             leads_to: None,
+            details: Details::default(),
             sort_name: String::new(),
         }
     }
@@ -137,6 +154,8 @@ pub struct Panel {
     /// The other way round: Z to A, smallest or oldest first. Directories stay on top.
     pub reverse: bool,
     pub show_hidden: bool,
+    /// Alt+T: permissions, owner, group and attributes too, as mc's long listing.
+    pub long: bool,
     /// Ctrl+F: only files matching this are listed (`*.jpg *.cr2`, `!*.tmp`, or part of a
     /// name; see `find::NameFilter`). Folders are always listed.
     pub filter: Option<String>,
@@ -237,9 +256,17 @@ fn name_order(a: &str, b: &str) -> Ordering {
 }
 
 impl Panel {
-    /// Opens `cwd`, falling back to its parents, the home directory or the system root.
+    /// Opens `cwd` with the usual listing (see `with_listing`).
+    #[cfg(test)]
     pub fn new(cwd: PathBuf, show_hidden: bool) -> Panel {
+        Panel::with_listing(cwd, show_hidden, false)
+    }
+
+    /// Opens `cwd`, falling back to its parents, the home directory or the system root, with
+    /// the long listing (Alt+T) on or off from the start.
+    pub fn with_listing(cwd: PathBuf, show_hidden: bool, long: bool) -> Panel {
         let mut panel = Panel::blank(show_hidden);
+        panel.long = long;
         panel.cwd = util::normalize(&cwd);
         panel.begin(vec![Spot::Here(panel.cwd.clone())], true, Purpose::Start);
         panel.wait_a_moment();
@@ -259,6 +286,7 @@ impl Panel {
             sort: SortBy::Name,
             reverse: false,
             show_hidden,
+            long: false,
             filter: None,
             page: 20,
             space: None,
@@ -279,6 +307,7 @@ impl Panel {
     /// A new tab of this panel: the same folder, order, filter and memory of drives.
     pub fn new_tab(&self) -> Panel {
         let mut tab = Panel::blank(self.show_hidden);
+        tab.long = self.long;
         tab.cwd = self.cwd.clone();
         (tab.sort, tab.reverse, tab.filter) = (self.sort, self.reverse, self.filter.clone());
         tab.drive_dirs = self.drive_dirs.clone();
@@ -319,6 +348,7 @@ impl Panel {
             refuge,
             past_gone_only: matches!(purpose, Purpose::Go { .. } | Purpose::Step { .. }),
             show_hidden: self.show_hidden,
+            long: self.long,
             filter: self.filter.clone(),
             sort: self.sort,
             reverse: self.reverse,
@@ -1038,6 +1068,7 @@ fn archive_entries(view: &ArchiveView, filter: Option<&NameFilter>) -> Vec<Entry
             size: item.size,
             modified: item.modified,
             leads_to: None,
+            details: Details::default(),
             sort_name: item.name().to_lowercase(),
         })
         .collect()
@@ -1062,6 +1093,7 @@ pub fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&Name
         if !is_dir && filter.is_some_and(|f| !f.matches(&item.name)) {
             continue;
         }
+        let (owner, group) = owner_and_group(&item.long_name, item.attrs.owner);
         out.push(Entry {
             sort_name: item.name.to_lowercase(),
             is_exec: attrs.is_executable(),
@@ -1074,13 +1106,33 @@ pub fn remote_entries(view: &RemoteView, show_hidden: bool, filter: Option<&Name
             is_parent: false,
             is_hidden,
             leads_to: None,
+            details: Details { mode: item.attrs.mode, owner, group, attributes: None },
         });
     }
     Ok(out)
 }
 
+/// Owner and group by name, from the line `ls -l` would show that a server sends with each
+/// name (`-rw-r--r--  1 me  staff  42 Mar 3 12:00 x`); by number where it has no such line,
+/// or one shaped otherwise.
+fn owner_and_group(long_name: &str, numbers: Option<(u32, u32)>) -> (Option<String>, Option<String>) {
+    let fields: Vec<&str> = long_name.split_whitespace().collect();
+    let shaped = fields.len() >= 5
+        && fields[0].len() >= 10
+        && fields[0].starts_with(['-', 'd', 'l', 'c', 'b', 'p', 's'])
+        && fields[1].bytes().all(|b| b.is_ascii_digit());
+    if shaped {
+        return (Some(fields[2].to_string()), Some(fields[3].to_string()));
+    }
+    match numbers {
+        Some((uid, gid)) => (Some(uid.to_string()), Some(gid.to_string())),
+        None => (None, None),
+    }
+}
+
 /// The entries of a folder here; given up on once `stop` says nobody is waiting for them.
-pub fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>, stop: &AtomicBool) -> io::Result<Vec<Entry>> {
+/// `long`: with owners and groups by name, which cost a look-up (on Windows one per file).
+pub fn read_entries(dir: &Path, show_hidden: bool, long: bool, filter: Option<&NameFilter>, stop: &AtomicBool) -> io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     // On a Windows drive in WSL every file looks executable.
     let exec_bits = platform::exec_bits_mean_something(dir);
@@ -1109,12 +1161,14 @@ pub fn read_entries(dir: &Path, show_hidden: bool, filter: Option<&NameFilter>, 
             let target = target.display().to_string();
             target.strip_prefix(r"\\?\").map(String::from).unwrap_or(target)
         });
+        let details = platform::details(&path, own.as_ref(), long);
         out.push(Entry {
             sort_name: name.to_lowercase(),
             is_exec: !is_dir && exec_bits && platform::is_executable(&name, meta),
             size: if is_dir { 0 } else { meta.map_or(0, |m| m.len()) },
             modified: meta.and_then(|m| m.modified().ok()),
             leads_to,
+            details,
             name,
             path,
             is_dir,
@@ -1157,6 +1211,71 @@ mod tests {
 
     fn names(panel: &Panel) -> Vec<&str> {
         panel.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// What the long listing reads of a real file: owner and group by name only when asked
+    /// (they cost a look-up); the mode on Linux and macOS, the attributes on Windows.
+    #[test]
+    fn owners_are_read_for_the_long_listing_only() {
+        let tmp = TempDir::new("panel-details");
+        tmp.file("x.txt", "x");
+        let stop = AtomicBool::new(false);
+        let read = |long| {
+            read_entries(tmp.path(), true, long, None, &stop).unwrap().into_iter().find(|e| e.name == "x.txt").unwrap().details
+        };
+        let short = read(false);
+        assert_eq!((short.owner, short.group), (None, None));
+        let long = read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(tmp.path().join("x.txt")).unwrap();
+            assert_eq!(long.mode, Some(meta.mode()));
+            assert_eq!(long.owner, Some(platform::user_name(meta.uid())));
+            assert_eq!(long.group, Some(platform::group_name(meta.gid())));
+            if let Ok(me) = std::env::var("USER") {
+                assert_eq!(long.owner.as_deref(), Some(me.as_str()), "by name");
+            }
+            assert_eq!(cfg!(target_os = "macos"), long.attributes.is_some(), "macOS's flags");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!((long.mode, long.group.as_deref()), (None, None));
+            assert!(long.attributes.is_some_and(|a| a & 0x20 != 0), "a new file waits for a backup: A");
+            let owner = long.owner.expect("an owner");
+            let me = std::env::var("USERNAME").unwrap();
+            assert!(owner.eq_ignore_ascii_case(&me) || owner == "Administrators", "{owner}");
+        }
+    }
+
+    /// A server names owner and group only in the `ls -l` line it sends with each name; one
+    /// shaped otherwise gives the numbers.
+    #[test]
+    fn owners_from_a_servers_listing() {
+        let ls = "-rw-r--r--    1 jana     staff        1234 Mar  3 12:00 notes.txt";
+        assert_eq!(owner_and_group(ls, Some((501, 20))), (Some("jana".into()), Some("staff".into())));
+        let dir = "drwxr-xr-x 2 root root 4096 Jan 1 2024 etc";
+        assert_eq!(owner_and_group(dir, None), (Some("root".into()), Some("root".into())));
+        assert_eq!(owner_and_group("notes.txt", Some((501, 20))), (Some("501".into()), Some("20".into())), "a bare name");
+        assert_eq!(owner_and_group("", None), (None, None));
+    }
+
+    /// The same from a real server: the owner of a file there by name.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_server_names_the_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new("panel-remote-owner");
+        tmp.file("x.txt", "x");
+        let Some(connection) = crate::ssh::tests::local_connection(tmp.path()) else { return };
+        let view = RemoteView { connection: connection.clone(), dir: connection.home.clone() };
+        let entries = remote_entries(&view, true, None).unwrap();
+        crate::ssh::tests::forget(&connection);
+        let x = entries.iter().find(|e| e.name == "x.txt").unwrap();
+        let meta = std::fs::metadata(tmp.path().join("x.txt")).unwrap();
+        assert_eq!(x.details.owner, Some(platform::user_name(meta.uid())));
+        assert_eq!(x.details.group, Some(platform::group_name(meta.gid())));
+        assert_eq!(x.details.mode.map(|mode| mode & 0o7777), Some(meta.mode() & 0o7777));
     }
 
     #[test]

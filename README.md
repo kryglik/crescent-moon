@@ -128,6 +128,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Shift+Enter | open with… : Windows asks which app to open the file in |
 | Ctrl+F | filter the panel: only files matching `*.jpg *.cr2`, or not `!*.tmp`, or containing a word; folders stay. The panel's title shows it until Ctrl+F empties it |
 | F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
+| Alt+T | the long listing, as mc's: permissions, owner, group and attributes after the time, in this panel; again for the usual one. Each side keeps its own, in `settings.ini` too (see below) |
 | Ctrl+Space | size of the directory under the cursor (on `..`: all of them, plus a folder total) |
 | Shift+F2 | compare the two folders (as in Total Commander): marks on each side the files and folders the other side lacks or has an older copy of (same time but another size counts too), so F5 brings the other side up to date |
 
@@ -443,6 +444,25 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
+
+Alt+T sets `long_listing_left` and `long_listing_right` (both off at first): which panel shows the
+long listing.
+
+### The long listing (Alt+T)
+
+After Size and Modify time come the columns the folder's entries have:
+
+- **Permission**, as `ls -l` writes it (`drwxr-xr-x`), with setuid and setgid as `s` and the sticky
+  bit as `t`: on Linux and macOS, and for folders on another computer over SSH.
+- **Owner** and **Group** by name. Windows has an owner (SYSTEM, TrustedInstaller, you) and no
+  group worth showing; a server names them in the line `ls -l` would show, which it sends anyway.
+  Owners are looked up only while the long listing is on, once per account.
+- **Attr**: on Windows R read-only, H hidden, S system, A archive, C compressed, E encrypted,
+  O online-only (in the cloud until opened, as OneDrive keeps files); on macOS L locked
+  (`chflags uchg`), A append-only, H hidden, C compressed, O online-only (iCloud).
+
+A link shows its own permissions and owner, as `ls -l` does. Where the panel is narrow the name keeps
+16 places and the columns give way to it: the group first, then the attributes and the owner.
 
 Environment variables, used when the matching option is empty:
 

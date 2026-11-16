@@ -36,6 +36,8 @@ pub struct PanelHit {
     pub header_y: u16,
     pub size_x: u16,
     pub time_x: u16,
+    /// Where the long listing's columns start (Alt+T), when they show: their headings don't sort.
+    pub long_x: Option<u16>,
     pub details: bool,
 }
 
@@ -161,6 +163,9 @@ impl App {
         // A column heading sorts by it; clicking it again flips the order (A-Z / Z-A).
         // (Sorting by extension is in the F9 menu.)
         if hit.details && pos.y == hit.header_y && button == MouseButton::Left {
+            if hit.long_x.is_some_and(|x| pos.x + 1 >= x) {
+                return;
+            }
             let by = match pos.x {
                 x if x >= hit.time_x => SortBy::Time,
                 x if x >= hit.size_x => SortBy::Size,
@@ -428,6 +433,23 @@ mod tests {
         draw(&mut app);
         click(&mut app, 0, 0);
         assert!(app.dialog.is_none());
+    }
+
+    /// The long listing's headings (Alt+T) don't sort: a click there leaves the order as it is.
+    #[test]
+    fn the_long_listings_headings_dont_sort() {
+        let tmp = sample();
+        let mut app = app(tmp.path());
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
+        draw(&mut app);
+        let hit = app.hit.panels[0];
+        let long_x = hit.long_x.expect("the long listing has columns here");
+        let order = |app: &App| (app.panels[0].sort, app.panels[0].reverse);
+        let before = order(&app);
+        click(&mut app, long_x + 1, hit.header_y);
+        assert_eq!(order(&app), before);
+        click(&mut app, hit.time_x + 2, hit.header_y);
+        assert_eq!(order(&app).0, SortBy::Time, "the time's heading still does");
     }
 
     #[test]

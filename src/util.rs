@@ -34,6 +34,36 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+/// A unix mode as `ls -l` writes it: the type (`d` folder, `l` link, `-` file; `c`, `b`,
+/// `p`, `s` for devices, pipes and sockets), then read, write and run for the owner, the group
+/// and others. Setuid and setgid show as `s` and the sticky bit as `t` in place of the run
+/// bit, capital where that is off.
+pub fn mode_text(mode: u32) -> String {
+    let kind = match mode & 0o170000 {
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o020000 => 'c',
+        0o060000 => 'b',
+        0o010000 => 'p',
+        0o140000 => 's',
+        _ => '-',
+    };
+    let mut out = String::with_capacity(10);
+    out.push(kind);
+    for (shift, special, mark) in [(6, 0o4000, 's'), (3, 0o2000, 's'), (0, 0o1000, 't')] {
+        let bits = (mode >> shift) & 7;
+        out.push(if bits & 4 != 0 { 'r' } else { '-' });
+        out.push(if bits & 2 != 0 { 'w' } else { '-' });
+        out.push(match (mode & special != 0, bits & 1 != 0) {
+            (true, true) => mark,
+            (true, false) => mark.to_ascii_uppercase(),
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
+    }
+    out
+}
+
 /// Short human-readable size such as `3.4M` or `67G`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
@@ -869,6 +899,19 @@ mod tests {
         let (none, fresh) = (tmp.path().join("nothing"), tmp.path().join("fresh"));
         carry_over(&none, &fresh).unwrap();
         assert!(!fresh.exists(), "no rmc before: nothing is made");
+    }
+
+    #[test]
+    fn modes_as_ls_writes_them() {
+        assert_eq!(mode_text(0o100644), "-rw-r--r--");
+        assert_eq!(mode_text(0o040755), "drwxr-xr-x");
+        assert_eq!(mode_text(0o120777), "lrwxrwxrwx");
+        assert_eq!(mode_text(0o010600), "prw-------");
+        assert_eq!(mode_text(0o104755), "-rwsr-xr-x", "setuid on a program");
+        assert_eq!(mode_text(0o102644), "-rw-r-Sr--", "setgid without the run bit");
+        assert_eq!(mode_text(0o041777), "drwxrwxrwt", "/tmp");
+        assert_eq!(mode_text(0o041770), "drwxrwx--T");
+        assert_eq!(mode_text(0o644), "-rw-r--r--", "a server that leaves the type out");
     }
 
     #[test]

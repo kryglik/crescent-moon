@@ -376,7 +376,8 @@ impl App {
         let show_hidden = config.settings.show_hidden;
         crate::panel::NATURAL_SORT.store(config.settings.natural_sort, Ordering::Relaxed);
         let mut history = History::load(config.history_file.clone());
-        let panels = [Panel::new(left, show_hidden), Panel::new(right, show_hidden)];
+        let long = [config.settings.long_listing_left, config.settings.long_listing_right];
+        let panels = [Panel::with_listing(left, show_hidden, long[0]), Panel::with_listing(right, show_hidden, long[1])];
         history.visit(&panels[1].cwd);
         history.visit(&panels[0].cwd);
         let wanted = &config.settings.scheme;
@@ -843,6 +844,7 @@ impl App {
                 self.tab_index.swap(0, 1);
             }
             KeyCode::Char('t') if ctrl && !alt => self.new_tab(),
+            KeyCode::Char('t') if alt && !ctrl => self.toggle_long_listing(),
             KeyCode::Char('w') if ctrl && !alt && cmd_empty => self.close_tab(),
             KeyCode::Char(c @ '1'..='9') if alt && !ctrl => self.switch_tab(self.active, c as usize - '1' as usize),
             KeyCode::Char('o') if ctrl && !alt => self.show_shell(),
@@ -3455,6 +3457,24 @@ impl App {
         }
     }
 
+    /// Alt+T: the active side's long listing on or off (permissions, owner, group and
+    /// attributes beside the name), for its tabs too, and kept in the settings. Owners are read
+    /// only for the long listing, so turning it on reads the folders again.
+    fn toggle_long_listing(&mut self) {
+        let side = self.active;
+        let long = !self.panels[side].long;
+        for panel in std::iter::once(&mut self.panels[side]).chain(self.tabs[side].iter_mut()) {
+            panel.long = long;
+            if long {
+                panel.reload();
+            }
+        }
+        let mut settings = self.config.settings.clone();
+        if side == 0 { settings.long_listing_left = long } else { settings.long_listing_right = long }
+        self.apply_settings(settings);
+        self.notice = Some(if long { "Long listing: permissions, owner, group, attributes (Alt+T again: off)" } else { "Long listing off" }.into());
+    }
+
     fn insert_current_name(&mut self) {
         let Some(entry) = self.active_panel().current().filter(|e| !e.is_parent) else { return };
         let name = &entry.name;
@@ -3714,6 +3734,29 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         with_mods(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Alt+T: the active side's long listing on and off, its tabs with it, the other side as
+    /// it was, and the settings keep it.
+    #[test]
+    fn alt_t_switches_one_sides_long_listing() {
+        let tmp = TempDir::new("app-long");
+        tmp.file("a.txt", "a");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.on_key(ctrl('t'));
+        let alt_t = with_mods(KeyCode::Char('t'), KeyModifiers::ALT);
+        app.on_key(alt_t);
+        assert!(app.panels[0].long && app.tabs[0].iter().all(|tab| tab.long), "the side and its tabs");
+        assert!(!app.panels[1].long);
+        assert!(app.config.settings.long_listing_left && !app.config.settings.long_listing_right);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("owner")), "{:?}", app.notice);
+        app.on_key(alt_t);
+        assert!(!app.panels[0].long && !app.config.settings.long_listing_left);
+        // A new start takes each side's from the settings.
+        let mut config = config(None);
+        config.settings.long_listing_right = true;
+        let app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        assert!(!app.panels[0].long && app.panels[1].long);
     }
 
     /// A file another program creates shows up in the panel by itself, with the cursor and

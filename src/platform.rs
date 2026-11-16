@@ -304,6 +304,151 @@ pub fn is_executable(name: &str, _meta: Option<&Metadata>) -> bool {
     matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1")
 }
 
+/// What the long listing shows of an entry here (`own`: its metadata, a link not followed).
+/// Windows has attributes and an owner; no mode, and no group worth showing. The owner costs
+/// a look at the file's security, so it is read only for the long listing.
+#[cfg(windows)]
+pub fn details(path: &Path, own: Option<&Metadata>, long: bool) -> crate::panel::Details {
+    use std::os::windows::fs::MetadataExt;
+    crate::panel::Details {
+        mode: None,
+        owner: if long { win::owner_name(path) } else { None },
+        group: None,
+        attributes: own.map(|m| m.file_attributes()),
+    }
+}
+
+/// The attributes column: Windows' letters in `attrib`'s order (R read-only, H hidden,
+/// S system, A archive), then C compressed, E encrypted and O online-only (a file kept in the
+/// cloud until it is opened, as OneDrive does).
+#[cfg(windows)]
+pub fn attributes_text(attributes: u32) -> String {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+        FILE_ATTRIBUTE_SYSTEM,
+    };
+    let letters = [
+        (FILE_ATTRIBUTE_READONLY, 'R'),
+        (FILE_ATTRIBUTE_HIDDEN, 'H'),
+        (FILE_ATTRIBUTE_SYSTEM, 'S'),
+        (FILE_ATTRIBUTE_ARCHIVE, 'A'),
+        (FILE_ATTRIBUTE_COMPRESSED, 'C'),
+        (FILE_ATTRIBUTE_ENCRYPTED, 'E'),
+        (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, 'O'),
+    ];
+    letters.iter().filter(|(bits, _)| attributes & bits != 0).map(|(_, letter)| *letter).collect()
+}
+
+/// What the long listing shows of an entry here: the mode always (it comes with the
+/// metadata), owner and group by name only for the long listing, and on macOS its flags.
+#[cfg(unix)]
+pub fn details(_path: &Path, own: Option<&Metadata>, long: bool) -> crate::panel::Details {
+    use std::os::unix::fs::MetadataExt;
+    let Some(meta) = own else { return crate::panel::Details::default() };
+    crate::panel::Details {
+        mode: Some(meta.mode()),
+        owner: long.then(|| user_name(meta.uid())),
+        group: long.then(|| group_name(meta.gid())),
+        #[cfg(target_os = "macos")]
+        attributes: Some(std::os::macos::fs::MetadataExt::st_flags(meta)),
+        #[cfg(not(target_os = "macos"))]
+        attributes: None,
+    }
+}
+
+/// The attributes column on macOS, from its file flags: L locked (`uchg` or `schg`), A
+/// append-only, H hidden from Finder, C compressed, O online-only (iCloud keeps the data).
+#[cfg(target_os = "macos")]
+pub fn attributes_text(flags: u32) -> String {
+    const UF_IMMUTABLE: u32 = 0x2;
+    const UF_APPEND: u32 = 0x4;
+    const UF_COMPRESSED: u32 = 0x20;
+    const UF_HIDDEN: u32 = 0x8000;
+    const SF_IMMUTABLE: u32 = 0x2_0000;
+    const SF_APPEND: u32 = 0x4_0000;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    let letters = [
+        (UF_IMMUTABLE | SF_IMMUTABLE, 'L'),
+        (UF_APPEND | SF_APPEND, 'A'),
+        (UF_HIDDEN, 'H'),
+        (UF_COMPRESSED, 'C'),
+        (SF_DATALESS, 'O'),
+    ];
+    letters.iter().filter(|(bits, _)| flags & bits != 0).map(|(_, letter)| *letter).collect()
+}
+
+/// Linux keeps no attributes the listing reads (lsattr's cost a call per file).
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn attributes_text(_flags: u32) -> String {
+    String::new()
+}
+
+/// A user's name by number, as `ls -l` shows it, or the number where it has none. Each is
+/// looked up once: the system's list of users may be far away (LDAP).
+#[cfg(unix)]
+pub fn user_name(uid: u32) -> String {
+    static NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, String>>> =
+        std::sync::LazyLock::new(Default::default);
+    remembered(&NAMES, uid, |uid| {
+        looked_up(|buf| unsafe {
+            let mut entry: libc::passwd = std::mem::zeroed();
+            let mut found = std::ptr::null_mut();
+            let status = libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found);
+            // The name lives in `buf`: copied out while that is there.
+            let name = (status == 0 && !found.is_null()).then(|| std::ffi::CStr::from_ptr(entry.pw_name).to_string_lossy().into_owned());
+            (status, name)
+        })
+    })
+}
+
+/// A group's name by number, as `user_name`.
+#[cfg(unix)]
+pub fn group_name(gid: u32) -> String {
+    static NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, String>>> =
+        std::sync::LazyLock::new(Default::default);
+    remembered(&NAMES, gid, |gid| {
+        looked_up(|buf| unsafe {
+            let mut entry: libc::group = std::mem::zeroed();
+            let mut found = std::ptr::null_mut();
+            let status = libc::getgrgid_r(gid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found);
+            let name = (status == 0 && !found.is_null()).then(|| std::ffi::CStr::from_ptr(entry.gr_name).to_string_lossy().into_owned());
+            (status, name)
+        })
+    })
+}
+
+#[cfg(unix)]
+fn remembered(
+    names: &std::sync::Mutex<std::collections::HashMap<u32, String>>,
+    id: u32,
+    look_up: impl FnOnce(u32) -> Option<String>,
+) -> String {
+    if let Some(name) = names.lock().ok().and_then(|names| names.get(&id).cloned()) {
+        return name;
+    }
+    let name = look_up(id).unwrap_or_else(|| id.to_string());
+    if let Ok(mut names) = names.lock() {
+        names.insert(id, name.clone());
+    }
+    name
+}
+
+/// Runs a `get*_r` look-up, which says its status and the name it found, with a buffer that
+/// grows while it is too small.
+#[cfg(unix)]
+fn looked_up(mut call: impl FnMut(&mut [libc::c_char]) -> (libc::c_int, Option<String>)) -> Option<String> {
+    let mut buf: Vec<libc::c_char> = vec![0; 1024];
+    loop {
+        let (status, name) = call(&mut buf);
+        if status == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return name;
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::ffi::OsStr;
@@ -706,6 +851,75 @@ mod win {
         let account = String::from_utf16_lossy(&account[..account_len as usize]);
         let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
         Some(if domain.is_empty() { account } else { format!("{domain}\\{account}") })
+    }
+
+    /// The owner of a file by account name alone (`anna`, `Administrators`, `SYSTEM`,
+    /// `TrustedInstaller`), for the long listing; an account Windows can't name (from another
+    /// computer, deleted) as its SID. Each account is looked up once: a folder has many files
+    /// and few owners, and a look-up may ask the domain.
+    pub fn owner_name(path: &Path) -> Option<String> {
+        use std::collections::HashMap;
+        use std::sync::{LazyLock, Mutex};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{GetLengthSid, IsValidSid, OWNER_SECURITY_INFORMATION};
+        static NAMES: LazyLock<Mutex<HashMap<Vec<u8>, String>>> = LazyLock::new(Default::default);
+        let wide = long_wide(path);
+        let (mut sid, mut descriptor) = (null_mut(), null_mut());
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut sid,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let name = (!sid.is_null() && unsafe { IsValidSid(sid) } != 0).then(|| {
+            let key = unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) }.to_vec();
+            if let Some(name) = NAMES.lock().ok().and_then(|names| names.get(&key).cloned()) {
+                return Some(name);
+            }
+            let name = account_name(sid).or_else(|| sid_text(sid))?;
+            if let Ok(mut names) = NAMES.lock() {
+                names.insert(key, name.clone());
+            }
+            Some(name)
+        });
+        unsafe { LocalFree(descriptor) };
+        name.flatten()
+    }
+
+    /// The account a SID stands for, without its domain.
+    fn account_name(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+        use windows_sys::Win32::Security::LookupAccountSidW;
+        let (mut account, mut account_len) = ([0u16; 256], 256u32);
+        let (mut domain, mut domain_len) = ([0u16; 256], 256u32);
+        let mut kind = 0;
+        let ok = unsafe {
+            LookupAccountSidW(null(), sid, account.as_mut_ptr(), &mut account_len, domain.as_mut_ptr(), &mut domain_len, &mut kind)
+        };
+        (ok != 0).then(|| String::from_utf16_lossy(&account[..account_len as usize]))
+    }
+
+    /// A SID as text: `S-1-5-21-…`.
+    fn sid_text(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        let mut text = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return None;
+        }
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        unsafe { LocalFree(text as _) };
+        Some(out)
     }
 
     /// Opens a file in its associated Windows application.

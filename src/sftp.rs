@@ -143,6 +143,9 @@ impl Attrs {
 pub struct Name {
     pub name: String,
     pub attrs: Attrs,
+    /// The entry as `ls -l` shows it, which the server sends for people to read: the only
+    /// place SFTP version 3 names the owner and group.
+    pub long_name: String,
 }
 
 /// Free and total bytes of a disk, and a number that is the same all over that disk.
@@ -585,11 +588,10 @@ impl Sftp {
             let mut fields = reply.fields();
             for _ in 0..fields.u32()? {
                 let name = String::from_utf8_lossy(fields.bytes()?).into_owned();
-                // As `ls -l` shows it, for people.
-                fields.bytes()?;
+                let long_name = String::from_utf8_lossy(fields.bytes()?).into_owned();
                 let attrs = fields.attrs()?;
                 if name != "." && name != ".." {
-                    names.push(Name { name, attrs });
+                    names.push(Name { name, attrs, long_name });
                 }
             }
         }

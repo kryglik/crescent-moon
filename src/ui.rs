@@ -358,16 +358,21 @@ fn draw_panel(
     let details = inner.width >= 34;
     let (size_w, time_w) = (7usize, 12usize);
     let name_w = if details { inner_w - size_w - time_w - 2 } else { inner_w };
+    // Alt+T: the long listing's columns after those, as many as leave the name its room.
+    let long = if details && panel.long { long_columns(&panel.entries, name_w) } else { Vec::new() };
+    let name_w = name_w - long.iter().map(|column| column.width + 1).sum::<usize>();
     // In a repository the name column's last place holds each file's git mark.
     let mark_w = usize::from(repo.is_some() && git.enabled() && name_w > 8);
     let size_x = inner.x + name_w as u16 + 1;
     let time_x = size_x + size_w as u16 + 1;
+    let long_x = time_x + time_w as u16 + 1;
     let hit = PanelHit {
         area,
         list: Rect::new(inner.x, top + 1, inner.width, list_h as u16),
         header_y: top,
         size_x,
         time_x,
+        long_x: (!long.is_empty()).then_some(long_x),
         details,
     };
 
@@ -385,6 +390,12 @@ fn draw_panel(
         buf.set_string(time_x - 1, top, "│", frame);
         let time = title("Modify time", panel.sort == SortBy::Time);
         buf.set_string(time_x, top, util::center(&time, time_w), heading);
+        let mut x = long_x;
+        for column in &long {
+            buf.set_string(x - 1, top, "│", frame);
+            buf.set_string(x, top, util::center(column.kind.heading(), column.width), heading);
+            x += column.width as u16 + 1;
+        }
     }
 
     let now = SystemTime::now();
@@ -423,6 +434,13 @@ fn draw_panel(
             buf.set_string(size_x, y, util::pad_left(&size, size_w), style);
             buf.set_string(time_x - 1, y, "│", separator);
             buf.set_string(time_x, y, util::fit(&time, time_w), style);
+            let mut x = long_x;
+            for column in &long {
+                buf.set_string(x - 1, y, "│", separator);
+                let text = entry.map(|e| column.kind.text(e)).unwrap_or_default();
+                buf.set_string(x, y, util::fit(&text, column.width), style);
+                x += column.width as u16 + 1;
+            }
         }
     }
 
@@ -643,6 +661,87 @@ fn shell_cell_style(cell: &vt100::Cell) -> Style {
         }
     }
     style
+}
+
+/// A column of the long listing (Alt+T).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Long {
+    Mode,
+    Owner,
+    Group,
+    Attributes,
+}
+
+impl Long {
+    fn heading(self) -> &'static str {
+        match self {
+            Long::Mode => "Permission",
+            Long::Owner => "Owner",
+            Long::Group => "Group",
+            Long::Attributes => "Attr",
+        }
+    }
+
+    fn text(self, entry: &Entry) -> String {
+        let details = &entry.details;
+        match self {
+            Long::Mode => details.mode.map(util::mode_text).unwrap_or_default(),
+            Long::Owner => details.owner.clone().unwrap_or_default(),
+            Long::Group => details.group.clone().unwrap_or_default(),
+            Long::Attributes => details.attributes.map(crate::platform::attributes_text).unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LongColumn {
+    kind: Long,
+    width: usize,
+}
+
+/// The name keeps at least this many places; the long listing's columns give way to it.
+const NAME_LEAST: usize = 16;
+
+/// The long listing's columns, in the order they show (permissions, owner, group,
+/// attributes): those some entry has, as many as leave the name `NAME_LEAST` places out of
+/// `name_w`. Where they don't all fit, the group goes first, then the attributes, the owner.
+fn long_columns(entries: &[Entry], name_w: usize) -> Vec<LongColumn> {
+    let entries: Vec<&Entry> = entries.iter().filter(|e| !e.is_parent).collect();
+    let widest = |kind: Long, least: usize, most: usize| {
+        entries.iter().map(|e| util::width(&kind.text(e))).max().unwrap_or(0).clamp(least, most)
+    };
+    let has = |kind: Long| {
+        entries.iter().any(|e| match kind {
+            Long::Mode => e.details.mode.is_some(),
+            Long::Owner => e.details.owner.is_some(),
+            Long::Group => e.details.group.is_some(),
+            Long::Attributes => e.details.attributes.is_some(),
+        })
+    };
+    let mut room = name_w.saturating_sub(NAME_LEAST);
+    let mut kept = Vec::new();
+    for kind in [Long::Mode, Long::Owner, Long::Attributes, Long::Group] {
+        if !has(kind) {
+            continue;
+        }
+        let width = match kind {
+            Long::Mode => 10,
+            // As wide as the longest name there, up to Windows' TrustedInstaller.
+            Long::Owner | Long::Group => widest(kind, 5, 16),
+            Long::Attributes => widest(kind, 4, 7),
+        };
+        if width + 1 <= room {
+            room -= width + 1;
+            kept.push(LongColumn { kind, width });
+        }
+    }
+    kept.sort_by_key(|column| match column.kind {
+        Long::Mode => 0,
+        Long::Owner => 1,
+        Long::Group => 2,
+        Long::Attributes => 3,
+    });
+    kept
 }
 
 /// mc's type markers: `/` directory, `~` link to a directory, `@` link, `*` executable.
@@ -1456,6 +1555,57 @@ mod tests {
 
     fn app_for(tmp: &TempDir) -> App {
         App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), crate::testutil::config())
+    }
+
+    /// Alt+T's long listing: permissions, owner, group and attributes after the time, each
+    /// only where an entry has it, and only in the panel that has it on. On a narrow panel they
+    /// give way to the name: the group first, then the attributes and the owner.
+    #[test]
+    fn the_long_listing_shows_permissions_owner_group_and_attributes() {
+        use crate::panel::Details;
+        let tmp = TempDir::new("ui-long");
+        tmp.file("run.sh", "x");
+        tmp.file("notes.txt", "x");
+        let mut app = app_for(&tmp);
+        let panel = &mut app.panels[0];
+        panel.long = true;
+        for entry in panel.entries.iter_mut().filter(|e| !e.is_parent) {
+            entry.details = if entry.name == "run.sh" {
+                Details { mode: Some(0o104755), owner: Some("root".into()), group: Some("wheel".into()), attributes: None }
+            } else {
+                Details { mode: Some(0o100640), owner: Some("me".into()), group: Some("staff".into()), attributes: None }
+            };
+        }
+        let screen = render(&mut app, 200, 12);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        let line = |text: &str| screen.lines().find(|l| l.contains(text)).unwrap_or_default().to_string();
+        let header = line("Modify time");
+        assert_eq!(header.matches("Permission").count(), 1, "the left panel only:\n{screen}");
+        assert!(header.contains("Owner") && header.contains("Group"), "{screen}");
+        assert!(!header.contains("Attr"), "no entry has attributes:\n{screen}");
+        let run = line("run.sh");
+        assert!(run.contains("-rwsr-xr-x") && run.contains("root") && run.contains("wheel"), "{screen}");
+        let notes = line("notes.txt");
+        assert!(notes.contains("-rw-r-----") && notes.contains("│me ") && notes.contains("staff"), "{screen}");
+
+        // A panel of 53 places keeps 16 for the name: the permissions fit, the rest doesn't.
+        let screen = render(&mut app, 110, 12);
+        let header = screen.lines().find(|l| l.contains("Modify time")).unwrap_or_default().to_string();
+        assert!(header.contains("Permission") && !header.contains("Owner") && !header.contains("Group"), "{screen}");
+
+        // Windows' attributes, in attrib's letters.
+        #[cfg(windows)]
+        {
+            for entry in app.panels[0].entries.iter_mut().filter(|e| !e.is_parent) {
+                entry.details = Details { mode: None, owner: Some("me".into()), group: None, attributes: Some(0x23) };
+            }
+            let screen = render(&mut app, 200, 12);
+            let header = screen.lines().find(|l| l.contains("Modify time")).unwrap_or_default().to_string();
+            assert!(header.contains("Attr") && header.contains("Owner") && !header.contains("Permission"), "{screen}");
+            assert!(screen.lines().find(|l| l.contains("run.sh")).is_some_and(|l| l.contains("RHA")), "{screen}");
+        }
     }
 
     /// The command line starts with user@host, as bash's prompt does, in its own colour; `#`
