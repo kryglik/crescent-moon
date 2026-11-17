@@ -180,7 +180,8 @@ pub enum Dialog {
     Places { root: PathBuf, id: String, places: Vec<Place>, cursor: usize },
     /// Alt+A: what to set for each of `platform::ATTRIBUTES` on `paths`; None leaves it as each
     /// file has it (they differ).
-    Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize },
+    /// `about`: what it is, for one file (see `platform::describe`).
+    Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize, about: Vec<(&'static str, String)> },
     Help { scroll: usize },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },

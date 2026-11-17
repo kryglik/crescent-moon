@@ -304,6 +304,36 @@ impl Panel {
         }
     }
 
+    /// A tab in the background, put back from the last session: nothing is read until it is
+    /// shown (`reload`), and then the cursor goes to `cursor`.
+    pub fn unread(dir: &Path, show_hidden: bool, long: bool, sort: SortBy, reverse: bool, cursor: Option<String>) -> Panel {
+        let mut panel = Panel::blank(show_hidden);
+        panel.cwd = util::normalize(dir);
+        (panel.long, panel.sort, panel.reverse, panel.cursor_to) = (long, sort, reverse, cursor);
+        panel
+    }
+
+    /// The order, as F9 sets it, for what is listed and what is read from now on.
+    pub fn set_order(&mut self, sort: SortBy, reverse: bool) {
+        (self.sort, self.reverse) = (sort, reverse);
+        self.resort();
+    }
+
+    /// The name to put the cursor on when this folder is opened again: the one under it, or
+    /// in a zip the zip itself; none for another computer.
+    pub fn name_to_come_back_to(&self) -> Option<String> {
+        if self.remote.is_some() {
+            return None;
+        }
+        if let Some(mut view) = self.archive.as_ref() {
+            while let Some(outer) = view.outer.as_deref() {
+                view = outer;
+            }
+            return view.shown.file_name().map(|name| name.to_string_lossy().into_owned());
+        }
+        self.current().filter(|entry| !entry.is_parent).map(|entry| entry.name.clone())
+    }
+
     /// A new tab of this panel: the same folder, order, filter and memory of drives.
     pub fn new_tab(&self) -> Panel {
         let mut tab = Panel::blank(self.show_hidden);

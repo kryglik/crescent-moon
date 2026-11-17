@@ -25,6 +25,7 @@ mod reading;
 #[cfg(test)]
 mod sandbox_tests;
 mod scheme;
+mod session;
 mod settings;
 mod sftp;
 mod sizes;
@@ -192,8 +193,14 @@ fn main() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dirs: Vec<PathBuf> = args.dirs.iter().map(|d| util::resolve(&cwd, &d.to_string_lossy())).collect();
     let cwd_file = args.cwd_file.as_ref().map(|file| cwd.join(file));
-    let left = dirs.first().cloned().unwrap_or_else(|| cwd.clone());
-    let right = dirs.get(1).cloned().unwrap_or_else(|| left.clone());
+    let config = Config::load();
+    // Started without folders: where the panels were when cm last closed, if that is kept.
+    let session = (dirs.is_empty() && config.settings.reopen_last)
+        .then(|| config.session_file.as_deref().and_then(session::Session::load))
+        .flatten();
+    let shown = |side: usize| session.as_ref().map(|session| session.shown(side).dir.clone());
+    let left = dirs.first().cloned().or_else(|| shown(0)).unwrap_or_else(|| cwd.clone());
+    let right = dirs.get(1).cloned().or_else(|| shown(1)).unwrap_or_else(|| left.clone());
     // A Windows process holds its working folder: as long as cm runs, the folder it was
     // started in couldn't be moved or deleted, even from cm. Nothing here depends on it:
     // every path is absolute, and programs are started in the panel's folder.
@@ -203,7 +210,10 @@ fn main() -> ExitCode {
     }
     util::sweep_temp();
     util::carry_over_settings();
-    let mut app = App::new(left, right, Config::load());
+    let mut app = App::new(left, right, config);
+    if let Some(session) = &session {
+        app.restore(session);
+    }
     app.mouse &= args.mouse;
     app.mouse_allowed = args.mouse;
 
@@ -231,6 +241,7 @@ fn main() -> ExitCode {
     ratatui::restore();
     title.restore();
     app.save_history();
+    app.save_session();
     // Files taken out of archives to be viewed (one still open in an app stays).
     util::remove_session_dir();
 

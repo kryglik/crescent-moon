@@ -142,25 +142,75 @@ pub fn admin_can_reach(_path: &Path) -> bool {
     false
 }
 
+/// One of Alt+A's rows: its letter in the long listing's Attr column (' ' for none), what it
+/// means, and its bit in what `attributes` returns.
+#[derive(Clone, Copy)]
+pub struct Attribute {
+    pub letter: char,
+    pub label: &'static str,
+    pub bit: u32,
+}
+
+const fn row(letter: char, label: &'static str, bit: u32) -> Attribute {
+    Attribute { letter, label, bit }
+}
+
 /// What Alt+A sets: Windows' attributes.
 #[cfg(windows)]
-pub const ATTRIBUTES: &[(&str, u32)] = &[("Read-only", 0x1), ("Hidden", 0x2), ("System", 0x4), ("Archive", 0x20)];
-
-/// What Alt+A sets: the permission bits, as mc's chmod.
-#[cfg(not(windows))]
-pub const ATTRIBUTES: &[(&str, u32)] = &[
-    ("Owner may read", 0o400),
-    ("Owner may write", 0o200),
-    ("Owner may run", 0o100),
-    ("Group may read", 0o40),
-    ("Group may write", 0o20),
-    ("Group may run", 0o10),
-    ("Others may read", 0o4),
-    ("Others may write", 0o2),
-    ("Others may run", 0o1),
+pub const ATTRIBUTES: &[Attribute] = &[
+    row('R', "Read-only", 0x1),
+    row('H', "Hidden", 0x2),
+    row('S', "System: Windows' own", 0x4),
+    row('A', "Archive: changed since the last backup", 0x20),
 ];
 
-/// A file's attributes (Windows) or permission bits (elsewhere), as `ATTRIBUTES` counts them.
+/// What Alt+A sets: the permission bits, as mc's chmod, and the special ones.
+#[cfg(not(windows))]
+const PERMISSIONS: [Attribute; 12] = [
+    row(' ', "Owner may read", 0o400),
+    row(' ', "Owner may write", 0o200),
+    row(' ', "Owner may run", 0o100),
+    row(' ', "Group may read", 0o40),
+    row(' ', "Group may write", 0o20),
+    row(' ', "Group may run", 0o10),
+    row(' ', "Others may read", 0o4),
+    row(' ', "Others may write", 0o2),
+    row(' ', "Others may run", 0o1),
+    row(' ', "Runs as its owner (setuid)", 0o4000),
+    row(' ', "Runs as its group; a folder's group goes on (setgid)", 0o2000),
+    row(' ', "Sticky: in a folder only owners delete (sticky)", 0o1000),
+];
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const ATTRIBUTES: &[Attribute] = &PERMISSIONS;
+
+/// On macOS also two of its flags, as Finder sets them (`chflags hidden`, `chflags uchg`), in
+/// bits of their own above the mode's.
+#[cfg(target_os = "macos")]
+pub const ATTRIBUTES: &[Attribute] = &{
+    let mut rows = [row(' ', "", 0); 14];
+    let mut i = 0;
+    while i < 12 {
+        rows[i] = PERMISSIONS[i];
+        i += 1;
+    }
+    rows[12] = row('H', "Hidden from Finder (chflags hidden)", MAC_HIDDEN);
+    rows[13] = row('L', "Locked: no change at all (chflags uchg)", MAC_LOCKED);
+    rows
+};
+
+/// Where `attributes` puts macOS's hidden and locked flags, above the mode's twelve bits.
+#[cfg(target_os = "macos")]
+const MAC_HIDDEN: u32 = 1 << 16;
+#[cfg(target_os = "macos")]
+const MAC_LOCKED: u32 = 1 << 17;
+#[cfg(target_os = "macos")]
+const UF_HIDDEN: u32 = 0x8000;
+#[cfg(target_os = "macos")]
+const UF_IMMUTABLE: u32 = 0x2;
+
+/// A file's attributes (Windows) or permission bits (elsewhere; on macOS with its hidden
+/// and locked flags), as `ATTRIBUTES` counts them.
 #[cfg(windows)]
 pub fn attributes(path: &Path) -> std::io::Result<u32> {
     use std::os::windows::fs::MetadataExt;
@@ -171,7 +221,17 @@ pub fn attributes(path: &Path) -> std::io::Result<u32> {
 #[cfg(not(windows))]
 pub fn attributes(path: &Path) -> std::io::Result<u32> {
     use std::os::unix::fs::PermissionsExt;
-    Ok(std::fs::metadata(path)?.permissions().mode())
+    let meta = std::fs::metadata(path)?;
+    let mode = meta.permissions().mode() & 0o7777;
+    #[cfg(target_os = "macos")]
+    {
+        let flags = std::os::macos::fs::MetadataExt::st_flags(&meta);
+        let hidden = if flags & UF_HIDDEN != 0 { MAC_HIDDEN } else { 0 };
+        let locked = if flags & UF_IMMUTABLE != 0 { MAC_LOCKED } else { 0 };
+        return Ok(mode | hidden | locked);
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(mode)
 }
 
 /// Sets what `attributes` returned, changed. Only the bits in `ATTRIBUTES` (and on Windows
@@ -203,10 +263,130 @@ pub fn set_attributes(path: &Path, value: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn set_attributes(path: &Path, value: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(value & 0o7777))
+}
+
+/// macOS: the mode, and the hidden and locked flags with the others as they are. A locked
+/// file takes no change, its mode neither: it is unlocked first, and locked again last if
+/// it is to stay so.
+#[cfg(target_os = "macos")]
+pub fn set_attributes(path: &Path, value: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)?;
+    let old = std::os::macos::fs::MetadataExt::st_flags(&meta);
+    let flag = |on: bool, bit: u32, flags: u32| if on { flags | bit } else { flags & !bit };
+    let flags = flag(value & MAC_LOCKED != 0, UF_IMMUTABLE, flag(value & MAC_HIDDEN != 0, UF_HIDDEN, old));
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let set_flags = |flags: u32| {
+        if unsafe { libc::chflags(name.as_ptr(), flags as _) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    let mode_changes = meta.permissions().mode() & 0o7777 != value & 0o7777;
+    if old & UF_IMMUTABLE != 0 && (mode_changes || flags & UF_IMMUTABLE == 0) {
+        set_flags(old & !UF_IMMUTABLE)?;
+    }
+    if mode_changes {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(value & 0o7777))?;
+    }
+    if flags != std::os::macos::fs::MetadataExt::st_flags(&std::fs::metadata(path)?) {
+        set_flags(flags)?;
+    }
+    Ok(())
+}
+
+/// What Alt+A tells of one file above its switches: what it is (and its size, or where a link
+/// leads), when it changed, who owns it, its permissions as a number too, and every attribute
+/// or flag it has in words, also those Alt+A can't set.
+pub fn describe(path: &Path) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let own = crate::lfs::symlink_metadata(path).ok();
+    let meta = crate::lfs::metadata(path).ok().or_else(|| own.clone());
+    let kind = match (&own, &meta) {
+        (Some(own), _) if own.file_type().is_symlink() => {
+            let target = crate::lfs::read_link(path).map(|t| t.display().to_string()).unwrap_or_default();
+            format!("link to {}", target.strip_prefix(r"\\?\").unwrap_or(&target))
+        }
+        (_, Some(meta)) if meta.is_dir() => "folder".to_string(),
+        (_, Some(meta)) => format!("file, {} bytes", util::thousands(meta.len())),
+        _ => "not there any more".to_string(),
+    };
+    out.push(("What", kind));
+    if let Some(time) = meta.as_ref().and_then(|m| m.modified().ok()) {
+        out.push(("Modified", chrono::DateTime::<chrono::Local>::from(time).format("%Y-%m-%d %H:%M:%S").to_string()));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(owner) = win::owner_name(path) {
+            out.push(("Owner", owner));
+        }
+        if let Some(attributes) = own.as_ref().map(std::os::windows::fs::MetadataExt::file_attributes) {
+            out.push(("Attributes", windows_attribute_words(attributes)));
+        }
+    }
+    #[cfg(unix)]
+    if let Some(own) = &own {
+        use std::os::unix::fs::MetadataExt;
+        let (uid, gid) = (own.uid(), own.gid());
+        out.push(("Owner", format!("{} ({uid}), group {} ({gid})", user_name(uid), group_name(gid))));
+        let mode = meta.as_ref().map_or(own.mode(), |m| m.mode());
+        out.push(("Permissions", format!("{} ({:04o})", util::mode_text(mode), mode & 0o7777)));
+        #[cfg(target_os = "macos")]
+        out.push(("Flags", mac_flag_words(std::os::macos::fs::MetadataExt::st_flags(own))));
+    }
+    out
+}
+
+/// Every attribute a Windows file has, in words, "none" for none.
+#[cfg(windows)]
+fn windows_attribute_words(attributes: u32) -> String {
+    const WORDS: [(u32, &str); 13] = [
+        (0x1, "read-only"),
+        (0x2, "hidden"),
+        (0x4, "system"),
+        (0x20, "archive"),
+        (0x100, "temporary"),
+        (0x200, "sparse"),
+        (0x400, "a link or junction (reparse point)"),
+        (0x800, "compressed"),
+        (0x1000, "offline"),
+        (0x2000, "not indexed for search"),
+        (0x4000, "encrypted"),
+        (0x8_0000, "always kept on this device"),
+        (0x40_0000 | 0x4_0000, "online-only: in the cloud until opened"),
+    ];
+    words(attributes, &WORDS)
+}
+
+/// Every flag a macOS file has, in words (as `ls -lO` names them), "none" for none.
+#[cfg(target_os = "macos")]
+fn mac_flag_words(flags: u32) -> String {
+    const WORDS: [(u32, &str); 12] = [
+        (0x1, "nodump"),
+        (0x2, "locked (uchg)"),
+        (0x4, "append-only (uappnd)"),
+        (0x20, "compressed"),
+        (0x8000, "hidden from Finder"),
+        (0x1_0000, "archived"),
+        (0x2_0000, "locked by the system (schg)"),
+        (0x4_0000, "append-only by the system (sappnd)"),
+        (0x8_0000, "restricted: the system's own (SIP)"),
+        (0x10_0000, "can't be deleted (sunlnk)"),
+        (0x80_0000, "firmlink"),
+        (0x4000_0000, "online-only: in iCloud until opened"),
+    ];
+    words(flags, &WORDS)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn words(bits: u32, words: &[(u32, &str)]) -> String {
+    let said: Vec<&str> = words.iter().filter(|(bit, _)| bits & bit != 0).map(|(_, word)| *word).collect();
+    if said.is_empty() { "none".to_string() } else { said.join(", ") }
 }
 
 /// A process started as administrator (its Windows handle).
@@ -1390,6 +1570,30 @@ mod unix {
             #[cfg(target_os = "linux")]
             assert_eq!(mount_point(Path::new("/proc/self")), Some(PathBuf::from("/proc")));
             assert!(same_device(Path::new("/"), Path::new("/no/such/file")), "a missing path counts by its parent");
+        }
+
+        /// macOS's hidden and locked flags through Alt+A's values: set, and a locked file's mode
+        /// changed while it is unlocked, or while it stays locked.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_hidden_and_locked_flags() {
+            use super::super::{MAC_HIDDEN, MAC_LOCKED, UF_HIDDEN, UF_IMMUTABLE, attributes, set_attributes};
+            let tmp = crate::testutil::TempDir::new("mac-flags");
+            let file = tmp.file("x.txt", "x");
+            let flags = |file: &Path| std::os::macos::fs::MetadataExt::st_flags(&std::fs::metadata(file).unwrap());
+            let start = attributes(&file).unwrap();
+            assert_eq!(start & (MAC_HIDDEN | MAC_LOCKED), 0);
+            set_attributes(&file, start | MAC_HIDDEN | MAC_LOCKED).unwrap();
+            assert_eq!(flags(&file) & (UF_HIDDEN | UF_IMMUTABLE), UF_HIDDEN | UF_IMMUTABLE);
+            assert!(std::fs::write(&file, "y").is_err(), "locked: no change");
+            // Still locked, read-only for everyone.
+            let read_only = (start & !0o222) | MAC_HIDDEN | MAC_LOCKED;
+            set_attributes(&file, read_only).unwrap();
+            assert_eq!(attributes(&file).unwrap(), read_only);
+            // Unlocked and shown again, writable again.
+            set_attributes(&file, start).unwrap();
+            assert_eq!(attributes(&file).unwrap(), start);
+            assert_eq!(flags(&file) & (UF_HIDDEN | UF_IMMUTABLE), 0);
         }
 
         /// macOS: `/` and what is in /Volumes, none of the system's own volumes; /dev is a

@@ -21,6 +21,7 @@ pub fn config() -> Config {
         hotlist_file: None,
         settings_file: None,
         history_file: None,
+        session_file: None,
         schemes_dir: None,
         places_file: None,
         colours: crate::scheme::Colours::default(),

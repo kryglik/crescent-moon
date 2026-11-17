@@ -44,7 +44,7 @@ What it does differently from the Windows port of mc:
 ```powershell
 cargo test
 cargo install --path .     # puts cm.exe into ~/.cargo/bin
-cm                        # or: cm LEFT_DIR RIGHT_DIR
+cm                        # the folders and tabs of last time; or: cm LEFT_DIR RIGHT_DIR
 ```
 
 The release build links the C runtime statically (`.cargo/config.toml`), so `cm.exe` can be
@@ -144,7 +144,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | F5 / F6 / F7 | copy / move / make directory; the progress shows the speed and the time left |
 | Shift+F5 / Shift+F6 | copy / rename the item under the cursor in this folder, as in mc, whatever is marked. The name is selected, as with F2, and a name that is taken gets the usual question |
 | F8, Delete | to the Recycle Bin (Shift: permanently); see Deleting as administrator |
-| Alt+A | attributes of the marked files (or the one under the cursor): read-only, hidden, system, archive on Windows, the permission bits (rwx) on Linux. Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
+| Alt+A | attributes of the marked files (or the one under the cursor), each with the letter the long listing (Alt+T) shows for it: read-only, hidden, system, archive on Windows; elsewhere the permission bits (rwx) with setuid, setgid and sticky, and on macOS its hidden and locked flags. For one file it tells first what it is, when it changed, who owns it, its permissions as a number, and in words every attribute or flag it has, also those it can't set (compressed, encrypted, online-only…). Space toggles, Enter sets them; a row where the files differ shows [?] and is left as each has it |
 | Alt+F5 / Alt+F9 | pack into a zip / unpack the zip under the cursor (see Zip archives) |
 | Ctrl+C / Ctrl+X | the marked files (or the one under the cursor) to the clipboard, copied or cut, the way Explorer puts them there: paste them in Explorer, a mail or a chat |
 | Ctrl+Shift+C | their full paths to the clipboard as text |
@@ -441,6 +441,7 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | Git: mark changed and new files | on: in a repository `git status` runs in the background (see Git); off, only the branch shows |
 | + and - mark folders too | on: `+` and `-` take folders as well as files; off, files only, as in mc. A pattern ending in a slash (`*/`) takes folders either way |
 | user@host before the command line | on: the command line's prompt starts with who and where, as bash's: `me@nas /home/me/src>` |
+| Reopen the last folders and tabs | on: started without folders, cm opens what it had when it last closed (see below); off, both panels open the folder it is started in |
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
@@ -483,6 +484,15 @@ beside it: the last 300 folders and 500 commands.
 Ctrl+\ only works while a US-style layout is active (on the Czech layout that key is a dead
 key), hence Ctrl+D. Directory sizes don't follow links or junctions, so nothing is counted twice;
 with sizes measured, F9's size sort orders directories by them.
+
+### Reopening the last folders and tabs
+
+On the way out cm writes `session.txt` beside the settings: each side's tabs in order, with
+their folders, their order (F9) and the name under the cursor, which tab each side shows, and
+which side is active. Started without folders, it opens all that again; `cm DIR` or
+`cm LEFT RIGHT` opens those instead. The tabs behind are read when shown. A folder that has
+gone opens the nearest one that hasn't; a panel that showed another computer or a zip comes
+back on the folder here it was opened from, with the cursor on the zip.
 
 ### Staying in the last directory
 
@@ -586,6 +596,7 @@ cm shows the mono scheme.
 | `src/find.rs` | the Find search: ignore + grep crates on a background thread, cancellable |
 | `src/finder.rs` | the Find window's state: fields, results sorted by path, cursor |
 | `src/settings.rs` | `settings.ini`: loading, saving |
+| `src/session.rs` | `session.txt`: each side's tabs as cm left them, read back when it starts without folders |
 | `src/scheme.rs` | colour schemes: the parts of the screen, the built-in schemes, scheme files, fewer colours for terminals with fewer, files' kinds |
 | `src/survey.rs` | counting what a delete would remove, and checking permissions, in the background |
 | `src/admin.rs` | "As admin": starting the elevated helper (`cm --admin-job`) and the helper itself |

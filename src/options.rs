@@ -14,6 +14,7 @@ pub enum Row {
     GitStatus,
     MarkFolders,
     PromptHost,
+    ReopenLast,
     Scheme,
     BigFile,
     Editor,
@@ -22,7 +23,7 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 14] = [
+pub const ROWS: [Row; 15] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
@@ -31,6 +32,7 @@ pub const ROWS: [Row; 14] = [
     Row::GitStatus,
     Row::MarkFolders,
     Row::PromptHost,
+    Row::ReopenLast,
     Row::Scheme,
     Row::BigFile,
     Row::Editor,
@@ -50,6 +52,7 @@ impl Row {
             Row::GitStatus => "Git: mark changed and new files",
             Row::MarkFolders => "+ and - mark folders too",
             Row::PromptHost => "user@host before the command line",
+            Row::ReopenLast => "Reopen the last folders and tabs",
             Row::Scheme => "Colour scheme (Alt+C)",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
@@ -61,7 +64,7 @@ impl Row {
 
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
-        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus | Row::MarkFolders | Row::PromptHost)
+        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus | Row::MarkFolders | Row::PromptHost | Row::ReopenLast)
     }
 
     /// Picked from a list (Enter opens it) rather than typed.
@@ -79,6 +82,7 @@ impl Row {
             Row::GitStatus => settings.git_status,
             Row::MarkFolders => settings.mark_folders,
             Row::PromptHost => settings.prompt_host,
+            Row::ReopenLast => settings.reopen_last,
             _ => false,
         }
     }
@@ -93,6 +97,7 @@ impl Row {
             Row::GitStatus => settings.git_status = !settings.git_status,
             Row::MarkFolders => settings.mark_folders = !settings.mark_folders,
             Row::PromptHost => settings.prompt_host = !settings.prompt_host,
+            Row::ReopenLast => settings.reopen_last = !settings.reopen_last,
             _ => {}
         }
     }

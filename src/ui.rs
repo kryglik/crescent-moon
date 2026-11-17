@@ -1082,7 +1082,7 @@ fn draw_dialog(
         | Dialog::Schemes { .. } => {
             (None, DialogHit::default())
         }
-        Dialog::Attributes { paths, states, cursor } => (None, draw_attributes(frame, area, paths, states, *cursor, t)),
+        Dialog::Attributes { paths, states, cursor, about } => (None, draw_attributes(frame, area, paths, states, *cursor, about, t)),
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
@@ -1359,29 +1359,46 @@ fn draw_attributes(
     paths: &[std::path::PathBuf],
     states: &[Option<bool>],
     cursor: usize,
+    about: &[(&str, String)],
     t: &Scheme,
 ) -> DialogHit {
     let rows = states.len() as u16;
-    let (outer, inner) = dialog_frame(frame, area, 52, rows + 6, "Attributes", false, t);
+    // What one file is, then its switches; each with the letter the long listing shows for it.
+    let told = if about.is_empty() { 0 } else { about.len() as u16 + 1 };
+    let (outer, inner) = dialog_frame(frame, area, 64, rows + told + 6, "Attributes", false, t);
     let style = t.dialog;
+    let width = inner.width as usize;
     let what = match paths {
-        [one] => one.file_name().map_or_else(|| one.display().to_string(), |n| n.to_string_lossy().into_owned()),
+        [one] => one.display().to_string(),
         many => format!("{} items", many.len()),
     };
-    let mut lines = vec![Line::from(util::fit_left(&what, inner.width as usize)), Line::default()];
-    for (i, ((label, _), state)) in crate::platform::ATTRIBUTES.iter().zip(states).enumerate() {
+    let mut lines = vec![Line::from(util::fit_left(&what, width)), Line::default()];
+    let label_w = about.iter().map(|(label, _)| util::width(label)).max().unwrap_or(0);
+    for (label, value) in about {
+        let value = util::fit(value, width.saturating_sub(label_w + 2));
+        lines.push(Line::from(vec![
+            Span::styled(util::pad(label, label_w + 2), t.on_dialog(t.dialog_dim)),
+            Span::styled(value, style),
+        ]));
+    }
+    if told > 0 {
+        lines.push(Line::default());
+    }
+    for (i, (attribute, state)) in crate::platform::ATTRIBUTES.iter().zip(states).enumerate() {
         let mark = match state {
             Some(true) => "[x]",
             Some(false) => "[ ]",
             None => "[?]",
         };
         let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
-        lines.push(Line::from(Span::styled(util::pad(&format!("{mark} {label}"), inner.width as usize), row_style)));
+        let text = format!("{mark} {} {}", attribute.letter, attribute.label);
+        lines.push(Line::from(Span::styled(util::pad(&util::fit(&text, width), width), row_style)));
     }
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("Space toggles · Enter sets them · Esc", t.on_dialog(t.dialog_dim))).right_aligned());
     frame.render_widget(Paragraph::new(lines).style(style), inner);
-    let list = Rect::new(inner.x, inner.y + 2, inner.width, rows.min(inner.height.saturating_sub(2)));
+    let top = 2 + told;
+    let list = Rect::new(inner.x, inner.y + top, inner.width, rows.min(inner.height.saturating_sub(top)));
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
 }
 
@@ -1555,6 +1572,37 @@ mod tests {
 
     fn app_for(tmp: &TempDir) -> App {
         App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), crate::testutil::config())
+    }
+
+    /// Alt+A on one file tells what it is, when it changed, who owns it and, in words, every
+    /// attribute or flag it has; each switch shows the letter the long listing uses.
+    #[test]
+    fn alt_a_tells_about_one_file() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let tmp = TempDir::new("ui-alt-a");
+        tmp.file("notes.txt", "hello");
+        tmp.file("more.txt", "x");
+        let mut app = app_for(&tmp);
+        app.panels[0].select_name("notes.txt");
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        let screen = render(&mut app, 110, 40);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("What") && screen.contains("file, 5 bytes"), "{screen}");
+        assert!(screen.contains("Modified") && screen.contains("Owner"), "{screen}");
+        #[cfg(windows)]
+        assert!(screen.contains("Attributes") && screen.contains("archive") && screen.contains("[ ] R Read-only"), "{screen}");
+        #[cfg(unix)]
+        assert!(screen.contains("Permissions") && screen.contains("(06") && screen.contains("Owner may read"), "{screen}");
+        #[cfg(target_os = "macos")]
+        assert!(screen.contains("Flags") && screen.contains("H Hidden from Finder"), "{screen}");
+        // Two files: only the switches, as they have them in common.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.panels[0].mark_matching("*.txt", true, true);
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        let screen = render(&mut app, 110, 40);
+        assert!(!screen.contains("Modified"), "{screen}");
     }
 
     /// Alt+T's long listing: permissions, owner, group and attributes after the time, each

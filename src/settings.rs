@@ -27,6 +27,9 @@ pub struct Settings {
     pub mark_folders: bool,
     /// The command line's prompt starts with user@host, as bash's does.
     pub prompt_host: bool,
+    /// Started without folders, cm opens the folders and tabs it had when it last closed
+    /// (`session.txt` beside this file).
+    pub reopen_last: bool,
     /// Alt+T's long listing (permissions, owner, group, attributes), each side on its own.
     pub long_listing_left: bool,
     pub long_listing_right: bool,
@@ -52,6 +55,7 @@ impl Default for Settings {
             git_status: true,
             mark_folders: true,
             prompt_host: true,
+            reopen_last: true,
             long_listing_left: false,
             long_listing_right: false,
             scheme: "classic".into(),
@@ -108,6 +112,7 @@ impl Settings {
                 "git_status" => settings.git_status = flag(settings.git_status),
                 "mark_folders" => settings.mark_folders = flag(settings.mark_folders),
                 "prompt_host" => settings.prompt_host = flag(settings.prompt_host),
+                "reopen_last" => settings.reopen_last = flag(settings.reopen_last),
                 "long_listing_left" => settings.long_listing_left = flag(settings.long_listing_left),
                 "long_listing_right" => settings.long_listing_right = flag(settings.long_listing_right),
                 "scheme" if !value.is_empty() => settings.scheme = value.to_string(),
@@ -140,6 +145,7 @@ impl Settings {
              git_status = {}\n\
              mark_folders = {}\n\
              prompt_host = {}\n\
+             reopen_last = {}\n\
              long_listing_left = {}\n\
              long_listing_right = {}\n\
              scheme = {}\n\
@@ -156,6 +162,7 @@ impl Settings {
             self.git_status,
             self.mark_folders,
             self.prompt_host,
+            self.reopen_last,
             self.long_listing_left,
             self.long_listing_right,
             self.scheme,
@@ -186,6 +193,7 @@ mod tests {
             git_status: false,
             mark_folders: false,
             prompt_host: false,
+            reopen_last: false,
             long_listing_right: true,
             scheme: "nord".into(),
             big_file_mb: 25,

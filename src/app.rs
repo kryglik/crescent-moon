@@ -131,6 +131,8 @@ pub struct Config {
     pub schemes_dir: Option<PathBuf>,
     /// Places in git repositories, for Ctrl+E (`places.ini` beside the settings).
     pub places_file: Option<PathBuf>,
+    /// The panels and tabs as cm left them (`session.txt` beside the settings); None in tests.
+    pub session_file: Option<PathBuf>,
     /// What the terminal does with colours.
     pub colours: Colours,
     pub settings: Settings,
@@ -148,6 +150,7 @@ impl Config {
         config.history_file = History::default_file();
         config.schemes_dir = scheme::default_dir();
         config.places_file = places::File::default_path();
+        config.session_file = crate::session::Session::default_file();
         config.colours = Colours::detect();
         config
     }
@@ -175,6 +178,7 @@ impl Config {
             history_file: None,
             schemes_dir: None,
             places_file: None,
+            session_file: None,
             colours: Colours::default(),
             settings,
         }
@@ -504,6 +508,57 @@ impl App {
     }
 
     /// Saves the history file (on exit, and from `tick` now and then).
+    /// The panels as they are: each side's tabs in order (the folder here, also for a panel
+    /// showing another computer or a zip), their order and the name under the cursor.
+    pub fn session(&self) -> crate::session::Session {
+        use crate::session::{Session, Side, Tab};
+        let tab = |panel: &Panel| Tab {
+            dir: panel.cwd.clone(),
+            sort: panel.sort,
+            reverse: panel.reverse,
+            cursor: panel.name_to_come_back_to(),
+        };
+        let side = |side: usize| {
+            let mut tabs: Vec<Tab> = self.tabs[side].iter().map(tab).collect();
+            let shown = self.tab_index[side].min(tabs.len());
+            tabs.insert(shown, tab(&self.panels[side]));
+            Side { tabs, shown }
+        };
+        Session { sides: [side(0), side(1)], active: self.active }
+    }
+
+    /// On the way out, with "Reopen the last folders and tabs" on: the session, for next time.
+    pub fn save_session(&self) {
+        if let Some(file) = self.config.session_file.as_deref().filter(|_| self.config.settings.reopen_last) {
+            let _ = self.session().save(file);
+        }
+    }
+
+    /// Puts back what `session` held. The panels already show its shown tabs (`main` opened
+    /// them there); this sets their order and cursor, puts the other tabs beside them (each
+    /// read once it is shown), and makes the side active that was.
+    pub fn restore(&mut self, session: &crate::session::Session) {
+        for (side, saved) in session.sides.iter().enumerate() {
+            let shown = saved.shown.min(saved.tabs.len().saturating_sub(1));
+            let (show_hidden, long) = (self.panels[side].show_hidden, self.panels[side].long);
+            self.tabs[side].clear();
+            for (i, tab) in saved.tabs.iter().enumerate() {
+                if i == shown {
+                    let panel = &mut self.panels[side];
+                    panel.set_order(tab.sort, tab.reverse);
+                    if let Some(name) = &tab.cursor {
+                        panel.select_name(name);
+                    }
+                } else {
+                    let panel = Panel::unread(&tab.dir, show_hidden, long, tab.sort, tab.reverse, tab.cursor.clone());
+                    self.tabs[side].push(panel);
+                }
+            }
+            self.tab_index[side] = shown;
+        }
+        self.active = session.active.min(1);
+    }
+
     pub fn save_history(&mut self) {
         if self.history_changed {
             let _ = self.history.save();
@@ -1022,7 +1077,7 @@ impl App {
                 self.on_branches_key(&key, filter, cursor, branches, here, coming)
             }
             Dialog::Places { root, id, places, cursor } => self.on_places_key(&key, root, id, places, cursor),
-            Dialog::Attributes { paths, states, cursor } => self.on_attributes_key(&key, paths, states, cursor),
+            Dialog::Attributes { paths, states, cursor, about } => self.on_attributes_key(&key, paths, states, cursor, about),
             Dialog::Delete { paths, to_trash, mut focus, survey } => {
                 let buttons = dialog::delete_buttons(&survey.tally());
                 match dialog::handle_buttons(buttons, &mut focus, &key) {
@@ -1466,7 +1521,9 @@ impl App {
         let history_file = self.config.history_file.take();
         let (schemes_dir, colours) = (self.config.schemes_dir.take(), self.config.colours);
         let places_file = self.config.places_file.take();
+        let session_file = self.config.session_file.take();
         self.config = Config::new(settings, hotlist_file, settings_file);
+        self.config.session_file = session_file;
         self.config.history_file = history_file;
         self.config.schemes_dir = schemes_dir;
         self.config.places_file = places_file;
@@ -2463,16 +2520,28 @@ impl App {
         };
         let states = platform::ATTRIBUTES
             .iter()
-            .map(|(_, bit)| match values.iter().filter(|v| *v & bit != 0).count() {
+            .map(|attribute| match values.iter().filter(|v| *v & attribute.bit != 0).count() {
                 0 => Some(false),
                 n if n == values.len() => Some(true),
                 _ => None,
             })
             .collect();
-        self.dialog = Some(Dialog::Attributes { paths, states, cursor: 0 });
+        // One file is told about too; of many, only what they have in common shows (the switches).
+        let about = match paths.as_slice() {
+            [one] => platform::describe(one),
+            _ => Vec::new(),
+        };
+        self.dialog = Some(Dialog::Attributes { paths, states, cursor: 0, about });
     }
 
-    fn on_attributes_key(&mut self, key: &KeyEvent, paths: Vec<PathBuf>, mut states: Vec<Option<bool>>, mut cursor: usize) -> Option<Dialog> {
+    fn on_attributes_key(
+        &mut self,
+        key: &KeyEvent,
+        paths: Vec<PathBuf>,
+        mut states: Vec<Option<bool>>,
+        mut cursor: usize,
+        about: Vec<(&'static str, String)>,
+    ) -> Option<Dialog> {
         match key.code {
             KeyCode::Esc | KeyCode::F(10) => return None,
             KeyCode::Up => cursor = cursor.saturating_sub(1),
@@ -2484,7 +2553,7 @@ impl App {
             }
             _ => {}
         }
-        Some(Dialog::Attributes { paths, states, cursor })
+        Some(Dialog::Attributes { paths, states, cursor, about })
     }
 
     /// Sets what the attributes dialog says, file by file (rows left at [?] untouched).
@@ -2493,10 +2562,10 @@ impl App {
         for path in paths {
             let result = platform::attributes(path).and_then(|old| {
                 let mut new = old;
-                for ((_, bit), state) in platform::ATTRIBUTES.iter().zip(states) {
+                for (attribute, state) in platform::ATTRIBUTES.iter().zip(states) {
                     match state {
-                        Some(true) => new |= bit,
-                        Some(false) => new &= !bit,
+                        Some(true) => new |= attribute.bit,
+                        Some(false) => new &= !attribute.bit,
                         None => {}
                     }
                 }
@@ -4313,7 +4382,7 @@ mod tests {
         tmp.file("b.txt", "b");
         let mut app = test_app(tmp.path(), tmp.path());
         let first_row = if cfg!(windows) { "Read-only" } else { "Owner may read" };
-        assert_eq!(platform::ATTRIBUTES[0].0, first_row);
+        assert_eq!(platform::ATTRIBUTES[0].label, first_row);
         // One file: set the first row's attribute, then clear it again.
         app.active_panel_mut().select_name("a.txt");
         app.on_key(with_mods(KeyCode::Char('a'), KeyModifiers::ALT));
@@ -4326,10 +4395,10 @@ mod tests {
         }
         app.on_key(key(KeyCode::Char(' ')));
         app.on_key(key(KeyCode::Enter));
-        let bit = platform::ATTRIBUTES[row].1;
+        let bit = platform::ATTRIBUTES[row].bit;
         let value = platform::attributes(&tmp.path().join("a.txt")).unwrap();
         assert_eq!(value & bit != 0, cfg!(windows), "toggled");
-        assert_eq!(Some(platform::attributes(&tmp.path().join("a.txt")).unwrap() & platform::ATTRIBUTES[0].1 != 0), before);
+        assert_eq!(Some(platform::attributes(&tmp.path().join("a.txt")).unwrap() & platform::ATTRIBUTES[0].bit != 0), before);
         // Both files: that row now differs.
         app.on_key(ctrl('a'));
         app.on_key(with_mods(KeyCode::Char('a'), KeyModifiers::ALT));
@@ -4542,6 +4611,66 @@ mod tests {
         assert!(util::same_path(&app.active_panel().cwd, &sub));
     }
 
+    /// What the panels hold goes into the session, and a new start puts it back: each side's
+    /// tabs in order, the one shown, each one's order and cursor, the active side. A tab in the
+    /// background is read once shown; one whose folder has gone opens the nearest that hasn't.
+    #[test]
+    fn the_panels_and_tabs_come_back() {
+        let tmp = TempDir::new("app-session");
+        let (a, b, c, gone) = (tmp.dir("a"), tmp.dir("b"), tmp.dir("c"), tmp.dir("gone"));
+        tmp.file("a/one.txt", "1");
+        tmp.file("a/two.txt", "22");
+        tmp.file("b/x.txt", "x");
+        tmp.file("c/zz.txt", "z");
+        let mut app = test_app(&a, &c);
+        // Left: a by size, smallest first, on two.txt; then b, shown; then a folder that will go.
+        app.panels[0].set_order(SortBy::Size, true);
+        app.panels[0].select_name("two.txt");
+        app.on_key(ctrl('t'));
+        app.change_dir(0, b.clone());
+        app.on_key(ctrl('t'));
+        app.change_dir(0, gone.clone());
+        app.switch_tab(0, 1);
+        app.active = 1;
+        let session = app.session();
+        let dirs: Vec<&Path> = session.sides[0].tabs.iter().map(|tab| tab.dir.as_path()).collect();
+        assert_eq!(dirs, [a.as_path(), b.as_path(), gone.as_path()]);
+        assert_eq!(session.sides[0].shown, 1);
+        let first = &session.sides[0].tabs[0];
+        assert_eq!((first.sort, first.reverse, first.cursor.as_deref()), (SortBy::Size, true, Some("two.txt")));
+        assert_eq!(session.sides[1].tabs.len(), 1);
+        assert_eq!(session.active, 1);
+
+        // Next time: `main` opens the shown folders, and the rest comes back.
+        fs::remove_dir(&gone).unwrap();
+        let mut again = test_app(&session.shown(0).dir, &session.shown(1).dir);
+        again.restore(&session);
+        assert_eq!((again.active, again.tab_index[0], again.tabs[0].len()), (1, 1, 2));
+        assert!(util::same_path(&again.panels[0].cwd, &b));
+        assert!(again.tabs[0].iter().all(|tab| tab.entries.is_empty()), "the others aren't read yet");
+        again.switch_tab(0, 0);
+        wait_until("the first tab", &mut again, |app| app.panels[0].current().is_some_and(|e| e.name == "two.txt"));
+        assert_eq!((again.panels[0].sort, again.panels[0].reverse), (SortBy::Size, true));
+        again.switch_tab(0, 2);
+        wait_until("the nearest folder", &mut again, |app| util::same_path(&app.panels[0].cwd, tmp.path()));
+    }
+
+    /// The session is written on the way out only with the option on.
+    #[test]
+    fn the_session_is_kept_only_with_the_option_on() {
+        let tmp = TempDir::new("app-session-file");
+        let file = tmp.path().join("session.txt");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.config.session_file = Some(file.clone());
+        app.config.settings.reopen_last = false;
+        app.save_session();
+        assert!(!file.exists());
+        app.config.settings.reopen_last = true;
+        app.save_session();
+        let read = crate::session::Session::load(&file).expect("written");
+        assert!(util::same_path(&read.shown(0).dir, tmp.path()));
+    }
+
     fn wait_until(what: &str, app: &mut App, mut done: impl FnMut(&mut App) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !done(app) {
@@ -4706,6 +4835,10 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.config.settings.prompt_host);
+        // The last folders and tabs reopened (on): off.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.reopen_last);
         // The colour scheme isn't typed: letters do nothing there (Enter opens the list).
         app.on_key(key(KeyCode::Down));
         typing(&mut app, "x");
