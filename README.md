@@ -116,7 +116,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Alt+B | the git repository's branches, newest first: type to find one, Enter switches to it after asking (see Git) |
 | Ctrl+E | in a git repository: the places you keep there; a key goes to one, Ins adds where the panel is (see Places) |
 | Ctrl+T / Ctrl+W / Alt+1…9 | folder tabs, as in Total Commander: a new tab on the same folder, close the tab (with an empty command line; otherwise Ctrl+W deletes a word), go to tab N. Each tab keeps its folder, order and filter; a row of tabs shows above the panels once a side has more than one, and they are clickable |
-| Ctrl+S or Alt+S | quick search by name; the same key again jumps to the next match |
+| Ctrl+S or Alt+S | quick search: typing jumps to the next name that holds the text anywhere, in any letter case (`err` finds `Blueberry.txt`); the same key again jumps to the next match. With the option below off, only names that start with it, as in mc |
 | Alt+F7 or Alt+? | find text in files below the panel's folder (see Find) |
 
 #### Looking at things
@@ -442,6 +442,7 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | + and - mark folders too | on: `+` and `-` take folders as well as files; off, files only, as in mc. A pattern ending in a slash (`*/`) takes folders either way |
 | user@host before the command line | on: the command line's prompt starts with who and where, as bash's: `me@nas /home/me/src>` |
 | Reopen the last folders and tabs | on: started without folders, cm opens what it had when it last closed (see below); off, both panels open the folder it is started in |
+| Quick search finds text anywhere in a name | on: Ctrl+S / Alt+S match inside names; off, only their start, as mc. Letter case doesn't count either way |
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |

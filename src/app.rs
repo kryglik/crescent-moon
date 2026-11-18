@@ -954,15 +954,17 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            // The same key again: the next name that starts with what was typed.
+            // The same key again: the next name that holds (or starts with) what was typed.
             KeyCode::Char('s') if ctrl != alt => {
                 let query = query.clone();
-                self.active_panel_mut().find_prefix(&query, true);
+                let anywhere = self.config.settings.search_anywhere;
+                self.active_panel_mut().find_name(&query, true, anywhere);
             }
             KeyCode::Char(c) if dialog::is_text_input(key) => {
                 query.push(c);
                 let attempt = query.clone();
-                if !self.active_panel_mut().find_prefix(&attempt, false)
+                let anywhere = self.config.settings.search_anywhere;
+                if !self.active_panel_mut().find_name(&attempt, false, anywhere)
                     && let Some(query) = self.quicksearch.as_mut()
                 {
                     query.pop();
@@ -4839,6 +4841,10 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char(' ')));
         assert!(!app.config.settings.reopen_last);
+        // Quick search finds text anywhere in a name (on): from its start only.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.config.settings.search_anywhere);
         // The colour scheme isn't typed: letters do nothing there (Enter opens the list).
         app.on_key(key(KeyCode::Down));
         typing(&mut app, "x");

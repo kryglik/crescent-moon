@@ -919,14 +919,16 @@ impl Panel {
         self.offset = self.offset.min(self.entries.len().saturating_sub(self.page));
     }
 
-    /// Jumps to the next entry whose name starts with `prefix` (case-insensitive).
-    pub fn find_prefix(&mut self, prefix: &str, skip_current: bool) -> bool {
-        let prefix = prefix.to_lowercase();
+    /// Quick search: jumps to the next entry (from the cursor on, round to the top) whose name
+    /// holds `text` anywhere, or with `anywhere` off starts with it; letter case doesn't count.
+    pub fn find_name(&mut self, text: &str, skip_current: bool, anywhere: bool) -> bool {
+        let text = text.to_lowercase();
         let n = self.entries.len();
         let start = if skip_current { 1 } else { 0 };
         for step in start..n + start {
             let i = (self.cursor + step) % n.max(1);
-            if self.entries[i].name.to_lowercase().starts_with(&prefix) {
+            let name = self.entries[i].name.to_lowercase();
+            if if anywhere { name.contains(&text) } else { name.starts_with(&text) } {
                 self.cursor = i;
                 return true;
             }
@@ -1435,10 +1437,32 @@ mod tests {
         tmp.file("banana", "");
         tmp.file("Blueberry", "");
         let mut panel = Panel::new(tmp.path().to_path_buf(), true);
-        assert!(panel.find_prefix("b", false));
+        assert!(panel.find_name("b", false, false));
         assert_eq!(panel.current().unwrap().name, "banana");
-        assert!(panel.find_prefix("b", true));
+        assert!(panel.find_name("b", true, false));
         assert_eq!(panel.current().unwrap().name, "Blueberry");
-        assert!(!panel.find_prefix("x", false));
+        assert!(!panel.find_name("x", false, false));
+        assert!(!panel.find_name("err", false, false), "inside a name: only anywhere");
+    }
+
+    /// Anywhere in the name, letter case not counting: `ERR` finds `Blueberry`, `an` finds
+    /// `banana` and then, again, nothing else but it.
+    #[test]
+    fn quick_search_finds_text_anywhere_in_a_name() {
+        let tmp = TempDir::new("panel-search-anywhere");
+        tmp.file("apple", "");
+        tmp.file("banana", "");
+        tmp.file("Blueberry", "");
+        tmp.file("Účty.txt", "");
+        let mut panel = Panel::new(tmp.path().to_path_buf(), true);
+        assert!(panel.find_name("ERR", false, true));
+        assert_eq!(panel.current().unwrap().name, "Blueberry");
+        assert!(panel.find_name("an", false, true));
+        assert_eq!(panel.current().unwrap().name, "banana");
+        assert!(panel.find_name("an", true, true), "round to the same one");
+        assert_eq!(panel.current().unwrap().name, "banana");
+        assert!(panel.find_name("čty", false, true) && panel.current().unwrap().name == "Účty.txt");
+        assert!(panel.find_name("ÚČ", false, true), "capitals with accents too");
+        assert!(!panel.find_name("kiwi", false, true));
     }
 }

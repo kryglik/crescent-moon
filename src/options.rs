@@ -15,6 +15,7 @@ pub enum Row {
     MarkFolders,
     PromptHost,
     ReopenLast,
+    SearchAnywhere,
     Scheme,
     BigFile,
     Editor,
@@ -23,7 +24,7 @@ pub enum Row {
     Shell,
 }
 
-pub const ROWS: [Row; 15] = [
+pub const ROWS: [Row; 16] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
@@ -33,6 +34,7 @@ pub const ROWS: [Row; 15] = [
     Row::MarkFolders,
     Row::PromptHost,
     Row::ReopenLast,
+    Row::SearchAnywhere,
     Row::Scheme,
     Row::BigFile,
     Row::Editor,
@@ -53,6 +55,7 @@ impl Row {
             Row::MarkFolders => "+ and - mark folders too",
             Row::PromptHost => "user@host before the command line",
             Row::ReopenLast => "Reopen the last folders and tabs",
+            Row::SearchAnywhere => "Quick search finds text anywhere in a name",
             Row::Scheme => "Colour scheme (Alt+C)",
             Row::BigFile => "Big file limit, MB",
             Row::Editor => "Editor (F4)",
@@ -64,7 +67,7 @@ impl Row {
 
     /// A checkbox rather than a text field.
     pub fn is_flag(self) -> bool {
-        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus | Row::MarkFolders | Row::PromptHost | Row::ReopenLast)
+        matches!(self, Row::ConfirmQuit | Row::ShowHidden | Row::Mouse | Row::Arrows | Row::NaturalSort | Row::GitStatus | Row::MarkFolders | Row::PromptHost | Row::ReopenLast | Row::SearchAnywhere)
     }
 
     /// Picked from a list (Enter opens it) rather than typed.
@@ -83,6 +86,7 @@ impl Row {
             Row::MarkFolders => settings.mark_folders,
             Row::PromptHost => settings.prompt_host,
             Row::ReopenLast => settings.reopen_last,
+            Row::SearchAnywhere => settings.search_anywhere,
             _ => false,
         }
     }
@@ -98,6 +102,7 @@ impl Row {
             Row::MarkFolders => settings.mark_folders = !settings.mark_folders,
             Row::PromptHost => settings.prompt_host = !settings.prompt_host,
             Row::ReopenLast => settings.reopen_last = !settings.reopen_last,
+            Row::SearchAnywhere => settings.search_anywhere = !settings.search_anywhere,
             _ => {}
         }
     }
