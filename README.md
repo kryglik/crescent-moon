@@ -110,7 +110,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Ctrl+PgUp / Ctrl+PgDn | up / into a folder, as in Total Commander and Far |
 | Alt+Left / Alt+Right | back / forward through the folders the panel was in, as in a browser (mc's Alt+Y / Alt+U too); `cd -` goes back |
 | Alt+H or Alt+Down | folder history: the folders visited lately, newest first, kept between sessions; type part of a path to narrow it, Enter goes there, Del forgets one |
-| Alt+F1, Alt+F2 | drive picker for the left / right panel |
+| Alt+F1, Alt+F2 | drive picker for the left / right panel: where, its kind, free space, and its volume, share or where a computer comes from; Del forgets a computer used lately, F4 edits `~/.ssh/config` |
 | Ctrl+\ or Ctrl+D | favourite folders: Ins adds the current one, Enter or 1–9 jumps, Del removes |
 | Alt+W | the git repository's worktrees: Enter goes to one, into the same subfolder (see Git) |
 | Alt+B | the git repository's branches, newest first: type to find one, Enter switches to it after asking (see Git) |
@@ -236,8 +236,11 @@ say so.
 field a number after the colon is the port; anywhere else `host:2222` is, as for scp, a file
 called 2222 in the home folder (`host:./2222` is that file here too). A `Port` in
 `~/.ssh/config` works as well. `cd host:/path` on the command line does the same, and the drive
-picker (Alt+F1 / Alt+F2) lists the computers connected to lately and the hosts of
-`~/.ssh/config`. Addresses go in the hotlist and the folder history like folders do.
+picker (Alt+F1 / Alt+F2) lists, under the drives, the computers connected to lately and the hosts
+of `~/.ssh/config`, each as Ctrl+N takes it (`me@host:2222`) and saying which of the two it comes
+from. Del there forgets one used lately (every way it was typed); F4 opens `~/.ssh/config` in the
+editor, where the others are added, changed or taken out (`Host` lines). Addresses go in the
+hotlist and the folder history like folders do.
 
 cm runs your `ssh` program and speaks SFTP through it, so whatever `ssh host` does works here
 too: keys, the agent, aliases from `~/.ssh/config`, ProxyJump. If `ssh` needs to ask something (a

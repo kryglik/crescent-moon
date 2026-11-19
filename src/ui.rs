@@ -1252,38 +1252,58 @@ fn draw_sort(frame: &mut Frame, area: Rect, cursor: usize, current: SortBy, reve
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
 }
 
-/// The drive picker: letter, label (or network share), type and free space. Slow drives
-/// show "checking…" until their answer arrives.
+/// What the drive picker says to change it.
+const DRIVES_HINT: &str = "Enter goes there · Del forgets a computer used lately · F4 edits ~/.ssh/config";
+
+/// The drive picker, in columns: where (a drive's folder, or a computer as Ctrl+N takes it,
+/// `me@host:2222`), its kind, free space (slow drives say "checking…" until their answer
+/// arrives), and last, dimmed, its volume or share, or where a computer comes from.
 fn draw_drives(frame: &mut Frame, area: Rect, drives: &[DriveInfo], cursor: usize, side: usize, t: &Scheme) -> DialogHit {
-    let label_w = drives.iter().map(|d| util::width(&d.label)).max().unwrap_or(0).min(32);
-    let texts: Vec<String> = drives
-        .iter()
-        .map(|drive| {
-            let space = match (drive.space, drive.pending) {
-                (Some((free, total)), _) => format!("{} free of {}", util::human_size(free), util::human_size(total)),
-                (None, true) => "checking…".into(),
-                (None, false) if drive.kind == "network" => "not reachable".into(),
-                (None, false) => String::new(),
-            };
-            let label = if label_w > 0 { format!("{} ", util::fit(&drive.label, label_w)) } else { String::new() };
-            format!("{}  {label}{} {space}", drive.root.display(), util::pad(drive.kind, 9))
-        })
-        .collect();
+    let place = |drive: &DriveInfo| match crate::ssh::parse_exact(&drive.root.to_string_lossy()).filter(|_| drive.kind == "ssh") {
+        Some((target, _)) => format!("{target}{}", target.port.map(|port| format!(":{port}")).unwrap_or_default()),
+        None => drive.root.display().to_string(),
+    };
+    let space = |drive: &DriveInfo| match (drive.space, drive.pending) {
+        (Some((free, total)), _) => format!("{} free of {}", util::human_size(free), util::human_size(total)),
+        (None, true) => "checking…".into(),
+        (None, false) if drive.kind == "network" => "not reachable".into(),
+        (None, false) => String::new(),
+    };
+    let places: Vec<String> = drives.iter().map(place).collect();
+    let spaces: Vec<String> = drives.iter().map(space).collect();
+    let place_w = places.iter().map(|p| util::width(p)).max().unwrap_or(0).min(48);
+    let kind_w = drives.iter().map(|d| util::width(d.kind)).max().unwrap_or(0);
     // Room for "4.5T free of 10.9T" even before the answers arrive, so the box doesn't grow.
-    let widest = texts.iter().map(|t| util::width(t)).max().unwrap_or(0).max(label_w + 37);
-    let width = (widest as u16 + 4).max(30);
+    let has_space = drives.iter().any(|d| d.kind != "ssh");
+    let space_w = spaces.iter().map(|s| util::width(s)).max().unwrap_or(0).max(if has_space { 18 } else { 0 });
+    let label_w = drives.iter().map(|d| util::width(&d.label)).max().unwrap_or(0).min(40);
+    let row_w = place_w + 2 + kind_w + if space_w > 0 { 2 + space_w } else { 0 } + if label_w > 0 { 2 + label_w } else { 0 };
+    let width = (row_w.max(util::width(DRIVES_HINT)) as u16 + 4).max(30);
     let title = if side == 0 { "Left drive" } else { "Right drive" };
-    let (outer, inner) = dialog_frame(frame, area, width, drives.len() as u16 + 2, title, false, t);
-    let style = t.dialog;
-    let lines: Vec<Line> = texts
+    let (outer, inner) = dialog_frame(frame, area, width, drives.len() as u16 + 4, title, false, t);
+    let inner_w = inner.width as usize;
+    let mut lines: Vec<Line> = drives
         .iter()
         .enumerate()
-        .map(|(i, text)| {
-            let row_style = if i == cursor { t.on_dialog(t.dialog_focus) } else { style };
-            Line::from(Span::styled(util::fit(text, inner.width as usize), row_style))
+        .map(|(i, drive)| {
+            let focus = i == cursor;
+            let style = if focus { t.on_dialog(t.dialog_focus) } else { t.dialog };
+            let dim = if focus { style } else { t.on_dialog(t.dialog_dim) };
+            let mut text = format!("{}  {}", util::pad(&util::fit_left(&places[i], place_w), place_w), util::pad(drive.kind, kind_w));
+            if space_w > 0 {
+                text += &format!("  {}", util::pad_left(&spaces[i], space_w));
+            }
+            let used = util::width(&text).min(inner_w);
+            let label = if label_w > 0 { format!("  {}", util::fit(&drive.label, label_w)) } else { String::new() };
+            Line::from(vec![
+                Span::styled(util::fit(&text, used), style),
+                Span::styled(util::fit(&label, inner_w - used), dim),
+            ])
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines).style(style), inner);
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(util::fit(DRIVES_HINT, inner_w), t.on_dialog(t.dialog_dim))).right_aligned());
+    frame.render_widget(Paragraph::new(lines).style(t.dialog), inner);
     let rows = Rect::new(inner.x, inner.y, inner.width, (drives.len() as u16).min(inner.height));
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((rows, 0)) }
 }
@@ -1572,6 +1592,45 @@ mod tests {
 
     fn app_for(tmp: &TempDir) -> App {
         App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), crate::testutil::config())
+    }
+
+    /// The drive picker in columns: each row's kind starts at the same place; a computer reads
+    /// as Ctrl+N takes it (no `ssh://`, no colon at the end), with where it comes from; the
+    /// hint says how to change the list.
+    #[test]
+    fn the_drive_picker_lines_up() {
+        let tmp = TempDir::new("ui-drives-columns");
+        let mut app = app_for(&tmp);
+        let drive = |root: &str, label: &str, kind: &'static str, space: Option<(u64, u64)>| DriveInfo {
+            root: PathBuf::from(root),
+            label: label.into(),
+            kind,
+            space,
+            pending: false,
+        };
+        let drives = vec![
+            drive("/", "", "root", Some((184 << 30, 1500 << 30))),
+            drive("/mnt/media", "//nas/media", "network", Some((397 << 30, 3000 << 30))),
+            drive("/run/media/me/Disk4TB", "/dev/mapper/disk-luks", "removable", Some((3200 << 30, 3600 << 30))),
+            drive("ssh://me@box:222", "used lately", "ssh", None),
+            drive("box:", "~/.ssh/config", "ssh", None),
+        ];
+        app.dialog = Some(Dialog::Drives { side: 1, drives, cursor: 0 });
+        let screen = render(&mut app, 140, 20);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        let column = |row: &str, kind: &str| {
+            let line = screen.lines().find(|l| l.contains(row)).unwrap_or_else(|| panic!("no {row}:\n{screen}"));
+            let at = line.find(&format!("{kind} ")).unwrap();
+            line[..at].chars().count()
+        };
+        let kinds = [("root", "root"), ("/mnt/media", "network"), ("Disk4TB", "removable"), ("me@box:222", "ssh"), ("~/.ssh/config", "ssh")];
+        let columns: Vec<usize> = kinds.iter().map(|(row, kind)| column(row, kind)).collect();
+        assert!(columns.iter().all(|c| *c == columns[0]), "{columns:?}\n{screen}");
+        assert!(!screen.contains("ssh://") && !screen.contains("box:  "), "{screen}");
+        assert!(screen.lines().any(|l| l.contains("me@box:222") && l.contains("used lately")), "{screen}");
+        assert!(screen.contains("Del forgets"), "{screen}");
     }
 
     /// Alt+A on one file tells what it is, when it changed, who owns it and, in words, every

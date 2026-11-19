@@ -1066,6 +1066,16 @@ impl App {
                         None => Some(Dialog::Drives { side, drives, cursor }),
                     }
                 }
+                KeyCode::Delete => {
+                    let mut drives = drives;
+                    self.forget_computer(&mut drives, cursor);
+                    let cursor = cursor.min(drives.len().saturating_sub(1));
+                    Some(Dialog::Drives { side, drives, cursor })
+                }
+                KeyCode::F(4) => {
+                    self.edit_ssh_config();
+                    None
+                }
                 KeyCode::Esc => None,
                 _ => Some(Dialog::Drives { side, drives, cursor }),
             },
@@ -3023,21 +3033,7 @@ impl App {
     /// hosts of `~/.ssh/config`.
     fn open_drives(&mut self, side: usize) {
         let mut drives = platform::drives();
-        let earlier = self.history.inputs.list("ssh").iter().rev().filter_map(|text| ssh::parse_connect(text).ok()).map(|(target, _)| target);
-        let configured = ssh::configured_hosts().into_iter().filter_map(|host| ssh::parse_connect(&host).ok()).map(|(target, _)| target);
-        let mut hosts: Vec<Target> = Vec::new();
-        for target in earlier.chain(configured) {
-            if !hosts.contains(&target) {
-                hosts.push(target);
-            }
-        }
-        drives.extend(hosts.iter().map(|target| platform::DriveInfo {
-            root: PathBuf::from(target.place("")),
-            label: String::new(),
-            kind: "ssh",
-            space: None,
-            pending: false,
-        }));
+        drives.extend(self.computers());
         let cwd = &self.panels[side].cwd;
         // The most specific drive holding the panel's folder (on Linux everything is under /).
         let cursor = drives
@@ -3049,6 +3045,70 @@ impl App {
         let slow: Vec<PathBuf> = drives.iter().filter(|d| d.pending).map(|d| d.root.clone()).collect();
         self.drive_space = (!slow.is_empty()).then(|| platform::query_space_later(slow));
         self.dialog = Some(Dialog::Drives { side, drives, cursor });
+    }
+
+    /// The drive picker's computers: those connected to lately (Ctrl+N's history), newest
+    /// first, then the hosts `~/.ssh/config` names. Each says where it comes from, which is
+    /// where it is changed: Del forgets one used lately, F4 edits the config.
+    fn computers(&self) -> Vec<platform::DriveInfo> {
+        let lately: Vec<Target> =
+            self.history.inputs.list("ssh").iter().rev().filter_map(|text| ssh::parse_connect(text).ok()).map(|(target, _)| target).collect();
+        let configured: Vec<Target> =
+            ssh::configured_hosts().into_iter().filter_map(|host| ssh::parse_connect(&host).ok()).map(|(target, _)| target).collect();
+        let mut hosts: Vec<Target> = Vec::new();
+        for target in lately.iter().chain(&configured) {
+            if !hosts.contains(target) {
+                hosts.push(target.clone());
+            }
+        }
+        hosts
+            .into_iter()
+            .map(|target| {
+                let label = match (lately.contains(&target), configured.contains(&target)) {
+                    (true, true) => "used lately, ~/.ssh/config",
+                    (true, false) => "used lately",
+                    _ => "~/.ssh/config",
+                };
+                platform::DriveInfo { root: PathBuf::from(target.place("")), label: label.into(), kind: "ssh", space: None, pending: false }
+            })
+            .collect()
+    }
+
+    /// Del in the drive picker: a computer used lately is forgotten (all of what was typed to
+    /// reach it); one `~/.ssh/config` names stays, and is said to be there.
+    fn forget_computer(&mut self, drives: &mut Vec<platform::DriveInfo>, cursor: usize) {
+        let Some(drive) = drives.get(cursor) else { return };
+        let Some((target, _)) = ssh::parse_exact(&drive.root.to_string_lossy()).filter(|_| drive.kind == "ssh") else {
+            self.notice = Some("Drives are what the system has mounted: only computers can be forgotten here".into());
+            return;
+        };
+        let typed: Vec<String> = self
+            .history
+            .inputs
+            .list("ssh")
+            .iter()
+            .filter(|text| ssh::parse_connect(text).is_ok_and(|(typed, _)| typed == target))
+            .cloned()
+            .collect();
+        if typed.is_empty() {
+            self.notice = Some(format!("{target} is a Host in ~/.ssh/config: F4 here edits that file"));
+            return;
+        }
+        for text in &typed {
+            self.history.inputs.forget("ssh", text);
+        }
+        self.history_changed = true;
+        drives.retain(|d| d.kind != "ssh");
+        drives.extend(self.computers());
+    }
+
+    /// F4 in the drive picker: `~/.ssh/config` in the editor, where the computers it names
+    /// come from (`Host` lines; a file that isn't there yet is begun).
+    fn edit_ssh_config(&mut self) {
+        match util::home_dir() {
+            Some(home) => self.external = Some(External::Edit(home.join(".ssh").join("config"), None)),
+            None => self.error("There is no home folder to find ~/.ssh/config in.".to_string()),
+        }
     }
 
     /// Goes to the folder the panel last had open on that drive. Choosing the drive the panel
@@ -5798,6 +5858,43 @@ mod tests {
         typing(&mut app, "new.txt");
         app.on_key(key(KeyCode::Enter));
         assert!(tmp.path().join("new.txt").exists() && !tmp.path().join("old name.txt").exists());
+    }
+
+    /// The drive picker's computers say where they come from. Del forgets one used lately
+    /// (every way it was typed); a drive isn't forgotten. F4 opens ~/.ssh/config in the editor.
+    #[test]
+    fn computers_used_lately_can_be_forgotten() {
+        let tmp = TempDir::new("app-drives-forget");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.history.inputs.add("ssh", "me@picker-test-one:2222");
+        app.history.inputs.add("ssh", "ssh://me@picker-test-one:2222/srv");
+        app.history.inputs.add("ssh", "picker-test-two");
+        app.on_key(with_mods(KeyCode::F(1), KeyModifiers::ALT));
+        let rows = |app: &App| match &app.dialog {
+            Some(Dialog::Drives { drives, .. }) => drives.iter().map(|d| (d.root.to_string_lossy().into_owned(), d.label.clone())).collect::<Vec<_>>(),
+            _ => panic!("no drives"),
+        };
+        let one = rows(&app).into_iter().position(|(root, _)| root.contains("picker-test-one")).expect("listed");
+        assert_eq!(rows(&app)[one].1, "used lately");
+        assert!(rows(&app).iter().position(|(root, _)| root.contains("picker-test-two")) < Some(one), "newest first");
+        if let Some(Dialog::Drives { cursor, .. }) = &mut app.dialog {
+            *cursor = one;
+        }
+        app.on_key(key(KeyCode::Delete));
+        assert!(!rows(&app).iter().any(|(root, _)| root.contains("picker-test-one")), "gone from the list");
+        assert!(rows(&app).iter().any(|(root, _)| root.contains("picker-test-two")));
+        assert!(!app.history.inputs.list("ssh").iter().any(|t| t.contains("picker-test-one")), "and from the history, both ways");
+        // A drive stays, with a word why.
+        if let Some(Dialog::Drives { cursor, .. }) = &mut app.dialog {
+            *cursor = 0;
+        }
+        let before = rows(&app).len();
+        app.on_key(key(KeyCode::Delete));
+        assert_eq!(rows(&app).len(), before);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("mounted")));
+        app.on_key(key(KeyCode::F(4)));
+        assert!(app.dialog.is_none());
+        assert!(matches!(&app.external, Some(External::Edit(path, None)) if path.ends_with(Path::new(".ssh").join("config"))));
     }
 
     /// The drive picker goes to its ends by Home and End, and by the page keys.
