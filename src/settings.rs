@@ -40,6 +40,8 @@ pub struct Settings {
     pub scheme: String,
     /// Files bigger than this many megabytes go to the pager, and the editor asks first.
     pub big_file_mb: u64,
+    /// Alt+Shift+C puts the text of files up to this many kilobytes on the clipboard.
+    pub text_copy_kb: u64,
     /// Commands; empty means automatic (environment variables, then what is installed).
     pub editor: String,
     pub viewer: String,
@@ -64,6 +66,7 @@ impl Default for Settings {
             long_listing_right: false,
             scheme: "classic".into(),
             big_file_mb: 10,
+            text_copy_kb: 1024,
             editor: String::new(),
             viewer: String::new(),
             pager: String::new(),
@@ -97,6 +100,10 @@ impl Settings {
         self.big_file_mb.saturating_mul(1024 * 1024)
     }
 
+    pub fn text_copy_bytes(&self) -> u64 {
+        self.text_copy_kb.saturating_mul(1024)
+    }
+
     fn parse(text: &str) -> Self {
         let mut settings = Settings::default();
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with(['#', ';'])) {
@@ -128,6 +135,13 @@ impl Settings {
                         settings.big_file_mb = mb;
                     }
                 }
+                "text_copy_kb" => {
+                    if let Ok(kb) = value.parse::<u64>()
+                        && kb > 0
+                    {
+                        settings.text_copy_kb = kb;
+                    }
+                }
                 "editor" => settings.editor = value.to_string(),
                 "viewer" => settings.viewer = value.to_string(),
                 "pager" => settings.pager = value.to_string(),
@@ -156,6 +170,7 @@ impl Settings {
              long_listing_right = {}\n\
              scheme = {}\n\
              big_file_mb = {}\n\
+             text_copy_kb = {}\n\
              editor = {}\n\
              viewer = {}\n\
              pager = {}\n\
@@ -174,6 +189,7 @@ impl Settings {
             self.long_listing_right,
             self.scheme,
             self.big_file_mb,
+            self.text_copy_kb,
             self.editor,
             self.viewer,
             self.pager,
@@ -205,6 +221,7 @@ mod tests {
             long_listing_right: true,
             scheme: "nord".into(),
             big_file_mb: 25,
+            text_copy_kb: 64,
             editor: r#""C:\Program Files\Neovim\bin\nvim.exe" -p"#.into(),
             ..Settings::default()
         };

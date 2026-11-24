@@ -18,13 +18,14 @@ pub enum Row {
     SearchAnywhere,
     Scheme,
     BigFile,
+    TextCopy,
     Editor,
     Viewer,
     Pager,
     Shell,
 }
 
-pub const ROWS: [Row; 16] = [
+pub const ROWS: [Row; 17] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
@@ -37,6 +38,7 @@ pub const ROWS: [Row; 16] = [
     Row::SearchAnywhere,
     Row::Scheme,
     Row::BigFile,
+    Row::TextCopy,
     Row::Editor,
     Row::Viewer,
     Row::Pager,
@@ -58,6 +60,7 @@ impl Row {
             Row::SearchAnywhere => "Quick search finds text anywhere in a name",
             Row::Scheme => "Colour scheme (Alt+C)",
             Row::BigFile => "Big file limit, MB",
+            Row::TextCopy => "Copy text to the clipboard up to, KB",
             Row::Editor => "Editor (F4)",
             Row::Viewer => "Viewer (F3)",
             Row::Pager => "Pager (big files)",
@@ -110,6 +113,7 @@ impl Row {
     pub fn text(self, settings: &Settings) -> String {
         match self {
             Row::BigFile => settings.big_file_mb.to_string(),
+            Row::TextCopy => settings.text_copy_kb.to_string(),
             Row::Scheme => settings.scheme.clone(),
             Row::Editor => settings.editor.clone(),
             Row::Viewer => settings.viewer.clone(),
@@ -128,6 +132,13 @@ impl Row {
                     && mb > 0
                 {
                     settings.big_file_mb = mb;
+                }
+            }
+            Row::TextCopy => {
+                if let Ok(kb) = text.parse::<u64>()
+                    && kb > 0
+                {
+                    settings.text_copy_kb = kb;
                 }
             }
             Row::Editor => settings.editor = text,

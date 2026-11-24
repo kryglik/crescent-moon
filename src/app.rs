@@ -57,6 +57,8 @@ enum AfterJob {
     /// F4 on another computer: edited here, and put back if it changed. `there` is how the
     /// file looked over there.
     Edit { connection: Arc<Connection>, path: String, there: Attrs },
+    /// Alt+Shift+C in a zip or on another computer: its text to the clipboard.
+    CopyText,
 }
 
 /// A file of another computer in the editor.
@@ -350,6 +352,9 @@ pub struct App {
     pub clipboard: Clipboard,
     /// Text for the terminal to put on its clipboard (OSC 52); the main loop sends it.
     pub terminal_clipboard: Option<String>,
+    /// Alt+Shift+C: a file's name, and its bytes being read on a thread of its own (a slow
+    /// share mustn't hold the screen), for the clipboard.
+    text_copy: Option<(String, Receiver<std::io::Result<Vec<u8>>>)>,
     /// The running job pastes files that were cut: when it is done, the clipboard is emptied.
     pasting_cut: Option<Vec<PathBuf>>,
     /// What to do with a file the running job takes out of an archive, once it is out.
@@ -443,6 +448,7 @@ impl App {
             preview_rows: 20,
             clipboard: Clipboard::default(),
             terminal_clipboard: None,
+            text_copy: None,
             pasting_cut: None,
             after_job: None,
             watches: [None, None],
@@ -574,6 +580,7 @@ impl App {
             || self.previewer.as_ref().is_some_and(Previewer::loading)
             || self.git.running()
             || self.panels.iter().any(Panel::is_reading)
+            || self.text_copy.is_some()
     }
 
     /// Ctrl+Q: the quick view on or off.
@@ -848,6 +855,7 @@ impl App {
             }
             KeyCode::Char('c') if ctrl && !alt => self.copy_to_clipboard(Effect::Copy),
             KeyCode::Char('C') if ctrl && !alt => self.copy_paths(),
+            KeyCode::Char('C') if alt && !ctrl => self.copy_file_text(),
             KeyCode::Char('x') if ctrl && !alt => self.copy_to_clipboard(Effect::Move),
             // Windows Terminal keeps Ctrl+V for its own paste, hence Alt+V.
             KeyCode::Char('v') if ctrl != alt => self.paste(),
@@ -2091,6 +2099,13 @@ impl App {
             self.subshell = None;
             changed = true;
         }
+        if let Some((_, read)) = &self.text_copy
+            && let Ok(bytes) = read.try_recv()
+            && let Some((name, _)) = self.text_copy.take()
+        {
+            self.finish_text_copy(&name, bytes);
+            changed = true;
+        }
         if let Some(answers) = &self.drive_space {
             while let Ok((root, space)) = answers.try_recv() {
                 changed = true;
@@ -2473,6 +2488,83 @@ impl App {
                     [one] => format!("{} copied to the clipboard as text", one.display()),
                     many => format!("{} paths copied to the clipboard as text", many.len()),
                 });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Alt+Shift+C: the text of the file under the cursor to the clipboard, so it pastes into
+    /// a mail, a chat or a form. Only up to the limit in Ctrl+P (`text_copy_kb`), and only
+    /// text: a file with zero bytes in it (a program, a picture) is refused. In a zip or on
+    /// another computer it is taken out first, as for F3.
+    fn copy_file_text(&mut self) {
+        let Some(entry) = self.active_panel().current().cloned() else { return };
+        if entry.is_parent || entry.is_dir {
+            self.notice = Some("Alt+Shift+C copies a file's text: a folder has none".into());
+            return;
+        }
+        let limit = self.config.settings.text_copy_bytes();
+        if entry.size > limit {
+            return self.error(format!(
+                "\"{}\" is {}: the clipboard takes the text of files up to {}.\n\
+                 Ctrl+P changes the limit (\"Copy text to the clipboard up to, KB\").",
+                entry.name,
+                util::human_size(entry.size),
+                util::human_size(limit)
+            ));
+        }
+        if self.active_panel().archive.is_some() {
+            return self.take_out(&entry, AfterJob::CopyText);
+        }
+        if let Some(view) = self.active_panel().remote.clone() {
+            if let Some(path) = self.path_there(&view, &entry) {
+                self.fetch(&entry, path, AfterJob::CopyText);
+            }
+            return;
+        }
+        self.read_text_to_copy(&entry.name, entry.path);
+    }
+
+    /// Reads `path` on a thread of its own, at most one byte over the limit (it may have grown
+    /// since it was listed); `tick` takes it from there.
+    fn read_text_to_copy(&mut self, name: &str, path: PathBuf) {
+        use std::io::Read;
+        let limit = self.config.settings.text_copy_bytes();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let read = crate::lfs::open(&path).and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(limit + 1).read_to_end(&mut bytes).map(|_| bytes)
+            });
+            let _ = tx.send(read);
+        });
+        self.notice = Some(format!("Reading \"{name}\" for the clipboard…"));
+        self.text_copy = Some((name.to_string(), rx));
+    }
+
+    /// The bytes are in: text goes to the clipboard, and the notice says how much.
+    fn finish_text_copy(&mut self, name: &str, read: std::io::Result<Vec<u8>>) {
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(e) => return self.error(format!("Cannot read \"{name}\":\n{e}")),
+        };
+        let limit = self.config.settings.text_copy_bytes();
+        if bytes.len() as u64 > limit {
+            return self.error(format!("\"{name}\" is over {} now: not copied.", util::human_size(limit)));
+        }
+        let Some(text) = util::text_of(&bytes) else {
+            return self.error(format!("\"{name}\" isn't text (it has zero bytes in it): not copied."));
+        };
+        match self.clipboard.put_plain_text(&text) {
+            Ok(terminal) => {
+                self.terminal_clipboard = terminal;
+                let lines = text.lines().count();
+                self.notice = Some(format!(
+                    "The text of \"{name}\" is on the clipboard: {} line{}, {} characters",
+                    util::thousands(lines as u64),
+                    if lines == 1 { "" } else { "s" },
+                    util::thousands(text.chars().count() as u64)
+                ));
             }
             Err(e) => self.error(e),
         }
@@ -3270,6 +3362,10 @@ impl App {
             AfterJob::View => {
                 self.viewed_copy = path.parent().map(|folder| (folder.to_path_buf(), Instant::now()));
                 self.view(path, size, None);
+            }
+            AfterJob::CopyText => {
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.read_text_to_copy(&name, path);
             }
             AfterJob::Edit { connection, path: file, there } => {
                 let modified = fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
@@ -4717,6 +4813,42 @@ mod tests {
         wait_until("the nearest folder", &mut again, |app| util::same_path(&app.panels[0].cwd, tmp.path()));
     }
 
+    /// Alt+Shift+C: a text file's text goes to the clipboard (in tests the terminal's, as
+    /// OSC 52), UTF-16 with its mark too. A file with zero bytes in it isn't text, one over the
+    /// limit isn't read at all, and a folder has none: nothing is copied, and it says why.
+    #[test]
+    fn alt_shift_c_copies_a_files_text() {
+        let tmp = TempDir::new("app-text-copy");
+        tmp.file("notes.txt", "první řádek\ndruhý\n");
+        fs::write(tmp.path().join("wide.txt"), [0xFF, 0xFE, b'h', 0, b'i', 0]).unwrap();
+        fs::write(tmp.path().join("program.bin"), [0x7F, b'E', b'L', b'F', 0, 1]).unwrap();
+        tmp.file("big.log", &"x".repeat(3000));
+        tmp.dir("folder");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.config.settings.text_copy_kb = 2;
+        let copy = |app: &mut App, name: &str| {
+            (app.terminal_clipboard, app.dialog, app.notice) = (None, None, None);
+            assert!(app.active_panel_mut().select_name(name), "{name}");
+            app.on_key(with_mods(KeyCode::Char('C'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+            wait_until("the reading", app, |app| app.text_copy.is_none());
+        };
+        let refused = |app: &App, why: &str| {
+            app.terminal_clipboard.is_none()
+                && matches!(&app.dialog, Some(Dialog::Message { lines, .. }) if lines.iter().any(|l| l.contains(why)))
+        };
+        copy(&mut app, "notes.txt");
+        assert_eq!(app.terminal_clipboard.as_deref(), Some(clipboard::osc52("první řádek\ndruhý\n").as_str()));
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("2 lines") && n.contains("18 characters")), "{:?}", app.notice);
+        copy(&mut app, "wide.txt");
+        assert_eq!(app.terminal_clipboard.as_deref(), Some(clipboard::osc52("hi").as_str()));
+        copy(&mut app, "program.bin");
+        assert!(refused(&app, "isn't text"), "{:?}", app.dialog.is_some());
+        copy(&mut app, "big.log");
+        assert!(refused(&app, "the clipboard takes the text of files up to"));
+        copy(&mut app, "folder");
+        assert!(app.terminal_clipboard.is_none() && app.notice.as_deref().is_some_and(|n| n.contains("folder has none")));
+    }
+
     /// The session is written on the way out only with the option on.
     #[test]
     fn the_session_is_kept_only_with_the_option_on() {
@@ -4918,6 +5050,13 @@ mod tests {
         assert_eq!(app.config.big_file, BIG_FILE, "not yet");
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.config.big_file, 25 * 1024 * 1024);
+        // The clipboard's text limit: 1024 KB becomes 64.
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        typing(&mut app, "64");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.config.settings.text_copy_kb, 64);
         typing(&mut app, "micro");
         app.on_key(key(KeyCode::Esc));
         assert!(app.dialog.is_none());

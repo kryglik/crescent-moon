@@ -4,7 +4,7 @@
 //! pastes files copied or cut in Explorer or in cm.
 //!
 //! Elsewhere than Windows there is no system clipboard for files: cm keeps its own, and the
-//! paths go to the terminal's clipboard as text (OSC 52, which works over ssh too).
+//! paths go to the clipboard as text (`put_plain_text`). Alt+Shift+C puts a file's text there.
 
 use std::path::{Path, PathBuf};
 
@@ -56,12 +56,23 @@ impl Clipboard {
     /// Ctrl+Shift+C: the paths as text, one per line, to paste into anything that takes
     /// text. Returns text for the terminal's clipboard (OSC 52), where that is the way.
     pub fn put_text(&mut self, paths: &[PathBuf]) -> Result<Option<String>, String> {
-        let text = as_text(paths);
+        self.put_plain_text(&as_text(paths))
+    }
+
+    /// Any text on the clipboard (Alt+Shift+C: a file's text): Windows' own; on a Mac
+    /// `pbcopy`; on a Linux desktop `wl-copy`, `xclip` or `xsel`, whichever is there; over ssh
+    /// or without those, the terminal's (OSC 52, returned for cm to write), which is also
+    /// the clipboard of the computer the terminal runs on.
+    pub fn put_plain_text(&mut self, text: &str) -> Result<Option<String>, String> {
         #[cfg(windows)]
         if SYSTEM {
-            return win::set_text(&text).map(|()| None);
+            return win::set_text(text).map(|()| None);
         }
-        Ok(Some(osc52(&text)))
+        #[cfg(unix)]
+        if cfg!(not(test)) && local_helper(text) {
+            return Ok(None);
+        }
+        Ok(Some(osc52(text)))
     }
 
     /// After moved files were pasted, the clipboard no longer says where they are; Explorer
@@ -79,6 +90,40 @@ impl Clipboard {
 pub fn as_text(paths: &[PathBuf]) -> String {
     let lines: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
     lines.join(if cfg!(windows) { "\r\n" } else { "\n" })
+}
+
+/// The desktop's own clipboard program, when cm runs on that desktop (not over ssh: there the
+/// clipboard that counts is the terminal's computer's). Apple's Terminal doesn't take OSC 52 at
+/// all, hence `pbcopy` on a Mac. Whether the program took the text.
+#[cfg(unix)]
+fn local_helper(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let var = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    if var("SSH_CONNECTION") || var("SSH_TTY") {
+        return false;
+    }
+    let found = |program: &str| crate::util::find_in_path(program).is_some();
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("pbcopy", &[])
+    } else if var("WAYLAND_DISPLAY") && found("wl-copy") {
+        ("wl-copy", &[])
+    } else if var("DISPLAY") && found("xclip") {
+        ("xclip", &["-selection", "clipboard"])
+    } else if var("DISPLAY") && found("xsel") {
+        ("xsel", &["--clipboard", "--input"])
+    } else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    else {
+        return false;
+    };
+    let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    // wl-copy and xclip stay to hand the text out until something else is copied: not waited
+    // for here, only reaped when they end.
+    std::thread::spawn(move || child.wait());
+    written
 }
 
 /// Asks the terminal to put `text` on the system clipboard (OSC 52).

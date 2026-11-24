@@ -181,6 +181,13 @@ pub fn read_text(path: &Path) -> std::io::Result<String> {
     Ok(decode_text(&std::fs::read(path)?))
 }
 
+/// A file's bytes as text, decoded as `decode_text` does; None when they aren't text: a zero
+/// byte outside UTF-16 (which has a byte order mark) is a program, a picture, an archive.
+pub fn text_of(bytes: &[u8]) -> Option<String> {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+    (utf16 || !bytes.contains(&0)).then(|| decode_text(bytes))
+}
+
 pub fn decode_text(bytes: &[u8]) -> String {
     let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
         let units: Vec<u16> = rest.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();

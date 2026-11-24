@@ -148,6 +148,7 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 | Alt+F5 / Alt+F9 | pack into a zip / unpack the zip under the cursor (see Zip archives) |
 | Ctrl+C / Ctrl+X | the marked files (or the one under the cursor) to the clipboard, copied or cut, the way Explorer puts them there: paste them in Explorer, a mail or a chat |
 | Ctrl+Shift+C | their full paths to the clipboard as text |
+| Alt+Shift+C | the text of the file under the cursor to the clipboard, to paste into a mail, a chat or a form: files up to 1 MB (Ctrl+P changes the limit), and only text (UTF-8, UTF-16 with its mark, or on Windows the system's code page); a file with zero bytes in it isn't. In a zip or on another computer it is taken out first, as for F3. On Windows it goes on Windows' clipboard; on a Mac through `pbcopy`; on a Linux desktop through `wl-copy`, `xclip` or `xsel`; over ssh, on the clipboard of the computer the terminal runs on (OSC 52), as Ctrl+Shift+C's paths do |
 | Alt+V | paste files copied or cut in Explorer or in cm into the panel's folder (cut ones are moved, and the clipboard is emptied afterwards, as Explorer does). Windows Terminal keeps Ctrl+V for its own paste; where a terminal lets Ctrl+V through, it works too. On Linux cm keeps its own clipboard for files, and the paths go to the terminal's clipboard (OSC 52, over ssh too) |
 
 #### Everything else
@@ -448,6 +449,7 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | Quick search finds text anywhere in a name | on: Ctrl+S / Alt+S match inside names; off, only their start, as mc. Letter case doesn't count either way |
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
+| Copy text to the clipboard up to, KB | 1024: Alt+Shift+C copies the text of files up to this size |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
 
 Alt+T sets `long_listing_left` and `long_listing_right` (both off at first): which panel shows the
