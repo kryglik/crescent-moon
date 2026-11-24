@@ -828,6 +828,36 @@ pub fn take_width_end(s: &str, max: usize) -> &str {
     s
 }
 
+/// `s` in lines of at most `w` columns, broken between words where it can be (a word wider
+/// than a line is cut), and at its own line breaks.
+pub fn wrap(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut lines = Vec::new();
+    for paragraph in s.lines() {
+        let mut line = String::new();
+        for word in paragraph.split(' ').filter(|word| !word.is_empty()) {
+            let mut word = word;
+            if !line.is_empty() && width(&line) + 1 + width(word) <= w {
+                line.push(' ');
+                line.push_str(word);
+                continue;
+            }
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            while width(word) > w {
+                let head = take_width(word, w);
+                let head = if head.is_empty() { &word[..word.chars().next().map_or(0, char::len_utf8)] } else { head };
+                lines.push(head.to_string());
+                word = &word[head.len()..];
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 pub fn pad(s: &str, w: usize) -> String {
     let mut out = s.to_string();
     out.extend(std::iter::repeat_n(' ', w.saturating_sub(width(s))));
@@ -1034,6 +1064,18 @@ mod tests {
         assert!(short.contains('~'));
         assert_eq!(fit_left(r"C:\a\very\long\path", 8), "…ng\\path");
         assert_eq!(center("ab", 6), "  ab  ");
+    }
+
+    #[test]
+    fn wrapping_words() {
+        assert_eq!(wrap("The text of \"a.txt\" is on the clipboard", 20), ["The text of \"a.txt\"", "is on the clipboard"]);
+        assert_eq!(wrap("short", 20), ["short"]);
+        assert_eq!(wrap("a  b", 20), ["a b"], "spaces between words count once");
+        assert_eq!(wrap("in C:\\a\\very\\long\\path here", 8), ["in", "C:\\a\\ver", "y\\long\\p", "ath here"]);
+        assert_eq!(wrap("one\ntwo", 20), ["one", "two"]);
+        assert_eq!(wrap("žluťoučký kůň", 9), ["žluťoučký", "kůň"], "columns, not bytes");
+        assert_eq!(wrap("日本語", 3), ["日", "本", "語"], "wide letters");
+        assert_eq!(wrap("", 5), Vec::<String>::new());
     }
 
     #[test]

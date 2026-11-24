@@ -450,6 +450,7 @@ rmc: the first time it starts, it copies what is in rmc's folder, `%APPDATA%\rmc
 | Colour scheme | classic; Enter opens Alt+C's list (see Colour schemes) |
 | Big file limit, MB | 10: bigger files go to the pager on F3, and F4 asks first |
 | Copy text to the clipboard up to, KB | 1024: Alt+Shift+C copies the text of files up to this size |
+| Notices in the middle, seconds (0: off) | 3: what the last action did ("The text of "notes.txt" is on the clipboard: 12 lines, 345 characters") shows in a box in the middle of the screen for this long, a little longer when it is long, then on the command line until the next key. The box holds nothing up: the next key does what it always does and takes the box with it, and a click on it only closes it. Over a dialog, the notice waits on the command line. 0 keeps notices on the command line only |
 | Editor, Viewer, Pager, Shell | empty: automatic, from the variables below, then what is installed |
 
 Alt+T sets `long_listing_left` and `long_listing_right` (both off at first): which panel shows the
@@ -597,6 +598,7 @@ cm shows the mono scheme.
 | `src/lnk.rs` | reading where a Windows shortcut leads |
 | `src/sizes.rs` | directory size measuring on a worker thread |
 | `src/mouse.rs` | mouse handling, using the screen areas `ui.rs` records each frame |
+| `src/notice.rs` | notices in a box in the middle for their first seconds |
 | `src/subshell.rs` | the persistent shell: ConPTY via portable-pty, screen copy via vt100, key encoding |
 | `src/hotlist.rs` | favourite folders and their file |
 | `src/find.rs` | the Find search: ignore + grep crates on a background thread, cancellable |

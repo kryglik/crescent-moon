@@ -26,6 +26,8 @@ pub struct HitAreas {
     pub preview: Option<Rect>,
     /// Each side's tabs and their numbers (when there are several).
     pub tabs: [Vec<(Rect, usize)>; 2],
+    /// The box with the last notice (see `notice`).
+    pub notice: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -77,6 +79,11 @@ impl App {
             return;
         }
         self.notice = None;
+        self.notice_box.forget();
+        // A click on the notice's box only takes it away.
+        if self.hit.notice.is_some_and(|area| area.contains(pos)) {
+            return;
+        }
         // A click says where to be now, whatever was typed for a folder on its way.
         if matches!(event.kind, MouseEventKind::Down(_)) {
             self.typed_ahead.clear();

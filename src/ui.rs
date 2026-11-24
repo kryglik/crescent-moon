@@ -9,7 +9,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, Padding, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Clear, Gauge, Padding, Paragraph, Widget};
 
 use crate::app::App;
 use crate::dialog::{self, Button, Dialog};
@@ -116,6 +116,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(switching) = &app.switching {
         let lines = [format!("Switching to {}…", switching.branch), "git isn't stopped halfway".to_string()];
         draw_message(frame, area, "Git", &lines, &[], 0, false, t);
+    }
+    // The last notice, for its first seconds (see `notice`).
+    if app.panels_free()
+        && let Some(text) = app.notice_box.showing()
+    {
+        hit.notice = Some(draw_notice_box(frame, area, text, t));
     }
     // Help can't scroll past its end (or keys up would first have to undo the excess).
     if let Some(Dialog::Help { scroll }) = &mut app.dialog {
@@ -919,14 +925,31 @@ fn draw_cmdline(frame: &mut Frame, area: Rect, app: &App) -> Position {
     let room = width.saturating_sub(prompt_w + 1);
     let (text, cursor) = app.cmdline.view(room);
     spans.extend([Span::raw(prompt), Span::raw(" "), Span::raw(text)]);
-    // A short message from the last action, until the next key.
+    // A short message from the last action, until the next key (once its box has gone).
     if app.cmdline.is_empty()
+        && !(app.panels_free() && app.notice_box.is_up())
         && let Some(notice) = &app.notice
     {
         spans.push(Span::styled(util::take_width(notice, room).to_string(), t.on_bar(t.notice)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(t.command_line), area);
     Position::new(area.x + (prompt_w + cursor) as u16, area.y)
+}
+
+/// The last notice in a box in the middle of the screen (see `notice`), its corners round so
+/// it isn't taken for a dialog that waits for an answer. Returns where it is, for the mouse.
+fn draw_notice_box(frame: &mut Frame, area: Rect, text: &str, t: &Scheme) -> Rect {
+    let most = (area.width as usize).saturating_sub(10).clamp(10, 70);
+    let lines = util::wrap(text, most);
+    let widest = lines.iter().map(|l| util::width(l)).max().unwrap_or(0);
+    let rect = centered(area, widest as u16 + 6, lines.len() as u16 + 4);
+    let block = Block::bordered().border_type(BorderType::Rounded).style(t.dialog).padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    let text: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(text).style(t.dialog), inner);
+    rect
 }
 
 /// The help box's height, border included.
@@ -2153,6 +2176,94 @@ mod tests {
             render(&mut app, w, h);
         }
         assert!(render(&mut app, 18, 4).contains("cm: the window"));
+    }
+
+    /// A notice comes in a box in the middle for its first seconds, and isn't on the command
+    /// line meanwhile; then it is there until the next key. Over a dialog it waits on the
+    /// command line; a click on the box only takes it away; 0 seconds, no box at all.
+    #[test]
+    fn a_notice_comes_in_a_box_in_the_middle() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new("ui-notice-box");
+        for i in 0..20 {
+            tmp.file(&format!("file{i:02}.txt"), "x");
+        }
+        let mut app = app_for(&tmp);
+        let said = "The text of \"notes.txt\" is on the clipboard: 2 lines, 18 characters";
+        app.notice = Some(said.into());
+        app.tick();
+        let screen = render(&mut app, 100, 20);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        let lines: Vec<&str> = screen.lines().collect();
+        let at = lines.iter().position(|l| l.contains(said)).unwrap_or_else(|| panic!("no box:\n{screen}"));
+        assert!((8..=10).contains(&at), "in the middle: row {at}\n{screen}");
+        assert!(lines[at - 2].contains('╭') && lines[at + 2].contains('╰'), "{screen}");
+        let left = lines[at][..lines[at].find(said).unwrap()].chars().count();
+        let right = 100 - left - said.chars().count();
+        assert!(left.abs_diff(right) <= 1, "centred: {left} and {right}\n{screen}");
+        assert!(!lines[18].contains("clipboard"), "not on the command line meanwhile:\n{screen}");
+
+        // Gone by itself, and then on the command line.
+        app.notice_box.follow(app.notice.as_deref(), true, 3, Instant::now() + Duration::from_secs(10));
+        let screen = render(&mut app, 100, 20);
+        assert!(!screen.contains('╭'), "{screen}");
+        assert!(screen.lines().nth(18).is_some_and(|l| l.contains("is on the clipboard")), "{screen}");
+        // The next key takes it away, and does what it always does.
+        let cursor = app.panels[0].cursor;
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.tick();
+        assert!(!render(&mut app, 100, 20).contains("clipboard"));
+        assert_eq!(app.panels[0].cursor, cursor + 1);
+
+        // Over a dialog it waits on the command line; the box comes once the dialog has gone.
+        app.dialog = Some(Dialog::Message { title: "Saved".into(), lines: vec!["Your changes are in X".into()], error: false });
+        app.notice = Some("Copied".into());
+        app.tick();
+        let screen = render(&mut app, 100, 20);
+        assert!(!screen.contains('╭') && screen.lines().nth(18).is_some_and(|l| l.contains("Copied")), "{screen}");
+        app.dialog = None;
+        app.tick();
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains('╭') && !screen.lines().nth(18).is_some_and(|l| l.contains("Copied")), "{screen}");
+
+        // A click on the box takes it away and nothing else: the file under it isn't picked.
+        let cursor = app.panels[0].cursor;
+        let area = app.hit.notice.expect("the box is where the mouse can find it");
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: area.x + 2, row: area.y + 1, modifiers: KeyModifiers::NONE };
+        app.on_mouse(click);
+        app.tick();
+        assert!(app.notice.is_none() && !app.notice_box.is_up() && app.panels[0].cursor == cursor);
+        assert!(!render(&mut app, 100, 20).contains('╭'));
+
+        // 0 seconds: on the command line only, as before.
+        app.config.settings.notice_seconds = 0;
+        app.notice = Some("Copied".into());
+        app.tick();
+        let screen = render(&mut app, 100, 20);
+        assert!(!screen.contains('╭') && screen.lines().nth(18).is_some_and(|l| l.contains("Copied")), "{screen}");
+    }
+
+    /// A long notice is wrapped in its box, and a narrow window still has room for it.
+    #[test]
+    fn a_long_notice_wraps_in_its_box() {
+        let tmp = TempDir::new("ui-notice-long");
+        let mut app = app_for(&tmp);
+        app.notice = Some("The editor went on by itself: cm can't bring back what it saves in /tmp/cm-1234/a very long name.txt, which goes when cm ends".into());
+        app.tick();
+        let screen = render(&mut app, 60, 20);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("The editor went on by itself") && screen.contains("which goes when cm ends"), "{screen}");
+        let top = screen.lines().position(|l| l.contains('╭')).unwrap();
+        let bottom = screen.lines().position(|l| l.contains('╰')).unwrap();
+        assert!(bottom - top >= 5, "on several lines:\n{screen}");
+        for (w, h) in [(20, 6), (24, 8), (30, 7)] {
+            render(&mut app, w, h);
+        }
     }
 
     /// Ctrl+Q shows the file under the cursor where the other panel was, and follows the cursor.

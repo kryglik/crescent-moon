@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::util;
 
+/// A notice's box stays up to a minute: longer is a dialog's job.
+pub const MOST_NOTICE_SECONDS: u64 = 60;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     /// F10 asks "Quit cm?" (it asks anyway while the shell is busy).
@@ -42,6 +45,9 @@ pub struct Settings {
     pub big_file_mb: u64,
     /// Alt+Shift+C puts the text of files up to this many kilobytes on the clipboard.
     pub text_copy_kb: u64,
+    /// Notices ("3 items copied to the clipboard") show in a box in the middle of the screen
+    /// for this many seconds, then on the command line; 0, only there. See `notice`.
+    pub notice_seconds: u64,
     /// Commands; empty means automatic (environment variables, then what is installed).
     pub editor: String,
     pub viewer: String,
@@ -67,6 +73,7 @@ impl Default for Settings {
             scheme: "classic".into(),
             big_file_mb: 10,
             text_copy_kb: 1024,
+            notice_seconds: 3,
             editor: String::new(),
             viewer: String::new(),
             pager: String::new(),
@@ -142,6 +149,11 @@ impl Settings {
                         settings.text_copy_kb = kb;
                     }
                 }
+                "notice_seconds" => {
+                    if let Ok(seconds) = value.parse::<u64>() {
+                        settings.notice_seconds = seconds.min(MOST_NOTICE_SECONDS);
+                    }
+                }
                 "editor" => settings.editor = value.to_string(),
                 "viewer" => settings.viewer = value.to_string(),
                 "pager" => settings.pager = value.to_string(),
@@ -171,6 +183,7 @@ impl Settings {
              scheme = {}\n\
              big_file_mb = {}\n\
              text_copy_kb = {}\n\
+             notice_seconds = {}\n\
              editor = {}\n\
              viewer = {}\n\
              pager = {}\n\
@@ -190,6 +203,7 @@ impl Settings {
             self.scheme,
             self.big_file_mb,
             self.text_copy_kb,
+            self.notice_seconds,
             self.editor,
             self.viewer,
             self.pager,
@@ -222,6 +236,7 @@ mod tests {
             scheme: "nord".into(),
             big_file_mb: 25,
             text_copy_kb: 64,
+            notice_seconds: 0,
             editor: r#""C:\Program Files\Neovim\bin\nvim.exe" -p"#.into(),
             ..Settings::default()
         };
@@ -240,5 +255,8 @@ mod tests {
         assert_eq!(settings.scheme, "classic", "an empty scheme is the default one");
         assert_eq!(settings.big_file_mb, 10, "zero is not a limit");
         assert!(settings.confirm_quit);
+        assert_eq!(Settings::parse("notice_seconds = 0").notice_seconds, 0, "zero turns the box off");
+        assert_eq!(Settings::parse("notice_seconds = 600").notice_seconds, MOST_NOTICE_SECONDS);
+        assert_eq!(Settings::parse("notice_seconds = soon").notice_seconds, 3);
     }
 }

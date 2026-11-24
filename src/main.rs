@@ -15,6 +15,7 @@ mod keybar;
 mod lfs;
 mod lnk;
 mod mouse;
+mod notice;
 mod ops;
 mod options;
 mod panel;

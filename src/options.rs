@@ -19,13 +19,14 @@ pub enum Row {
     Scheme,
     BigFile,
     TextCopy,
+    NoticeSeconds,
     Editor,
     Viewer,
     Pager,
     Shell,
 }
 
-pub const ROWS: [Row; 17] = [
+pub const ROWS: [Row; 18] = [
     Row::ConfirmQuit,
     Row::ShowHidden,
     Row::Mouse,
@@ -39,6 +40,7 @@ pub const ROWS: [Row; 17] = [
     Row::Scheme,
     Row::BigFile,
     Row::TextCopy,
+    Row::NoticeSeconds,
     Row::Editor,
     Row::Viewer,
     Row::Pager,
@@ -61,6 +63,7 @@ impl Row {
             Row::Scheme => "Colour scheme (Alt+C)",
             Row::BigFile => "Big file limit, MB",
             Row::TextCopy => "Copy text to the clipboard up to, KB",
+            Row::NoticeSeconds => "Notices in the middle, seconds (0: off)",
             Row::Editor => "Editor (F4)",
             Row::Viewer => "Viewer (F3)",
             Row::Pager => "Pager (big files)",
@@ -114,6 +117,7 @@ impl Row {
         match self {
             Row::BigFile => settings.big_file_mb.to_string(),
             Row::TextCopy => settings.text_copy_kb.to_string(),
+            Row::NoticeSeconds => settings.notice_seconds.to_string(),
             Row::Scheme => settings.scheme.clone(),
             Row::Editor => settings.editor.clone(),
             Row::Viewer => settings.viewer.clone(),
@@ -123,7 +127,8 @@ impl Row {
         }
     }
 
-    /// Takes what was typed; a limit that isn't a whole number above zero is ignored.
+    /// Takes what was typed; a limit that isn't a whole number above zero is ignored (the
+    /// notices' seconds can be 0).
     pub fn set_text(self, settings: &mut Settings, text: &str) {
         let text = text.trim().to_string();
         match self {
@@ -139,6 +144,12 @@ impl Row {
                     && kb > 0
                 {
                     settings.text_copy_kb = kb;
+                }
+            }
+            // 0 is allowed here: notices on the command line only.
+            Row::NoticeSeconds => {
+                if let Ok(seconds) = text.parse::<u64>() {
+                    settings.notice_seconds = seconds.min(crate::settings::MOST_NOTICE_SECONDS);
                 }
             }
             Row::Editor => settings.editor = text,

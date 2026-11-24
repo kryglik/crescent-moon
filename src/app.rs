@@ -23,6 +23,7 @@ use crate::hotlist::Hotlist;
 use crate::lfs;
 use crate::lnk;
 use crate::mouse::{HitAreas, LastClick};
+use crate::notice::NoticeBox;
 use crate::ops::remote;
 use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
@@ -340,8 +341,9 @@ pub struct App {
     history_saved: Instant,
     history_pos: Option<usize>,
     /// A short message on the command line ("3 items copied to the clipboard"), gone at the
-    /// next key.
+    /// next key. For its first seconds it is in a box in the middle instead (`notice_box`).
     pub notice: Option<String>,
+    pub notice_box: NoticeBox,
     /// Ctrl+Q: the other panel shows what is under the cursor (see `preview`).
     pub quick_view: bool,
     /// Tab moved into the quick view: the arrows scroll it.
@@ -442,6 +444,7 @@ impl App {
             history_saved: Instant::now(),
             history_pos: None,
             notice,
+            notice_box: NoticeBox::default(),
             quick_view: false,
             preview_focus: false,
             previewer: None,
@@ -581,6 +584,18 @@ impl App {
             || self.git.running()
             || self.panels.iter().any(Panel::is_reading)
             || self.text_copy.is_some()
+            || self.notice_box.is_up()
+    }
+
+    /// Nothing is over the panels (a dialog, the shell, Find, a job's progress), so a notice's
+    /// box can be seen.
+    pub fn panels_free(&self) -> bool {
+        !self.shell_shown
+            && self.dialog.is_none()
+            && !self.find_shown
+            && self.job.is_none()
+            && self.connecting.is_none()
+            && self.switching.is_none()
     }
 
     /// Ctrl+Q: the quick view on or off.
@@ -760,6 +775,7 @@ impl App {
         }
         self.overwrite_asked = None;
         self.notice = None;
+        self.notice_box.forget();
         self.git.touch();
         if self.shell_shown {
             self.on_shell_key(key);
@@ -2158,7 +2174,11 @@ impl App {
         if self.history_changed && self.history_saved.elapsed() > std::time::Duration::from_secs(5) {
             self.save_history();
         }
-        self.tick_job() || changed
+        changed |= self.tick_job();
+        // A new notice comes in a box for a few seconds (once nothing is over the panels).
+        let free = self.panels_free();
+        let seconds = self.config.settings.notice_seconds;
+        self.notice_box.follow(self.notice.as_deref(), free, seconds, Instant::now()) || changed
     }
 
     /// What the panels had read, the hidden tabs' too, and the keys that waited for it.
@@ -5057,6 +5077,11 @@ mod tests {
         typing(&mut app, "64");
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.config.settings.text_copy_kb, 64);
+        // Notices in the middle for 3 seconds: 0, on the command line only.
+        app.on_key(key(KeyCode::Backspace));
+        typing(&mut app, "0");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.config.settings.notice_seconds, 0);
         typing(&mut app, "micro");
         app.on_key(key(KeyCode::Esc));
         assert!(app.dialog.is_none());
