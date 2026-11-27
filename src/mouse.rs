@@ -333,6 +333,7 @@ impl App {
                             | Dialog::Places { .. }
                             | Dialog::Schemes { .. }
                             | Dialog::Attributes { .. }
+                            | Dialog::Picture { .. }
                             | Dialog::Sort { .. }
                             | Dialog::Options { .. }
                             | Dialog::Message { .. }

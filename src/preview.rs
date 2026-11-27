@@ -1,5 +1,5 @@
 //! Quick view (Ctrl+Q): the other panel shows what is under the cursor: the start of a text
-//! file, a hex dump of a binary one, a picture's size, or a folder's contents. Files are read
+//! file, a hex dump of a binary one, what a picture is, or a folder's contents. Files are read
 //! on a background thread, so a slow network drive can't hold the screen up, and only the
 //! latest request counts when the cursor moves fast.
 
@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::SystemTime;
+
+use crate::picture::{self, Picture};
 
 /// How much of a file is read.
 const READ_LIMIT: u64 = 64 * 1024;
@@ -23,7 +25,7 @@ pub enum Content {
     Text { lines: Vec<String>, encoding: &'static str, partial: bool },
     /// A hex dump of the start of the file.
     Binary { lines: Vec<String>, partial: bool },
-    Picture { format: &'static str, width: u32, height: u32 },
+    Picture(Picture),
     Folder { folders: usize, files: usize, bytes: u64, names: Vec<(String, bool)>, partial: bool },
     Message(String),
 }
@@ -115,6 +117,7 @@ impl Content {
         match self {
             Content::Text { lines, .. } | Content::Binary { lines, .. } => lines.len(),
             Content::Folder { names, .. } => names.len(),
+            Content::Picture(picture) => picture.rows.len(),
             _ => 0,
         }
     }
@@ -124,7 +127,7 @@ impl Content {
 fn load_key(key: &Key) -> Content {
     let Some((zip, index)) = &key.archive else { return load(&key.path) };
     match crate::archive::read_start(zip, *index, READ_LIMIT) {
-        Ok(data) => content_of(&mut io::Cursor::new(data), key.size).unwrap_or_else(|e| Content::Message(format!("Cannot read it: {e}"))),
+        Ok(data) => content_of(&mut io::Cursor::new(data), key.size, &key.path).unwrap_or_else(|e| Content::Message(format!("Cannot read it: {e}"))),
         Err(e) => Content::Message(format!("Cannot read it from the archive: {e}")),
     }
 }
@@ -162,13 +165,14 @@ fn load_folder(path: &Path) -> Content {
 }
 
 fn load_file(path: &Path, size: u64) -> io::Result<Content> {
-    content_of(&mut File::open(path)?, size)
+    content_of(&mut File::open(path)?, size, path)
 }
 
-/// What a file (`size` bytes long) is, from its start.
-fn content_of<R: Read + Seek>(file: &mut R, size: u64) -> io::Result<Content> {
-    if let Some((format, width, height)) = picture_size(file)? {
-        return Ok(Content::Picture { format, width, height });
+/// What a file (`size` bytes long, called `name`) is, from its start.
+fn content_of<R: Read + Seek>(file: &mut R, size: u64, name: &Path) -> io::Result<Content> {
+    let ending = name.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    if let Some(picture) = picture::read(file, ending.as_deref())? {
+        return Ok(Content::Picture(picture));
     }
     file.seek(SeekFrom::Start(0))?;
     let mut data = Vec::new();
@@ -240,84 +244,6 @@ fn hex_dump(data: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The format and size of a PNG, JPEG, GIF, BMP or WebP picture.
-fn picture_size<R: Read + Seek>(file: &mut R) -> io::Result<Option<(&'static str, u32, u32)>> {
-    let mut head = [0u8; 32];
-    let n = read_up_to(file, &mut head)?;
-    let head = &head[..n];
-    let le16 = |i: usize| u16::from_le_bytes([head[i], head[i + 1]]) as u32;
-    let be32 = |i: usize| u32::from_be_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
-    let le32 = |i: usize| u32::from_le_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
-    let le24 = |i: usize| u32::from_le_bytes([head[i], head[i + 1], head[i + 2], 0]);
-    if n >= 24 && head.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Ok(Some(("PNG", be32(16), be32(20))));
-    }
-    if n >= 10 && (head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a")) {
-        return Ok(Some(("GIF", le16(6), le16(8))));
-    }
-    if n >= 26 && head.starts_with(b"BM") {
-        let height = le32(22) as i32;
-        return Ok(Some(("BMP", le32(18), height.unsigned_abs())));
-    }
-    if n >= 30 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
-        let size = match &head[12..16] {
-            b"VP8X" => Some((le24(24) + 1, le24(27) + 1)),
-            b"VP8L" => {
-                let bits = le32(21);
-                Some(((bits & 0x3FFF) + 1, (bits >> 14 & 0x3FFF) + 1))
-            }
-            b"VP8 " => Some((le16(26) & 0x3FFF, le16(28) & 0x3FFF)),
-            _ => None,
-        };
-        return Ok(size.map(|(w, h)| ("WebP", w, h)));
-    }
-    if n >= 4 && head.starts_with(&[0xFF, 0xD8]) {
-        return jpeg_size(file);
-    }
-    Ok(None)
-}
-
-/// Walks a JPEG's segments to the frame header, skipping the rest (an EXIF block with its
-/// thumbnail can be big) without reading it.
-fn jpeg_size<R: Read + Seek>(file: &mut R) -> io::Result<Option<(&'static str, u32, u32)>> {
-    let mut pos = 2u64;
-    for _ in 0..500 {
-        file.seek(SeekFrom::Start(pos))?;
-        let mut marker = [0u8; 4];
-        if read_up_to(file, &mut marker)? < 4 || marker[0] != 0xFF {
-            return Ok(None);
-        }
-        let kind = marker[1];
-        let length = u16::from_be_bytes([marker[2], marker[3]]) as u64;
-        // Start-of-frame markers, except DHT (C4), JPG (C8) and DAC (CC).
-        if (0xC0..=0xCF).contains(&kind) && !matches!(kind, 0xC4 | 0xC8 | 0xCC) {
-            let mut frame = [0u8; 5];
-            if read_up_to(file, &mut frame)? < 5 {
-                return Ok(None);
-            }
-            let height = u16::from_be_bytes([frame[1], frame[2]]) as u32;
-            let width = u16::from_be_bytes([frame[3], frame[4]]) as u32;
-            return Ok(Some(("JPEG", width, height)));
-        }
-        if length < 2 {
-            return Ok(None);
-        }
-        pos += 2 + length;
-    }
-    Ok(None)
-}
-
-fn read_up_to<R: Read>(file: &mut R, buf: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match file.read(&mut buf[filled..])? {
-            0 => break,
-            n => filled += n,
-        }
-    }
-    Ok(filled)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,7 +285,8 @@ mod tests {
         png.extend([8, 2, 0, 0, 0]);
         let path = tmp.path().join("a.png");
         fs::write(&path, &png).unwrap();
-        assert_eq!(load(&path), Content::Picture { format: "PNG", width: 640, height: 480 });
+        let Content::Picture(picture) = load(&path) else { panic!("{:?}", load(&path)) };
+        assert_eq!((picture.format, picture.row("Size")), ("PNG", Some("640 × 480 pixels, 0.3 megapixels")));
 
         // A JPEG with an APP1 (EXIF) segment before its frame header.
         let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x10];
@@ -368,7 +295,8 @@ mod tests {
         jpeg.extend([0u8; 12]);
         let path = tmp.path().join("a.jpg");
         fs::write(&path, &jpeg).unwrap();
-        assert_eq!(load(&path), Content::Picture { format: "JPEG", width: 4032, height: 3024 });
+        let Content::Picture(picture) = load(&path) else { panic!("{:?}", load(&path)) };
+        assert_eq!((picture.format, picture.row("Size")), ("JPEG", Some("4032 × 3024 pixels, 12.2 megapixels")));
     }
 
     #[test]

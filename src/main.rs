@@ -19,6 +19,7 @@ mod notice;
 mod ops;
 mod options;
 mod panel;
+mod picture;
 mod places;
 mod platform;
 mod preview;

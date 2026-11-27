@@ -293,6 +293,11 @@ pub fn session_dir() -> std::io::Result<PathBuf> {
     Ok(made)
 }
 
+/// The session folder, if one was made.
+pub fn made_session_dir() -> Option<PathBuf> {
+    SESSION_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Removes the session folder, if one was made (a file still open in an app stays).
 pub fn remove_session_dir() {
     if let Some(dir) = SESSION_DIR.lock().unwrap_or_else(|e| e.into_inner()).take() {

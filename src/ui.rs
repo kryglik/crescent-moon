@@ -554,10 +554,16 @@ fn draw_quick_view(buf: &mut Buffer, area: Rect, preview: Option<&Preview>, focu
                 put(line, base);
             }
         }
-        Content::Picture { format, width: w, height: h } => {
-            put(&format!("{format} picture"), bright);
-            let megapixels = f64::from(*w) * f64::from(*h) / 1_000_000.0;
-            put(&format!("{w} × {h} pixels ({megapixels:.1} megapixels)"), base);
+        // What it is first, then the rest, which scrolls.
+        Content::Picture(picture) => {
+            let mut told = picture.rows.iter();
+            if let Some((_, format)) = told.next() {
+                put(format, bright);
+            }
+            let label_w = picture.rows.iter().skip(1).map(|(label, _)| util::width(label)).max().unwrap_or(0);
+            for (label, value) in told.skip(preview.scroll).take(rows.saturating_sub(1)) {
+                put(&format!("{}  {value}", util::pad(label, label_w)), base);
+            }
         }
         Content::Folder { folders, files, bytes, names, partial } => {
             let more = if *partial { "+" } else { "" };
@@ -587,7 +593,7 @@ fn preview_info(preview: &Preview) -> String {
             format!("{encoding} · {size}{}", if *partial { " · the start" } else { "" })
         }
         Content::Binary { partial, .. } => format!("binary · {size}{}", if *partial { " · the start" } else { "" }),
-        Content::Picture { .. } => size,
+        Content::Picture(_) => size,
         _ => String::new(),
     }
 }
@@ -1106,6 +1112,9 @@ fn draw_dialog(
             (None, DialogHit::default())
         }
         Dialog::Attributes { paths, states, cursor, about } => (None, draw_attributes(frame, area, paths, states, *cursor, about, t)),
+        Dialog::Picture { path, size, picture, scroll, can_open, .. } => {
+            (None, draw_picture(frame, area, path, *size, picture.as_ref(), *scroll, *can_open, t))
+        }
         Dialog::Help { scroll } => {
             let height = help_height(area);
             // 72 columns: room for the longest help line (68) inside the border and padding.
@@ -1443,6 +1452,49 @@ fn draw_attributes(
     let top = 2 + told;
     let list = Rect::new(inner.x, inner.y + top, inner.width, rows.min(inner.height.saturating_sub(top)));
     DialogHit { area: outer, buttons: Vec::new(), rows: Some((list, 0)) }
+}
+
+/// F3's box for a picture: its name and size, what it is, and the keys.
+#[allow(clippy::too_many_arguments)]
+fn draw_picture(
+    frame: &mut Frame,
+    area: Rect,
+    path: &Path,
+    size: u64,
+    picture: Option<&crate::picture::Picture>,
+    scroll: usize,
+    can_open: bool,
+    t: &Scheme,
+) -> DialogHit {
+    let (box_w, lines, shown) = dialog::picture_lines(picture, (area.height, area.width));
+    let (outer, inner) = dialog_frame(frame, area, box_w, shown as u16 + 6, "Picture", false, t);
+    let (style, dim) = (t.dialog, t.on_dialog(t.dialog_dim));
+    let width = inner.width as usize;
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let size = util::human_size(size);
+    let name_w = width.saturating_sub(util::width(&size) + 2);
+    let mut text = vec![
+        Line::from(vec![Span::styled(util::fit(&name, name_w), style), Span::styled(format!("  {size}"), dim)]),
+        Line::default(),
+    ];
+    let label_w = lines.iter().map(|(label, _)| util::width(label)).max().unwrap_or(0);
+    let scroll = scroll.min(lines.len().saturating_sub(shown));
+    for (label, value) in lines.iter().skip(scroll).take(shown) {
+        let value = util::take_width(value, width.saturating_sub(label_w + 2)).to_string();
+        text.push(Line::from(vec![Span::styled(util::pad(label, label_w + 2), dim), Span::styled(value, style)]));
+    }
+    text.push(Line::default());
+    let mut keys = Vec::new();
+    if lines.len() > shown {
+        keys.push("↑↓ more");
+    }
+    if can_open && picture.is_some() {
+        keys.push("Enter opens it in its app");
+    }
+    keys.push("Esc");
+    text.push(Line::from(Span::styled(keys.join(" · "), dim)).right_aligned());
+    frame.render_widget(Paragraph::new(text).style(style), inner);
+    DialogHit { area: outer, buttons: Vec::new(), rows: None }
 }
 
 const HISTORY_HINT: &str = "type to narrow · Enter goes there · Del forgets · Esc";
@@ -2244,6 +2296,58 @@ mod tests {
         app.tick();
         let screen = render(&mut app, 100, 20);
         assert!(!screen.contains('╭') && screen.lines().nth(18).is_some_and(|l| l.contains("Copied")), "{screen}");
+    }
+
+    /// F3's box for a picture: its name and size on top, what it is in two columns, a long
+    /// text over several lines; on a low screen the rest scrolls.
+    #[test]
+    fn a_picture_in_its_box() {
+        use crate::picture::Picture;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let tmp = TempDir::new("ui-picture");
+        let mut app = app_for(&tmp);
+        let comment = "a long comment ".repeat(20);
+        let rows = [
+            ("Format", "JPEG, progressive"),
+            ("Size", "4032 × 3024 pixels, 12.2 megapixels"),
+            ("Taken", "2025-07-14 18:32:05 +02:00"),
+            ("Camera", "Canon EOS R6"),
+            ("Comment", comment.as_str()),
+            ("Software", "Firmware 1.8.1"),
+        ];
+        let picture = Picture { format: "JPEG", rows: rows.iter().map(|(l, v)| (l.to_string(), v.to_string())).collect() };
+        let path = tmp.path().join("IMG_0042.JPG");
+        app.dialog = Some(Dialog::Picture { path: path.clone(), size: 2_400_000, picture: Some(picture), coming: None, scroll: 0, can_open: true });
+        let screen = render(&mut app, 100, 30);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains(" Picture ") && screen.contains("IMG_0042.JPG") && screen.contains("2.3M"), "{screen}");
+        let line = |text: &str| screen.lines().find(|l| l.contains(text)).unwrap_or_else(|| panic!("no {text}:
+{screen}")).to_string();
+        assert!(line("4032 × 3024 pixels").contains("Size"));
+        // The texts start in one column.
+        assert_eq!(line("Camera").find("Canon"), line("Taken").find("2025"));
+        assert!(screen.lines().filter(|l| l.contains("a long comment")).count() >= 3, "{screen}");
+        assert!(line("Enter opens it in its app").contains("Esc") && !screen.contains("↑↓"), "{screen}");
+
+        // Low: the rest scrolls, End goes to the end.
+        let screen = render(&mut app, 100, 14);
+        if std::env::var_os("CM_PRINT").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("↑↓ more") && !screen.contains("Firmware"), "{screen}");
+        app.on_key(KeyEvent::from(KeyCode::End));
+        let screen = render(&mut app, 100, 14);
+        assert!(screen.contains("Firmware") && !screen.contains("Canon"), "{screen}");
+
+        // Being read; and where nothing opens pictures, Enter isn't offered.
+        app.dialog = Some(Dialog::Picture { path, size: 1, picture: None, coming: None, scroll: 0, can_open: false });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Reading…") && !screen.contains("Enter opens"), "{screen}");
+        for (w, h) in [(20, 6), (30, 8), (44, 10)] {
+            render(&mut app, w, h);
+        }
     }
 
     /// A long notice is wrapped in its box, and a narrow window still has room for it.

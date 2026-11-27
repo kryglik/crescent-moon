@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::EditedCopy;
+use crate::picture::Picture;
 use crate::places::Place;
 use crate::git::{Branch, Worktree};
 use crate::ops::Answer;
@@ -183,6 +184,16 @@ pub enum Dialog {
     /// `about`: what it is, for one file (see `platform::describe`).
     Attributes { paths: Vec<PathBuf>, states: Vec<Option<bool>>, cursor: usize, about: Vec<(&'static str, String)> },
     Help { scroll: usize },
+    /// F3 on a picture (`path`, `size` bytes): what it is, `coming` from a thread of its own
+    /// until it is read; `scroll` lines down. Enter opens it in its app, when `can_open`.
+    Picture {
+        path: PathBuf,
+        size: u64,
+        picture: Option<Picture>,
+        coming: Option<Receiver<Result<Option<Picture>, String>>>,
+        scroll: usize,
+        can_open: bool,
+    },
     /// F9: the sort order of panel `side`, which is sorted by `current` (`reverse`d).
     Sort { side: usize, cursor: usize, current: SortBy, reverse: bool },
     /// F8 / Shift+F8: the question, filled in by `survey` while it counts. The buttons are
@@ -506,6 +517,40 @@ pub fn take_earlier(back: &mut Dialog, row: &str) {
     }
 }
 
+/// The most lines one of a picture's texts takes in F3's box for it.
+const PICTURE_TEXT_LINES: usize = 6;
+
+/// F3's box for a picture, on a screen `screen` (height, width) big: how wide it is, its
+/// lines (a label and a text; a long text goes on over the next lines, without one), and how
+/// many of them show at once (the rest scroll).
+pub fn picture_lines(picture: Option<&Picture>, screen: (u16, u16)) -> (u16, Vec<(String, String)>, usize) {
+    let (height, width) = screen;
+    let box_w = width.saturating_sub(4).clamp(20, 84);
+    // Inside its border and padding.
+    let inner_w = box_w.saturating_sub(4) as usize;
+    let Some(picture) = picture else { return (box_w.min(50), vec![(String::new(), "Reading…".into())], 1) };
+    let label_w = picture.rows.iter().map(|(label, _)| util::width(label)).max().unwrap_or(0);
+    let text_w = inner_w.saturating_sub(label_w + 2).max(10);
+    let mut lines = Vec::new();
+    for (label, text) in &picture.rows {
+        let mut wrapped = util::wrap(text, text_w);
+        if wrapped.len() > PICTURE_TEXT_LINES {
+            wrapped.truncate(PICTURE_TEXT_LINES);
+            let last = &mut wrapped[PICTURE_TEXT_LINES - 1];
+            *last = format!("{}…", util::take_width(last, text_w - 1));
+        }
+        for (i, line) in wrapped.into_iter().enumerate() {
+            lines.push((if i == 0 { label.clone() } else { String::new() }, line));
+        }
+    }
+    // The widest line decides the box's width.
+    let widest = lines.iter().map(|(_, text)| label_w + 2 + util::width(text)).max().unwrap_or(0);
+    let box_w = (widest as u16 + 4).clamp(44.min(box_w), box_w);
+    // Its border, the name and a line under it, and a line and the keys at the bottom.
+    let shown = lines.len().min(height.saturating_sub(8) as usize).max(1);
+    (box_w, lines, shown)
+}
+
 /// The branches whose name or newest commit holds every word of `filter`.
 pub fn branch_rows<'a>(branches: &'a [Branch], filter: &str) -> Vec<&'a Branch> {
     branches.iter().filter(|b| matches_words(&format!("{} {}", b.name, b.subject), filter)).collect()
@@ -558,6 +603,8 @@ pub const HELP: &[&str] = &[
     "Files",
     "  F2 rename    F3 view    F4 edit    Shift+F4 new file",
     "               over 10 MB: F3 shows it in less, F4 asks first",
+    "               a picture: F3 tells what it is (size, camera, when,",
+    "               where), Enter there opens it; F4 doesn't edit it",
     "  F5 copy      F6 move    F7 make directory",
     "  Shift+F5/F6  copy / rename the file under the cursor in this",
     "               folder, whatever is marked",

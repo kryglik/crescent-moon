@@ -1159,10 +1159,15 @@ mod win {
 
 #[cfg(not(windows))]
 pub use unix::{
-    delete_denied, delete_privileged, disk_space, drives, exec_bits_mean_something, init, is_mount, mount_dirs, mount_point,
-    open_default,
-    runs_as_program, same_device, trash_refusal,
+    can_open, delete_denied, delete_privileged, disk_space, drives, exec_bits_mean_something, init, is_mount, mount_dirs,
+    mount_point, open_default, runs_as_program, same_device, trash_refusal,
 };
+
+/// Windows opens any file in its app, or asks which app to.
+#[cfg(windows)]
+pub fn can_open() -> bool {
+    true
+}
 
 /// On Windows a program is known by its extension (see `is_executable`).
 #[cfg(windows)]
@@ -1487,27 +1492,8 @@ mod unix {
     ///
     /// Otherwise `NoOpener`, and cm shows the file in the viewer instead.
     pub fn open_default(path: &Path) -> Result<(), OpenError> {
-        let found = |program: &str| util::find_in_path(program).is_some();
-        let graphical = ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
-        let (opener, arg) = if cfg!(target_os = "macos") {
-            // Over ssh, `open` would show it on the Mac's own screen, not where the user is.
-            if std::env::var_os("SSH_CONNECTION").is_some() {
-                return Err(OpenError::NoOpener);
-            }
-            ("open", path.as_os_str().to_owned())
-        } else if is_wsl() {
-            if found("wslview") {
-                ("wslview", path.as_os_str().to_owned())
-            } else if found("explorer.exe") {
-                ("explorer.exe", windows_path(path).ok_or(OpenError::NoOpener)?)
-            } else {
-                return Err(OpenError::NoOpener);
-            }
-        } else if graphical && found("xdg-open") {
-            ("xdg-open", path.as_os_str().to_owned())
-        } else {
-            return Err(OpenError::NoOpener);
-        };
+        let opener = opener().ok_or(OpenError::NoOpener)?;
+        let arg = if opener == "explorer.exe" { windows_path(path).ok_or(OpenError::NoOpener)? } else { path.as_os_str().to_owned() };
         // Its chatter would land on cm's screen; and wait for it so it doesn't linger as a zombie.
         let mut child = Command::new(opener)
             .arg(arg)
@@ -1518,6 +1504,25 @@ mod unix {
             .map_err(|e| OpenError::Failed(format!("Cannot run {opener}: {e}")))?;
         std::thread::spawn(move || child.wait());
         Ok(())
+    }
+
+    /// Whether files can be opened in their apps here (see `open_default`).
+    pub fn can_open() -> bool {
+        opener().is_some()
+    }
+
+    /// What `open_default` opens files with, if anything.
+    fn opener() -> Option<&'static str> {
+        let found = |program: &str| util::find_in_path(program).is_some();
+        let graphical = ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
+        if cfg!(target_os = "macos") {
+            // Over ssh, `open` would show it on the Mac's own screen, not where the user is.
+            std::env::var_os("SSH_CONNECTION").is_none().then_some("open")
+        } else if is_wsl() {
+            ["wslview", "explorer.exe"].into_iter().find(|program| found(program))
+        } else {
+            (graphical && found("xdg-open")).then_some("xdg-open")
+        }
     }
 
     fn is_wsl() -> bool {

@@ -29,6 +29,7 @@ use crate::ops::{self, Answer, Job, Msg, Question, Running};
 use crate::options::{self, OptionsAutomatic};
 use crate::keybar::Held;
 use crate::panel::{Came, DirSize, Entry, Panel, RemoteView, SortBy};
+use crate::picture;
 use crate::preview::{Key as PreviewKey, Previewer};
 use crate::platform::{self, OpenError, Shell};
 use crate::scheme::{self, Choice, Colours, Scheme};
@@ -711,7 +712,7 @@ impl App {
         let drives_pending = matches!(&self.dialog, Some(Dialog::Drives { drives, .. }) if drives.iter().any(|d| d.pending));
         let finding = self.finder.as_ref().is_some_and(Finder::working);
         let surveying = matches!(&self.dialog, Some(Dialog::Delete { survey, .. }) if !survey.is_done());
-        let listing = matches!(&self.dialog, Some(Dialog::Branches { coming: Some(_), .. }));
+        let listing = matches!(&self.dialog, Some(Dialog::Branches { coming: Some(_), .. }) | Some(Dialog::Picture { coming: Some(_), .. }));
         self.job.is_some()
             || self.connecting.is_some()
             || self.switching.is_some()
@@ -1109,6 +1110,7 @@ impl App {
             Dialog::Worktrees { filter, cursor, worktrees, here } => {
                 self.on_worktrees_key(&key, filter, cursor, worktrees, here)
             }
+            dialog @ Dialog::Picture { .. } => self.on_picture_key(&key, dialog),
             Dialog::Branches { filter, cursor, branches, here, coming } => {
                 self.on_branches_key(&key, filter, cursor, branches, here, coming)
             }
@@ -2150,6 +2152,7 @@ impl App {
         }
         changed |= self.tick_connecting();
         changed |= self.take_branches(false);
+        changed |= self.take_picture(false);
         changed |= self.tick_switching();
         changed |= self.tick_readings();
         // Not over a dialog: it may say where a file went. It comes when that one is read.
@@ -3365,14 +3368,7 @@ impl App {
         match then {
             AfterJob::Open { shown } if archive::is_archive(&path) => self.open_zip_here(&path, shown),
             AfterJob::Open { .. } => {
-                // Only a copy, gone when cm ends: read-only, so that its app says so when
-                // something is saved, instead of the work being lost with the copy.
-                if let Ok(meta) = fs::metadata(&path) {
-                    let mut permissions = meta.permissions();
-                    permissions.set_readonly(true);
-                    let _ = fs::set_permissions(&path, permissions);
-                }
-                self.notice = Some("Opened a read-only copy: changes have to be saved somewhere else".into());
+                self.open_as_copy(&path);
                 match platform::open_default(&path) {
                     Ok(()) => {}
                     Err(OpenError::NoOpener) => self.view(path, size, None),
@@ -3380,7 +3376,11 @@ impl App {
                 }
             }
             AfterJob::View => {
-                self.viewed_copy = path.parent().map(|folder| (folder.to_path_buf(), Instant::now()));
+                // A picture's box needs no viewer, and its copy stays (until cm ends) for Enter
+                // there to open it in its app.
+                if !picture::by_name(&path) {
+                    self.viewed_copy = path.parent().map(|folder| (folder.to_path_buf(), Instant::now()));
+                }
                 self.view(path, size, None);
             }
             AfterJob::CopyText => {
@@ -3430,9 +3430,16 @@ impl App {
         }
     }
 
-    /// F3: the viewer, or for a big file the pager (or, without one, the viewer after asking);
-    /// at `line` if given.
+    /// F3: for a picture, what it is; otherwise the viewer, or for a big file the pager (or,
+    /// without one, the viewer after asking); at `line` if given.
     fn view(&mut self, path: PathBuf, size: u64, line: Option<u64>) {
+        if picture::by_name(&path) {
+            return self.show_picture(path, size);
+        }
+        self.view_text(path, size, line);
+    }
+
+    fn view_text(&mut self, path: PathBuf, size: u64, line: Option<u64>) {
         if size <= self.config.big_file {
             self.external = Some(External::View(path, line));
         } else if self.config.pager.is_some() {
@@ -3444,7 +3451,7 @@ impl App {
 
     fn edit_current(&mut self) {
         let Some(entry) = self.active_panel().current().cloned() else { return };
-        if entry.is_dir {
+        if entry.is_dir || self.refuse_picture(&entry.path) {
             return;
         }
         // A file in an archive can only be looked at here.
@@ -3465,11 +3472,117 @@ impl App {
 
     /// F4: the editor, after asking for a big file; at `line` if given.
     fn edit(&mut self, path: PathBuf, size: u64, line: Option<u64>) {
+        if self.refuse_picture(&path) {
+            return;
+        }
         if size > self.config.big_file {
             self.confirm_big_file(path, size, true, line);
         } else {
             self.external = Some(External::Edit(path, line));
         }
+    }
+
+    /// A file taken out of a zip or brought from another computer, about to open in its app.
+    /// Only a copy, gone when cm ends: read-only, so that its app says so when something is
+    /// saved, instead of the work being lost with the copy.
+    fn open_as_copy(&mut self, path: &Path) {
+        if let Ok(meta) = fs::metadata(path) {
+            let mut permissions = meta.permissions();
+            permissions.set_readonly(true);
+            let _ = fs::set_permissions(path, permissions);
+        }
+        self.notice = Some("Opened a read-only copy: changes have to be saved somewhere else".into());
+    }
+
+    /// F4 on a picture: cm has no editor for those; say so and return true.
+    fn refuse_picture(&mut self, path: &Path) -> bool {
+        if !picture::by_name(path) {
+            return false;
+        }
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let enter = if platform::can_open() { ", Enter opens it in its app" } else { "" };
+        self.notice = Some(format!("\"{name}\" is a picture, which cm doesn't edit: F3 tells what it is{enter}"));
+        true
+    }
+
+    /// F3 on a picture: a box with what it is. It is read on a thread of its own (a picture on
+    /// a slow share mustn't hold the screen up), after a moment's wait for it, so mostly it is
+    /// there at once.
+    fn show_picture(&mut self, path: PathBuf, size: u64) {
+        let (send, coming) = mpsc::channel();
+        let reading = path.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(picture::read_path(&reading).map_err(|e| e.to_string()));
+        });
+        let can_open = platform::can_open();
+        self.dialog = Some(Dialog::Picture { path, size, picture: None, coming: Some(coming), scroll: 0, can_open });
+        self.take_picture(true);
+    }
+
+    /// What the picture in F3's box is, if it has been read; with `wait`, after a moment's
+    /// wait. A file that isn't a picture after all goes to the viewer, as any file does.
+    /// Returns whether anything came.
+    fn take_picture(&mut self, wait: bool) -> bool {
+        let Some(Dialog::Picture { coming: Some(coming), .. }) = &self.dialog else { return false };
+        let answer = if wait {
+            match coming.recv_timeout(crate::reading::a_moment()) {
+                Ok(answer) => answer,
+                Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err("it went wrong while it was read".into()),
+            }
+        } else {
+            match coming.try_recv() {
+                Ok(answer) => answer,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Err("it went wrong while it was read".into()),
+            }
+        };
+        let Some(Dialog::Picture { path, size, picture, coming, .. }) = &mut self.dialog else { return true };
+        match answer {
+            Ok(Some(found)) => (*picture, *coming) = (Some(found), None),
+            Ok(None) => {
+                let (path, size) = (path.clone(), *size);
+                self.dialog = None;
+                self.view_text(path, size, None);
+            }
+            Err(why) => {
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.dialog = None;
+                self.error(format!("Cannot read \"{name}\":
+{why}"));
+            }
+        }
+        true
+    }
+
+    /// Keys in F3's box for a picture: Enter opens it in its app, the arrows and pages
+    /// scroll it, and Esc, F3, F10, q or Space close it.
+    fn on_picture_key(&mut self, key: &KeyEvent, mut dialog: Dialog) -> Option<Dialog> {
+        let Dialog::Picture { path, picture, scroll, can_open, .. } = &mut dialog else { return Some(dialog) };
+        let (_, lines, shown) = dialog::picture_lines(picture.as_ref(), self.screen_size);
+        let last = lines.len().saturating_sub(shown);
+        match key.code {
+            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Down => *scroll = (*scroll + 1).min(last),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(shown.max(2) - 1),
+            KeyCode::PageDown => *scroll = (*scroll + shown.max(2) - 1).min(last),
+            KeyCode::Home => *scroll = 0,
+            KeyCode::End => *scroll = last,
+            KeyCode::Enter if *can_open => {
+                let path = path.clone();
+                if util::made_session_dir().is_some_and(|dir| path.starts_with(dir)) {
+                    self.open_as_copy(&path);
+                }
+                match platform::open_default(&path) {
+                    Ok(()) | Err(OpenError::NoOpener) => {}
+                    Err(OpenError::Failed(e)) => self.error(e),
+                }
+                return None;
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::F(3) | KeyCode::F(10) | KeyCode::Char('q' | ' ') => return None,
+            _ => {}
+        }
+        Some(dialog)
     }
 
     /// "x.log is 250M. Open it in nvim anyway?", with No as the default answer.
@@ -4953,6 +5066,81 @@ mod tests {
         assert_eq!(app.external.take(), Some(External::Edit(file.clone(), None)));
         app.on_key(key(KeyCode::F(3)));
         assert_eq!(app.external.take(), Some(External::View(file, None)));
+    }
+
+    /// A PNG of 640 × 480 that says nothing else.
+    fn small_png() -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend(640u32.to_be_bytes());
+        png.extend(480u32.to_be_bytes());
+        png.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        png
+    }
+
+    fn picture_shown(app: &App) -> Option<&crate::picture::Picture> {
+        match &app.dialog {
+            Some(Dialog::Picture { picture, .. }) => picture.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// F3 on a picture tells what it is, in a box and not in the viewer; one named like a
+    /// picture that isn't one goes to the viewer. F4 doesn't edit a picture, and says so.
+    #[test]
+    fn f3_tells_what_a_picture_is_and_f4_leaves_it() {
+        let tmp = TempDir::new("app-picture");
+        fs::write(tmp.path().join("photo.png"), small_png()).unwrap();
+        tmp.file("fake.jpg", "just text");
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("photo.png");
+        app.on_key(key(KeyCode::F(3)));
+        wait_until("the picture to be read", &mut app, |app| picture_shown(app).is_some());
+        assert!(app.external.is_none());
+        assert_eq!(picture_shown(&app).unwrap().rows[1], ("Size".to_string(), "640 × 480 pixels, 0.3 megapixels".to_string()));
+        // The arrows scroll it (there's nothing to scroll here); F3 again closes it.
+        app.on_key(key(KeyCode::Down));
+        assert!(picture_shown(&app).is_some());
+        app.on_key(key(KeyCode::F(3)));
+        assert!(app.dialog.is_none());
+
+        // F4: a notice, and no editor.
+        app.on_key(key(KeyCode::F(4)));
+        assert!(app.external.is_none() && app.dialog.is_none());
+        assert!(app.notice.as_deref().is_some_and(|n| n.starts_with("\"photo.png\" is a picture")), "{:?}", app.notice);
+
+        // Named like one, but it isn't: the viewer, as for any file.
+        app.active_panel_mut().select_name("fake.jpg");
+        app.on_key(key(KeyCode::F(3)));
+        wait_until("the viewer", &mut app, |app| app.external.is_some() || app.dialog.is_none());
+        assert_eq!(app.external.take(), Some(External::View(tmp.path().join("fake.jpg"), None)));
+        assert!(app.dialog.is_none());
+    }
+
+    /// A picture in a zip: F3 takes it out and tells what it is, and its copy stays for Enter
+    /// there to open it in its app; F4 takes nothing out.
+    #[test]
+    fn a_picture_in_a_zip() {
+        let tmp = TempDir::new("app-picture-zip");
+        let zip = tmp.path().join("pictures.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+        writer.start_file("in.png", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut writer, &small_png()).unwrap();
+        writer.finish().unwrap();
+        let mut app = test_app(tmp.path(), tmp.path());
+        app.active_panel_mut().select_name("pictures.zip");
+        app.open_current();
+        app.active_panel_mut().select_name("in.png");
+        app.on_key(key(KeyCode::F(4)));
+        assert!(app.job.is_none() && app.notice.as_deref().is_some_and(|n| n.contains("is a picture")), "{:?}", app.notice);
+        app.on_key(key(KeyCode::F(3)));
+        wait_for_job(&mut app);
+        wait_until("the picture to be read", &mut app, |app| picture_shown(app).is_some());
+        assert_eq!(picture_shown(&app).unwrap().format, "PNG");
+        let Some(Dialog::Picture { path: copy, .. }) = &app.dialog else { panic!() };
+        let copy = copy.clone();
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dialog.is_none() && copy.exists(), "the copy stays until cm ends");
+        assert!(app.viewed_copy.is_none());
     }
 
     #[test]

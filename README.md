@@ -37,6 +37,8 @@ What it does differently from the Windows port of mc:
   `nul` or `con` is a file. (The Recycle Bin and other programs can't reach them: Shift+F8
   deletes them, and Shift+F6 renames them to something they can open.)
 - F3/F4 open files in **Neovim** (or any editor you set) instead of a built-in viewer and editor.
+  On a **picture** F3 tells what it is instead: its size, the camera, the exposure, and when and
+  where it was taken.
 - F12 lists every command, found by typing part of its name.
 
 ## Build and install
@@ -123,8 +125,8 @@ name ("zip", "clip", "hist"; Enter runs it). The essentials:
 
 | Key | Action |
 | --- | --- |
-| F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor |
-| Ctrl+Q | quick view (as in Total Commander and Far): the other panel shows what is under the cursor, read in the background: the start of a text file (UTF-8 or UTF-16), a hex dump of a binary one, a picture's format and size (PNG, JPEG, GIF, BMP, WebP), a folder's contents. Tab goes into it to scroll (arrows, pages), the wheel scrolls it too |
+| F3 / F4 / Shift+F4 | view / edit / new file (in the editor); a file over 10 MB is shown in `less` instead, and F4 asks before loading it into the editor. On a picture F3 tells what it is instead (see Pictures), and F4 says cm doesn't edit pictures |
+| Ctrl+Q | quick view (as in Total Commander and Far): the other panel shows what is under the cursor, read in the background: the start of a text file (UTF-8 or UTF-16), a hex dump of a binary one, what a picture is (as F3 tells it), a folder's contents. Tab goes into it to scroll (arrows, pages), the wheel scrolls it too |
 | Shift+Enter | open with… : Windows asks which app to open the file in |
 | Ctrl+F | filter the panel: only files matching `*.jpg *.cr2`, or not `!*.tmp`, or containing a word; folders stay. The panel's title shows it until Ctrl+F empties it |
 | F9 | sort menu: name, extension, size, time; choosing the current order again (or F9 F9) flips it A-Z / Z-A |
@@ -229,6 +231,26 @@ say so.
   use its OEM code page (852 on a Czech Windows), which cm reads too. Names that would climb
   out of the folder they are unpacked into (`../x`) are left out. Packing writes UTF-8 names,
   deflated, ZIP64 for files over 4 GB.
+
+### Pictures
+
+F3 on a picture shows what it is, not its bytes in the viewer. It knows JPEG, PNG, GIF, WebP, HEIC,
+AVIF, TIFF, BMP and ICO, and the raw photos DNG, CR2, NEF and ARW:
+
+- its format, its size in pixels, how it is turned when shown, and its colour profile; an
+  animated GIF, PNG or WebP's frames (how many, how long, how often it plays), a TIFF's
+  pages, an icon's sizes;
+- what the camera wrote into it (EXIF): when it was taken, the camera and lens, the exposure
+  (shutter, aperture, ISO, compensation), the focal length, the flash, the GPS position;
+- the title, comment, tags and rating Windows' Explorer gives it, the artist, copyright and
+  program, and a PNG's texts.
+
+Only the parts of the file that say this are read, never the pixels, on a thread of its own.
+**Enter** in the box opens the picture in its app (a server with no desktop has none), and Esc,
+F3 or q closes it; the arrows scroll a long one. A file named like a picture that isn't one goes
+to the viewer as before, and SVG, which is text, is viewed and edited as text. **F4** on a
+picture says that cm doesn't edit pictures. Quick view (Ctrl+Q) tells the same. In a zip or on
+another computer the picture is taken out or brought over first, as for any F3.
 
 ### SSH
 
@@ -594,6 +616,7 @@ cm shows the mono scheme.
 | `src/history.rs` | folders visited and commands typed, kept in `history.txt`; what was typed into dialogs, in `inputs.txt` |
 | `src/compare.rs` | Shift+F2's comparison of two folders |
 | `src/preview.rs` | quick view: reading what to show on a background thread |
+| `src/picture.rs` | what a picture is (F3, quick view): format, size, colours and EXIF, from the parts of the file that say so |
 | `src/clipboard.rs` | files on the Windows clipboard (as Explorer puts them), OSC 52 elsewhere |
 | `src/lnk.rs` | reading where a Windows shortcut leads |
 | `src/sizes.rs` | directory size measuring on a worker thread |
